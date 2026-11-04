@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "name": "flint",
+  "api_version": ">= 0.1.19",
+  "version": "0.1.0",
+  "depends": [],
+  "platforms": ["linux"],
+  "entry": "flint_register",
+  "registration_target": "gufo_flint",
+  "targets": {
+    "gufo_flint": { "requires": [] },
+    "gufo_flint_hip": { "requires": ["hip"] },
+    "gufo_flint_text": { "requires": ["hip"] },
+    "flint_config_test": { "requires": ["testing"], "role": "test" },
+    "flint_probe_test": { "requires": ["testing"], "role": "test" },
+    "flint_ops_test": { "requires": ["hip", "testing"], "role": "test" }
+  },
+  "providers": [
+    {
+      "id": "flint",
+      "capability": "text_generation",
+      "keys": ["gguf:flint"],
+      "model_ids": ["flint-40b", "Flint-40B", "flint"],
+      "target": "gufo_flint_text",
+      "entry": "flint_provider_register"
+    }
+  ],
+  "options": [],
+  "licenses": ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+}

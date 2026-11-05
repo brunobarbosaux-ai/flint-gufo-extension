@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/host_budget.hpp>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "hip/vendor/qwen/tokenizer.hpp"
+#include "continuation_adapter.hpp"
 #include "src/chat_template.hpp"
 #include "src/gpu/engine.hpp"
 #include "src/runtime/config.hpp"
@@ -58,6 +60,22 @@ std::vector<std::uint8_t> FlintCompatibilityIdentity(
   return {canonical.begin(), canonical.end()};
 }
 
+std::vector<std::uint8_t> ComponentIdentity(
+    const FlintModel* model, std::uint32_t max_context) {
+  std::ostringstream identity;
+  identity << "schema=gufo-process-text-continuation-v1\n"
+           << "model_kind=flint\n"
+           // Without a validated artifact fingerprint the loaded model instance
+           // is the identity; durable caches require the fingerprint path.
+           << "model_instance=" << model << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "state_abi=" << kFlintStateAbi << '\n'
+           << "payload_layout=flint-rocm-session-snapshot-v"
+           << FlintSession::kSnapshotPayloadVersion << '\n';
+  const auto canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
 std::vector<std::int32_t> FlintEngineTokens(
     std::span<const TextRunnerToken> tokens) {
   std::vector<std::int32_t> converted;
@@ -84,17 +102,28 @@ public:
     }
   }
 
+  // Component-cache slot: the session is owned by the adapter's slot, which
+  // outlives this state through the retained adapter/slot handles.
+  FlintTextRunnerState(FlintSession& session, cache::Adapter& adapter,
+                       cache::Slot& slot)
+      : bound_session_(&session), adapter_(&adapter), slot_(&slot) {}
+
   void Invalidate() noexcept override {
     position_ = 0;
-    session_->Reset();
+    session().Reset();
   }
 
-  [[nodiscard]] FlintSession& session() const { return *session_; }
+  [[nodiscard]] FlintSession& session() const {
+    return bound_session_ != nullptr ? *bound_session_ : *session_;
+  }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
   std::unique_ptr<FlintSession> session_;
+  FlintSession* bound_session_{nullptr};
+  cache::Adapter* adapter_{nullptr};
+  cache::Slot* slot_{nullptr};
   std::size_t position_{0};
 };
 
@@ -253,6 +282,41 @@ public:
   [[nodiscard]] std::vector<ext::TextExecutionPlan> SupportedPlans()
       const override {
     return {{.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] bool UsesComponentCache() const override { return true; }
+
+  [[nodiscard]] std::unique_ptr<ext::ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override {
+    (void)ram;
+    cache::Identity identity;
+    if (persistence_.has_value())
+      identity = persistence_->compatibility_identity;
+    else
+      identity = ComponentIdentity(model_.get(), max_context_);
+    return hip::CreateHipComponentCacheResources(
+        std::make_unique<FlintContinuationAdapter>(model_, max_context_,
+                                                   std::move(identity)),
+        ledger,
+        hip::ComponentCacheHooks{
+            [] { return ext::HostSnapshotCeilingBytes(); },
+            [](std::string_view) {},
+            [](std::string_view) {},
+        });
+  }
+
+  [[nodiscard]] std::unique_ptr<ext::TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& flint = dynamic_cast<FlintContinuationAdapter&>(adapter);
+    return std::make_unique<FlintTextRunnerState>(flint.GetSession(slot),
+                                                  adapter, slot);
+  }
+
+  void ReconcileComponentState(ext::TextRunnerState& state,
+                               std::size_t position) const override {
+    auto& flint = RequireFlintState(state);
+    flint.set_position(position);
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>

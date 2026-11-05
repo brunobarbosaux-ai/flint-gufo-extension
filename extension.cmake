@@ -97,6 +97,7 @@ endif()
 gufo_extension_target(
   NAME gufo_flint_text
   SOURCES
+    continuation_adapter.cpp
     runner.cpp
     drivers.cpp
     provider.cpp

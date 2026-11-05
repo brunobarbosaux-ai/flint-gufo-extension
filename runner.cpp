@@ -335,16 +335,17 @@ public:
       sampling::SamplerState& sampler) const override {
     auto& flint = RequireFlintState(state);
     if (flint.position() >= max_context_)
-      return {.stop = true, .piece = {}};
+      return {.stop = true, .piece = {}, .logprobs = std::nullopt};
     const auto logits = flint.session().Logits();
     if (logits.empty())
       throw std::runtime_error("Flint token selection has no logits");
     const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
     if (flint.stop_at_eos() && IsStop(token))
-      return {.stop = true, .token = 0, .piece = {}};
+      return {.stop = true, .token = 0, .piece = {}, .logprobs = std::nullopt};
     return {.stop = false,
             .token = static_cast<TextRunnerToken>(token),
-            .piece = std::string(tokenizer_->DecodeToken(token))};
+            .piece = std::string(tokenizer_->DecodeToken(token)),
+            .logprobs = std::nullopt};
   }
 
   void Advance(ext::TextRunnerState& state,

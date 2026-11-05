@@ -17,7 +17,7 @@ namespace gufo::core {
 class GgufReader;
 }
 
-namespace gufo::tokenization {
+namespace gufo::vendor::qwen::tokenization {
 
 using TokenId = std::uint32_t;
 
@@ -143,6 +143,6 @@ private:
   PreTokenizer pre_tokenizer_{PreTokenizer::kNone};
 };
 
-}  // namespace gufo::tokenization
+}  // namespace gufo::vendor::qwen::tokenization
 
 #endif  // GUFO_TOKENIZATION_QWEN_TOKENIZER_HPP_

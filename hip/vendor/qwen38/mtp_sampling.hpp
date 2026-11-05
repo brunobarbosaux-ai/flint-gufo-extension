@@ -9,7 +9,7 @@
 
 #include "gufo/ext/sampling.hpp"
 
-namespace gufo::models::qwen38_flash_next {
+namespace gufo::vendor::qwen38_flash_next {
 
 enum class DraftDecision { kAccept, kReject, kStop };
 
@@ -141,6 +141,6 @@ DraftDecision VerifyDraft(std::span<const float> logits, std::int32_t draft,
   return DraftDecision::kAccept;
 }
 
-}  // namespace gufo::models::qwen38_flash_next
+}  // namespace gufo::vendor::qwen38_flash_next
 
 #endif

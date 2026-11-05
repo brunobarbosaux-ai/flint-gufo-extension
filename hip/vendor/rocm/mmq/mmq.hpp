@@ -1537,7 +1537,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
 // ds4 (P4 Inc3): aligned row-pair-SoA twin of load_tiles_q2_K.  x points at
 // the weight-server artifact [uint2 dm2 | int4 sc4 | uint2 qs2] (row pairs
-// interleaved; q2_k_aligned_derepack_kernel in qfn_mmq.cu is the byte-level
+// interleaved; q2_k_aligned_derepack_kernel in flint_mmq.cu is the byte-level
 // spec this inverts) and soa_npair is the total pair count = nblk/2, from
 // which the section offsets derive.  Every tile_x element is the same value
 // the standard loader reads from the raw 84-byte block, moved through
@@ -2608,7 +2608,7 @@ template <int mmq_y, bool need_check, int fixed_stride = 0> static __device__ __
 
 // ds4 (P4 Inc3): aligned-SoA twin of load_tiles_iq2_xxs.  x points at the
 // weight-server artifact [__half dq | uint2 qs] (iq2_xxs_aligned_derepack_kernel
-// in qfn_mmq.cu is the byte-level spec) and soa_nblk is the total block
+// in flint_mmq.cu is the byte-level spec) and soa_nblk is the total block
 // count.  Each lane's (q2, aux32) int pair is exactly one artifact uint2, so
 // the loads are 8-byte aligned and fully coalesced; the unpack math is the
 // standard loader's, making tile_x bit-identical.
@@ -3971,7 +3971,7 @@ struct mmq_args {
     // dense column range but wrong for a routed one: a 512-token chunk spreads
     // 3,072 (row, expert) pairs over 256 buckets, so the mean bucket is twelve
     // rows and an 80-column tile spends most of its matrix-core issue on
-    // padding. Zero keeps the default rule. See qfn_mmq_set_routed_tile_cols.
+    // padding. Zero keeps the default rule. See flint_mmq_set_routed_tile_cols.
     int mmq_x_request;
 };
 

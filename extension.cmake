@@ -60,10 +60,27 @@ if(TARGET gufo_flint_hip)
       hip/vendor/rocm/mmq/mmid.hip.cpp
       hip/vendor/rocm/mmq/mmvq.hip.cpp
       hip/vendor/rocm/mmq/moe_wave64.hip.cpp
-      hip/vendor/rocm/mmq/qfn_ggml_stubs.hip.cpp
-      hip/vendor/rocm/mmq/qfn_mmq.hip.cpp
+      hip/vendor/rocm/mmq/flint_ggml_stubs.hip.cpp
+      hip/vendor/rocm/mmq/flint_mmq.hip.cpp
       hip/vendor/rocm/mmq/quantize.hip.cpp
   )
+  # The wave64 W8A8 launcher instantiates the blocked WMMA GEMM, which needs
+  # the wave64 subtarget; SLP vectorization spills the Q-quant tiles (mirrors
+  # the in-tree per-source flags for the Qwen wave64 units).
+  gufo_extension_hip_sources(gufo_flint_hip
+    SOURCES
+      hip/vendor/rocm/w8a8_wave64.hip
+    OPTIONS
+      -mwavefrontsize64
+      -fno-slp-vectorize
+  )
+  if(DEFINED GUFO_EXTENSION_BUILD_ROOT)
+    target_sources(gufo_flint_hip PRIVATE
+      "${GUFO_EXTENSION_BUILD_ROOT}/hip/vendor/quant/ggml_dequant.cpp")
+  else()
+    target_sources(gufo_flint_hip PRIVATE hip/vendor/quant/ggml_dequant.cpp)
+  endif()
+  target_compile_definitions(gufo_flint_hip PRIVATE ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_flint_hip PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
@@ -128,6 +145,22 @@ gufo_extension_target(
 if(TARGET flint_probe_test)
   add_test(NAME flint.probe COMMAND flint_probe_test)
   set_tests_properties(flint.probe PROPERTIES LABELS "flint;cpu")
+endif()
+
+gufo_extension_target(
+  NAME flint_ops_test
+  SOURCES
+    tests/ops_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_ops_test)
+  add_test(NAME flint.ops COMMAND flint_ops_test)
+  set_tests_properties(flint.ops PROPERTIES LABELS "flint;hip;gpu;gfx1151")
 endif()
 
 # Source extensions own installation of their additional data and notices.

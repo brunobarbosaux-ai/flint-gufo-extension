@@ -5,7 +5,7 @@
 
 #include "hip/vendor/rocm/kernels.hpp"
 
-namespace gufo::models::qwen38_flash_next::rocm {
+namespace gufo::vendor::qwen38_flash_next::rocm {
 namespace {
 
 void AssignError(std::string* error, const char* message) {
@@ -198,4 +198,4 @@ bool BlasLt::Run(Plan& p, const void* weights, const void* input, float* out,
   return true;
 }
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::vendor::qwen38_flash_next::rocm

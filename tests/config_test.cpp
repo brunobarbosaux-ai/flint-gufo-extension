@@ -1,5 +1,7 @@
 #include "src/runtime/config.hpp"
 
+#include "gguf_test_shim.hpp"
+
 #include <cstring>
 #include <gufo/ext/gguf_reader.hpp>
 #include <iostream>

@@ -10,12 +10,12 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include "gufo/ext/experimental/ggml_dequant.hpp"
+#include "hip/vendor/quant/ggml_dequant.hpp"
 #include "hip/vendor/qwen38/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
 
-namespace gufo::models::qwen38_flash_next::rocm {
+namespace gufo::vendor::qwen38_flash_next::rocm {
 namespace {
 
 constexpr unsigned kThreads = 256;
@@ -7497,7 +7497,7 @@ const std::uint32_t* Iq3sGridDevice() {
     constexpr std::size_t kBytes = 512 * sizeof(std::uint32_t);
     void* p = nullptr;
     if (hipMalloc(&p, kBytes) == hipSuccess &&
-        hipMemcpy(p, gufo::quant::Iq3sGrid(), kBytes, hipMemcpyHostToDevice) ==
+        hipMemcpy(p, gufo::vendor::quant::Iq3sGrid(), kBytes, hipMemcpyHostToDevice) ==
             hipSuccess) {
       grid = static_cast<std::uint32_t*>(p);
     }
@@ -8479,4 +8479,4 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                                       stream);
 }
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::vendor::qwen38_flash_next::rocm

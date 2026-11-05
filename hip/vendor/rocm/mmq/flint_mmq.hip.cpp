@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // HIP adapters for the llama.cpp-derived quantized kernels. See VENDOR.md.
-#include "qfn_mmq_prelude.h"
-namespace qfn_mmq {
-#include "qfn_mmq.h"
+#include "flint_mmq_prelude.h"
+namespace flint_mmq {
+#include "flint_mmq.h"
 #include "common.hpp"
 #include "mmq.hpp"
 #include "mmvq.hpp"
@@ -11,20 +11,20 @@ namespace qfn_mmq {
 static int g_routed_max_expert_rows = 0;
 static int g_routed_tile_cols = 0;
 static int prepare_decode_kernels();
-extern "C" int qfn_mmq_init(int device) {
+extern "C" int flint_mmq_init(int device) {
     if (device < 0) {
-        fprintf(stderr, "qfn_mmq_init: invalid device %d\n", device);
+        fprintf(stderr, "flint_mmq_init: invalid device %d\n", device);
         return -1;
     }
     ggml_hip_set_device(device);
 
     const auto & info = ggml_hip_info();
     if (info.device_count == 0) {
-        fprintf(stderr, "qfn_mmq_init: no HIP devices found\n");
+        fprintf(stderr, "flint_mmq_init: no HIP devices found\n");
         return -1;
     }
     if (device >= info.device_count) {
-        fprintf(stderr, "qfn_mmq_init: device %d out of range (have %d)\n",
+        fprintf(stderr, "flint_mmq_init: device %d out of range (have %d)\n",
                 device, info.device_count);
         return -1;
     }
@@ -32,15 +32,15 @@ extern "C" int qfn_mmq_init(int device) {
     return prepare_decode_kernels();
 }
 
-extern "C" void qfn_mmq_set_routed_max_expert_rows(int rows) {
+extern "C" void flint_mmq_set_routed_max_expert_rows(int rows) {
     g_routed_max_expert_rows = rows > 0 ? rows : 0;
 }
 
-extern "C" void qfn_mmq_set_routed_tile_cols(int cols) {
+extern "C" void flint_mmq_set_routed_tile_cols(int cols) {
     g_routed_tile_cols = cols > 0 ? cols : 0;
 }
 
-extern "C" int qfn_mmq_routed_tile_cols_for_counts(
+extern "C" int flint_mmq_routed_tile_cols_for_counts(
         const unsigned int *counts, int n_experts) {
 
     if (!counts || n_experts <= 0) return 0;
@@ -63,16 +63,16 @@ extern "C" int qfn_mmq_routed_tile_cols_for_counts(
     return best_cols;
 }
 
-__global__ static void qfn_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
+__global__ static void flint_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float v = p[i];
     if (!isfinite(v)) p[i] = 0.0f;
 }
 
-static void qfn_mmq_sanitize_f32(float *p, uint64_t n, hipStream_t stream) {
+static void flint_mmq_sanitize_f32(float *p, uint64_t n, hipStream_t stream) {
     if (!p || n == 0) return;
-    qfn_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
+    flint_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
 
 ggml_backend_hip_context * get_ctx_for_device(int device) {
@@ -85,7 +85,7 @@ ggml_backend_hip_context * get_ctx_for_device(int device) {
 }
 
 template <ggml_type type>
-int qfn_mmq_dense_impl(
+int flint_mmq_dense_impl(
         const char  * tag,
         const void  * W,
         const float * X_f32,
@@ -183,19 +183,19 @@ int qfn_mmq_dense_impl(
         return -3;
     }
     if (!inline_sanitize) {
-        qfn_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+        flint_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     }
     return 0;
 }
 
-extern "C" int qfn_mmq_q8_0_dense(
+extern "C" int flint_mmq_q8_0_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, hipStream_t stream) {
-    return qfn_mmq_dense_impl<GGML_TYPE_Q8_0>("qfn_mmq_q8_0_dense", W, X, out, M, N, K, stream);
+    return flint_mmq_dense_impl<GGML_TYPE_Q8_0>("flint_mmq_q8_0_dense", W, X, out, M, N, K, stream);
 }
 
 template <ggml_type type>
-int qfn_mmq_moe_impl(
+int flint_mmq_moe_impl(
         const char    * tag,
         const void    * W,
         const float   * X_f32,
@@ -356,7 +356,7 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  hipStream_t stream, const void* W_b,
                                  float* out_b, bool gated,
                                  const void* X_q8 = nullptr) {
-  constexpr const char* tag = "qfn_mmq_moe_vec";
+  constexpr const char* tag = "flint_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
       type != GGML_TYPE_Q6_K && type != GGML_TYPE_Q5_1 &&
@@ -499,7 +499,7 @@ static int moe_vector_projection(int weight_type, const void* W,
   return 0;
 }
 
-extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
+extern "C" int flint_mmq_moe_vec(int weight_type, const void* W,
                                const float* X_f32, const int32_t* ids,
                                float* out_f32, int M, int K, int n_tokens,
                                int n_experts, int n_expert_used,
@@ -510,7 +510,7 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
                                out_b, false);
 }
 
-extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
+extern "C" int flint_mmq_moe_gated_vec(int weight_type, const void* gate,
                                      const void* up, const float* x,
                                      const int32_t* ids, float* out, int m,
                                      int k, int tokens, int experts,
@@ -520,7 +520,7 @@ extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
                                true);
 }
 
-extern "C" int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
+extern "C" int flint_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
                                           const void* up, const void* x_q8,
                                           const int32_t* ids, float* out,
                                           int m, int k, int tokens, int experts,
@@ -531,108 +531,108 @@ extern "C" int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
                                nullptr, true, x_q8);
 }
 
-extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
+extern "C" int flint_mmq_q8_0_moe_raw(const void* W, const float* X,
                                     const int32_t* ids, float* out, int M,
                                     int K, int n_tokens, int n_experts,
                                     int n_expert_used, hipStream_t stream) {
-  return qfn_mmq_moe_impl<GGML_TYPE_Q8_0>(
-      "qfn_mmq_q8_0_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
+  return flint_mmq_moe_impl<GGML_TYPE_Q8_0>(
+      "flint_mmq_q8_0_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
       n_expert_used, stream, nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q4_K_moe_raw(
+extern "C" int flint_mmq_q4_K_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q4_K>("qfn_mmq_q4_K_moe_raw", W, X, ids, out, M, K,
+    return flint_mmq_moe_impl<GGML_TYPE_Q4_K>("flint_mmq_q4_K_moe_raw", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q5_1_moe_raw(
+extern "C" int flint_mmq_q5_1_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q5_1>("qfn_mmq_q5_1_moe_raw", W, X, ids, out, M, K,
+    return flint_mmq_moe_impl<GGML_TYPE_Q5_1>("flint_mmq_q5_1_moe_raw", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q5_K_moe_raw(
+extern "C" int flint_mmq_q5_K_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q5_K>("qfn_mmq_q5_K_moe_raw", W, X, ids, out, M, K,
+    return flint_mmq_moe_impl<GGML_TYPE_Q5_K>("flint_mmq_q5_K_moe_raw", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q8_0_moe_pair(
+extern "C" int flint_mmq_q8_0_moe_pair(
     const void * W_a, const void * W_b, const float * X, const int32_t * ids,
     float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
     int n_expert_used, hipStream_t stream) {
     if (!W_b || !out_b) return -1;
-    return qfn_mmq_moe_impl<GGML_TYPE_Q8_0>("qfn_mmq_q8_0_moe_pair",
+    return flint_mmq_moe_impl<GGML_TYPE_Q8_0>("flint_mmq_q8_0_moe_pair",
         W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
         W_b, out_b);
 }
 
-extern "C" int qfn_mmq_q6_K_moe_raw(
+extern "C" int flint_mmq_q6_K_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q6_K>("qfn_mmq_q6_K_moe_raw", W, X, ids, out, M, K,
+    return flint_mmq_moe_impl<GGML_TYPE_Q6_K>("flint_mmq_q6_K_moe_raw", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_iq3_s_moe_raw(
+extern "C" int flint_mmq_iq3_s_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_IQ3_S>("qfn_mmq_iq3_s_moe_raw", W, X, ids, out, M, K,
+    return flint_mmq_moe_impl<GGML_TYPE_IQ3_S>("flint_mmq_iq3_s_moe_raw", W, X, ids, out, M, K,
                                              n_tokens, n_experts, n_expert_used, stream,
                                              nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_iq4_xs_moe_raw(
+extern "C" int flint_mmq_iq4_xs_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_IQ4_XS>("qfn_mmq_iq4_xs_moe_raw", W, X, ids, out, M, K,
+    return flint_mmq_moe_impl<GGML_TYPE_IQ4_XS>("flint_mmq_iq4_xs_moe_raw", W, X, ids, out, M, K,
                                               n_tokens, n_experts, n_expert_used, stream,
                                               nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q6_K_moe_pair(
+extern "C" int flint_mmq_q6_K_moe_pair(
     const void * W_a, const void * W_b, const float * X, const int32_t * ids,
     float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
     int n_expert_used, hipStream_t stream) {
     if (!W_b || !out_b) return -1;
-    return qfn_mmq_moe_impl<GGML_TYPE_Q6_K>("qfn_mmq_q6_K_moe_pair",
+    return flint_mmq_moe_impl<GGML_TYPE_Q6_K>("flint_mmq_q6_K_moe_pair",
         W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
         W_b, out_b);
 }
 
-extern "C" int qfn_mmq_q4_K_moe_pair_unique(
+extern "C" int flint_mmq_q4_K_moe_pair_unique(
     const void * W_a, const void * W_b, const float * X, const int32_t * ids,
     float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
     int n_expert_used, hipStream_t stream) {
     if (!W_b || !out_b) return -1;
-    return qfn_mmq_moe_impl<GGML_TYPE_Q4_K>("qfn_mmq_q4_K_moe_pair_unique",
+    return flint_mmq_moe_impl<GGML_TYPE_Q4_K>("flint_mmq_q4_K_moe_pair_unique",
         W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
         W_b, out_b);
 }
 
-extern "C" size_t qfn_mmq_q8_1_bytes(int N, int K) {
+extern "C" size_t flint_mmq_q8_1_bytes(int N, int K) {
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     return (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
 }
 
-extern "C" int qfn_mmq_quantize_q8_1(
+extern "C" int flint_mmq_quantize_q8_1(
         const float * X_f32, void * X_q8, int N, int K, hipStream_t stream) {
     if (!X_f32 || !X_q8 || N <= 0 || K <= 0 || K % 32 != 0) {
-        fprintf(stderr, "qfn_mmq_quantize_q8_1: bad arguments N=%d K=%d\n", N, K);
+        fprintf(stderr, "flint_mmq_quantize_q8_1: bad arguments N=%d K=%d\n", N, K);
         return -1;
     }
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -739,7 +739,7 @@ static void launch_q8_hc_down(const void* weights, const void* input,
     }
 }
 
-extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
+extern "C" int flint_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                                            const void* X_q8, float* out_f32,
                                            int M, int N, int K,
                                            hipStream_t stream) {
@@ -752,7 +752,7 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
        (M != 320 || K != 10240 || N % 8 != 0)) ||
       (N > MMVQ_MAX_BATCH_SIZE && W_gate)) {
     fprintf(stderr,
-            "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n", M, N,
+            "flint_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n", M, N,
             K);
     return -1;
   }
@@ -785,4 +785,4 @@ template void mul_mat_q_case<GGML_TYPE_IQ3_S>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
-} // namespace qfn_mmq
+} // namespace flint_mmq

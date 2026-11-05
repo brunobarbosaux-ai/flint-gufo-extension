@@ -9,7 +9,7 @@
 #include "gufo/ext/sha256.hpp"
 #include "hip/vendor/qwen/qwen_chat_template.hpp"
 
-namespace gufo::tokenization {
+namespace gufo::vendor::qwen::tokenization {
 namespace {
 
 std::string TemplateSha256(std::string_view value) {
@@ -27,4 +27,4 @@ bool QwenChatTemplate::IsOrnithTemplate(std::string_view raw_template) {
              OrnithTemplateSha256();
 }
 
-}  // namespace gufo::tokenization
+}  // namespace gufo::vendor::qwen::tokenization

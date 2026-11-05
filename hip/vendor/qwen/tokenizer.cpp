@@ -25,7 +25,7 @@
 #include "hip/vendor/qwen/qwen_chat_template.hpp"
 #include "hip/vendor/qwen/control_tokens.hpp"
 
-namespace gufo::tokenization {
+namespace gufo::vendor::qwen::tokenization {
 
 namespace {
 
@@ -813,4 +813,4 @@ bool QwenTokenizer::IsSpecialToken(TokenId id) const noexcept {
   return is_special_token_.contains(id);
 }
 
-}  // namespace gufo::tokenization
+}  // namespace gufo::vendor::qwen::tokenization

@@ -151,7 +151,7 @@ public:
   static constexpr std::size_t kWarmupTokens = 9000;
 
   FlintTextRunner(std::shared_ptr<FlintModel> model,
-                  std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+                  std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer,
                   std::vector<std::int32_t> stop_tokens,
                   std::uint32_t max_context,
                   std::string artifact_fingerprint = {})
@@ -284,7 +284,7 @@ public:
                           message.content + message.framing_suffix,
                           message.thought});
     }
-    tokenization::TokenizerOptions options;
+    gufo::vendor::qwen::tokenization::TokenizerOptions options;
     options.parse_special_tokens = true;
     // Qualified: the inherited TextModelRunner::RenderPrompt member would hide
     // the namespace-scope overload under unqualified lookup.
@@ -455,7 +455,7 @@ private:
   }
 
   std::shared_ptr<FlintModel> model_;
-  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer_;
   std::vector<std::int32_t> stop_tokens_;
   std::uint32_t max_context_;
   std::optional<ext::TextRunnerPersistenceDescriptor> persistence_;
@@ -504,7 +504,7 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
 
     std::string tokenizer_error;
     auto tokenizer =
-        tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
+        gufo::vendor::qwen::tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
     if (tokenizer == nullptr) {
       if (error)
         *error = "Flint tokenizer failed: " + tokenizer_error;

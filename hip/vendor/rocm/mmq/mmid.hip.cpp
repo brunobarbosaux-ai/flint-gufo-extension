@@ -1,6 +1,6 @@
-#include "qfn_mmq_prelude.h"
+#include "flint_mmq_prelude.h"
 #include "gufo/ext/experimental/managed_alloc.hpp"
-namespace qfn_mmq {
+namespace flint_mmq {
 #include "common.hpp"
 #include "mmid.hpp"
 
@@ -169,11 +169,11 @@ void ggml_hip_launch_mm_ids_helper(
     launch_mm_ids_helper_scan(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
 }
 
-}  // namespace qfn_mmq
+}  // namespace flint_mmq
 
-extern "C" int qfn_mmq_build_ids_maps(
+extern "C" int flint_mmq_build_ids_maps(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, hipStream_t stream) {
-    qfn_mmq::ggml_hip_launch_mm_ids_helper(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
+    flint_mmq::ggml_hip_launch_mm_ids_helper(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }

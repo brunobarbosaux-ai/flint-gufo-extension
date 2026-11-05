@@ -5,7 +5,7 @@
 #include <array>
 #include <string_view>
 
-namespace gufo::tokenization {
+namespace gufo::vendor::qwen::tokenization {
 
 /// Shared Qwen framing, also used by Qwen-Image, audio models and MiniMax H3.
 /// Other token families remain with their models. See AGENTS.md for guidance.
@@ -33,6 +33,6 @@ consteval auto ConcatControlText() {
   return text;
 }
 
-}  // namespace gufo::tokenization
+}  // namespace gufo::vendor::qwen::tokenization
 
 #endif  // GUFO_TOKENIZATION_QWEN_CONTROL_TOKENS_HPP_

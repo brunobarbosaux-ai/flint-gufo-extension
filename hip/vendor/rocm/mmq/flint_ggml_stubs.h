@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// qfn_ggml_stubs.h - minimal ggml-API stubs for Flash-Next's vendored mmq kernels.
+// flint_ggml_stubs.h - minimal ggml-API stubs for Flash-Next's vendored mmq kernels.
 //
 // The mmq.hpp / mma.hpp / vecdotq.hpp / quantize.hpp / mmid.hpp / common.hpp
 // files in this directory are vendored verbatim from llama.cpp's ggml-hip

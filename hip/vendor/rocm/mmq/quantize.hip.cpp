@@ -1,5 +1,5 @@
-#include "qfn_mmq_prelude.h"
-namespace qfn_mmq {
+#include "flint_mmq_prelude.h"
+namespace flint_mmq {
 #include "quantize.hpp"
 #include <cstdint>
 
@@ -270,4 +270,4 @@ void quantize_mmq_q8_1_hip(
     }
 }
 
-}  // namespace qfn_mmq
+}  // namespace flint_mmq

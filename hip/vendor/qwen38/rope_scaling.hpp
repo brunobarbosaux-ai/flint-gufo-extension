@@ -11,7 +11,7 @@
 #define QFN_HOST_DEVICE
 #endif
 
-namespace gufo::models::qwen38_flash_next {
+namespace gufo::vendor::qwen38_flash_next {
 
 /// Static YaRN context extension as in Hugging Face `rope_type: yarn`:
 /// truncated correction range, linear ramp between the beta bounds, and
@@ -100,6 +100,6 @@ QFN_HOST_DEVICE inline float YarnPairMultiplier(const YarnRope& yarn,
   return 1.0F - ramp * (1.0F - yarn.inv_factor);
 }
 
-}  // namespace gufo::models::qwen38_flash_next
+}  // namespace gufo::vendor::qwen38_flash_next
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_ROPE_SCALING_HPP_

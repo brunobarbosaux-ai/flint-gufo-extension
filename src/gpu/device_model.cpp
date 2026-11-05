@@ -127,7 +127,7 @@ public:
     if (t->type == core::GgmlType::kQ8_0) {
       rocm::ExpandQ8ToHalf(t->data, static_cast<__half*>(t->half_data), count,
                            nullptr);
-    } else if (!qwen38_flash_next::rocm::DequantizeHalf(
+    } else if (!gufo::vendor::qwen38_flash_next::rocm::DequantizeHalf(
                    t->data, t->type, static_cast<__half*>(t->half_data), count,
                    nullptr)) {
       t->half_data = nullptr;

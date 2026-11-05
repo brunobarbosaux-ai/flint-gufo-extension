@@ -15,7 +15,7 @@
 #include "src/gpu/kernels/kernels.hpp"
 #include "hip/vendor/rocm/blaslt.hpp"
 #include "hip/vendor/rocm/kernels.hpp"
-#include "hip/vendor/rocm/mmq/qfn_mmq.h"
+#include "hip/vendor/rocm/mmq/flint_mmq.h"
 
 namespace gufo::models::flint::gpu {
 namespace {
@@ -236,7 +236,7 @@ struct Session::Impl {
   __half* xh{nullptr};
   bool xh_valid{false};
 
-  std::unique_ptr<qwen38_flash_next::rocm::BlasLt> blaslt;
+  std::unique_ptr<gufo::vendor::qwen38_flash_next::rocm::BlasLt> blaslt;
   struct StepGraph {
     hipGraphExec_t exec{nullptr};
     bool failed{false};
@@ -410,10 +410,10 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
   FLINT_HIP(hipStreamCreateWithFlags(&side_stream, hipStreamNonBlocking));
   FLINT_HIP(hipEventCreateWithFlags(&fork_event, hipEventDisableTiming));
   FLINT_HIP(hipEventCreateWithFlags(&join_event, hipEventDisableTiming));
-  if (qfn_mmq_init(0) != 0)
+  if (flint_mmq_init(0) != 0)
     return Fail(error_msg, "mmq initialization failed");
   std::string blaslt_error;
-  blaslt = qwen38_flash_next::rocm::BlasLt::Create(stream, &blaslt_error);
+  blaslt = gufo::vendor::qwen38_flash_next::rocm::BlasLt::Create(stream, &blaslt_error);
   if (!blaslt)
     return Fail(error_msg, "hipBLASLt: " + blaslt_error);
 
@@ -466,9 +466,9 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
        route_bounds.Allocate(kMaxExperts + 1) &&
        route_cursors.Allocate(kMaxExperts) &&
        rows_token.Allocate(
-           qwen38_flash_next::rocm::RoutedCompactRows(slots, c.expert_count)) &&
+           gufo::vendor::qwen38_flash_next::rocm::RoutedCompactRows(slots, c.expert_count)) &&
        rows_slot.Allocate(
-           qwen38_flash_next::rocm::RoutedCompactRows(slots, c.expert_count)) &&
+           gufo::vendor::qwen38_flash_next::rocm::RoutedCompactRows(slots, c.expert_count)) &&
        tiles_pair.Allocate(tile_capacity_for(slots, c.expert_count)) &&
        tiles_down.Allocate(tile_capacity_for(slots, c.expert_count)) &&
        act_half.Allocate(slots * c.expert_ff) &&
@@ -487,9 +487,9 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
        d_logits.Allocate(std::size_t{Session::kMaxVerifyRows} * c.vocab_size) &&
        attn_part.Allocate(std::size_t{kVecBatch} * c.num_heads * kGlobalSplits *
                           (c.head_dim + 2));
-  const std::size_t q8_bytes = qfn_mmq_q8_1_bytes(kVecBatch, kQ8MaxK);
+  const std::size_t q8_bytes = flint_mmq_q8_1_bytes(kVecBatch, kQ8MaxK);
   const std::size_t tiled_bytes =
-      qwen38_flash_next::rocm::Q8TiledBytes(tile, kQ8MaxK);
+      gufo::vendor::qwen38_flash_next::rocm::Q8TiledBytes(tile, kQ8MaxK);
   ok = ok && hipMalloc(&q8_tiled, tiled_bytes) == hipSuccess &&
        hipMalloc(reinterpret_cast<void**>(&xh),
                  std::size_t{tile} * c.hidden_size * sizeof(__half)) ==
@@ -526,7 +526,7 @@ bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
                           std::uint32_t n, std::string* error_msg) {
   if (w.type == GgmlType::kQ8_0 && n > kVecBatch && w.cols < kW8A8MinK) {
     rocm::NarrowRows(in, x_half, n, w.cols, w.cols, stream);
-    if (!qwen38_flash_next::rocm::DenseF16Gemm(w.data, x_half, out, n, w.rows,
+    if (!gufo::vendor::qwen38_flash_next::rocm::DenseF16Gemm(w.data, x_half, out, n, w.rows,
                                                w.cols, stream)) {
       return Fail(error_msg, "Q8 F16 GEMM failed");
     }
@@ -534,7 +534,7 @@ bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
   }
   if (w.half_data != nullptr && n > kVecBatch) {
     rocm::NarrowRows(in, x_half, n, w.cols, w.cols, stream);
-    if (!qwen38_flash_next::rocm::DenseHalfWeightGemm(
+    if (!gufo::vendor::qwen38_flash_next::rocm::DenseHalfWeightGemm(
             static_cast<const __half*>(w.half_data), x_half, out, n, w.rows,
             w.cols, stream)) {
       return Fail(error_msg, "F16 GEMM failed");
@@ -543,13 +543,13 @@ bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
   }
   if (w.type == GgmlType::kQ8_0) {
     if (n > kVecBatch && w.rows != kStackedQkvRows) {
-      qwen38_flash_next::rocm::QuantizeQ8Tiled(in, q8_tiled, n, w.cols, stream);
-      if (qwen38_flash_next::rocm::W8A8Gemm(w.data, q8_tiled, out, n, w.rows,
+      gufo::vendor::qwen38_flash_next::rocm::QuantizeQ8Tiled(in, q8_tiled, n, w.cols, stream);
+      if (gufo::vendor::qwen38_flash_next::rocm::W8A8Gemm(w.data, q8_tiled, out, n, w.rows,
                                             w.cols, stream)) {
         return true;
       }
     }
-    if (qfn_mmq_q8_0_dense(w.data, in, out, static_cast<int>(w.rows),
+    if (flint_mmq_q8_0_dense(w.data, in, out, static_cast<int>(w.rows),
                            static_cast<int>(n), static_cast<int>(w.cols),
                            stream) != 0) {
       return Fail(error_msg, "Q8_0 dense projection failed");
@@ -562,7 +562,7 @@ bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
     float* dst = out + static_cast<std::size_t>(r0) * w.rows;
     // An unselected expert id set: one ungated row per token.
     const int rc =
-        qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, src, zero_ids.get(),
+        flint_mmq_moe_vec(static_cast<int>(w.type), w.data, src, zero_ids.get(),
                         dst, static_cast<int>(w.rows), static_cast<int>(w.cols),
                         static_cast<int>(rows), 1, 1, stream, nullptr, nullptr);
     if (rc != 0)
@@ -582,35 +582,35 @@ bool Session::Impl::Experts(const DeviceTensor& w, const float* in, float* out,
   const std::int32_t* routed_ids = rt->ids.get();
   int rc = -1;
   if (rows * used <= kVecExpertRows) {
-    rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, in, routed_ids, out,
+    rc = flint_mmq_moe_vec(static_cast<int>(w.type), w.data, in, routed_ids, out,
                          M, K, T, E, U, stream, nullptr, nullptr);
   } else {
-    qfn_mmq_set_routed_max_expert_rows(static_cast<int>(n_tokens));
-    qfn_mmq_set_routed_tile_cols(
+    flint_mmq_set_routed_max_expert_rows(static_cast<int>(n_tokens));
+    flint_mmq_set_routed_tile_cols(
         RoutedTileCols(n_tokens, model->config.expert_used, w.experts));
     switch (w.type) {
       case GgmlType::kQ4_K:
-        rc = qfn_mmq_q4_K_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
+        rc = flint_mmq_q4_K_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
                                   stream);
         break;
       case GgmlType::kQ5_K:
-        rc = qfn_mmq_q5_K_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
+        rc = flint_mmq_q5_K_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
                                   stream);
         break;
       case GgmlType::kQ5_1:
-        rc = qfn_mmq_q5_1_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
+        rc = flint_mmq_q5_1_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
                                   stream);
         break;
       case GgmlType::kQ8_0:
-        rc = qfn_mmq_q8_0_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
+        rc = flint_mmq_q8_0_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
                                   stream);
         break;
       case GgmlType::kIQ3_S:
-        rc = qfn_mmq_iq3_s_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
+        rc = flint_mmq_iq3_s_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
                                    stream);
         break;
       case GgmlType::kIQ4_XS:
-        rc = qfn_mmq_iq4_xs_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
+        rc = flint_mmq_iq4_xs_moe_raw(w.data, in, routed_ids, out, M, K, T, E, U,
                                     stream);
         break;
       default:
@@ -618,8 +618,8 @@ bool Session::Impl::Experts(const DeviceTensor& w, const float* in, float* out,
     }
   }
   if (rows * used > kVecExpertRows) {
-    qfn_mmq_set_routed_max_expert_rows(0);
-    qfn_mmq_set_routed_tile_cols(0);
+    flint_mmq_set_routed_max_expert_rows(0);
+    flint_mmq_set_routed_tile_cols(0);
   }
   if (rc != 0)
     return Fail(error_msg, "routed expert projection failed");
@@ -632,7 +632,7 @@ bool Session::Impl::Quantize(const float* x, std::uint32_t n, std::uint32_t k,
   out->q = nullptr;
   if (n > kVecBatch)
     return true;
-  if (qfn_mmq_quantize_q8_1(x, slot, static_cast<int>(n), static_cast<int>(k),
+  if (flint_mmq_quantize_q8_1(x, slot, static_cast<int>(n), static_cast<int>(k),
                             stream) != 0) {
     return Fail(error_msg, "activation quantization failed");
   }
@@ -643,7 +643,7 @@ bool Session::Impl::Quantize(const float* x, std::uint32_t n, std::uint32_t k,
 bool Session::Impl::Project(const DeviceTensor& w, const Q8Rows& in, float* out,
                             std::uint32_t n, std::string* error_msg) {
   if (in.q != nullptr && w.type == GgmlType::kQ8_0) {
-    if (qfn_mmq_q8_0_dense_vec_preq(
+    if (flint_mmq_q8_0_dense_vec_preq(
             w.data, nullptr, in.q, out, static_cast<int>(w.rows),
             static_cast<int>(n), static_cast<int>(w.cols), stream) != 0) {
       return Fail(error_msg, "Q8_0 GEMV failed");
@@ -659,7 +659,7 @@ bool Session::Impl::Gated(const DeviceTensor& up, const DeviceTensor& gate,
                           float* scale_out) {
   if (in.q != nullptr && up.type == GgmlType::kQ8_0 &&
       gate.type == GgmlType::kQ8_0) {
-    if (qfn_mmq_q8_0_dense_vec_preq(
+    if (flint_mmq_q8_0_dense_vec_preq(
             up.data, gate.data, in.q, out, static_cast<int>(up.rows),
             static_cast<int>(n), static_cast<int>(up.cols), stream) != 0) {
       return Fail(error_msg, "gated Q8_0 GEMV failed");
@@ -701,7 +701,7 @@ bool Session::Impl::Ffn(const DeviceLayer& layer, std::uint32_t n,
 
 bool Session::Impl::RoutedBegin(std::uint32_t n, std::string* error_msg) {
   const Config& c = model->config;
-  qwen38_flash_next::rocm::ExpertCounts(rt->ids.get(), rt->counts.get(), n,
+  gufo::vendor::qwen38_flash_next::rocm::ExpertCounts(rt->ids.get(), rt->counts.get(), n,
                                         c.expert_count, c.expert_used, stream);
   FLINT_HIP(hipMemcpyAsync(rt->h_counts, rt->counts.get(),
                            c.expert_count * sizeof(std::uint32_t),
@@ -712,7 +712,7 @@ bool Session::Impl::RoutedBegin(std::uint32_t n, std::string* error_msg) {
 
 bool Session::Impl::RoutedExperts(const DeviceLayer& layer, std::uint32_t n,
                                   std::string* error_msg) {
-  using qwen38_flash_next::rocm::WeightType;
+  using gufo::vendor::qwen38_flash_next::rocm::WeightType;
   const Config& c = model->config;
   const std::uint32_t used = c.expert_used;
   const std::uint32_t experts = c.expert_count;
@@ -754,13 +754,13 @@ bool Session::Impl::RoutedExperts(const DeviceLayer& layer, std::uint32_t n,
   FLINT_HIP(hipMemcpyAsync(tiles_down.get(), host_down,
                            down_tiles * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, stream));
-  qwen38_flash_next::rocm::RoutedCompact(
+  gufo::vendor::qwen38_flash_next::rocm::RoutedCompact(
       rt->ids.get(), rt->counts.get(), route_bounds.get(), route_cursors.get(),
       rows_token.get(), rows_slot.get(), n, used, experts, stream);
   const __half* xh_in = XnHalf(n);
 
-  using qwen38_flash_next::rocm::RoutedF16Gemm;
-  using qwen38_flash_next::rocm::RoutedGatedF16Gemm;
+  using gufo::vendor::qwen38_flash_next::rocm::RoutedF16Gemm;
+  using gufo::vendor::qwen38_flash_next::rocm::RoutedGatedF16Gemm;
   bool ok;
   if (gated) {
     ok = RoutedGatedF16Gemm(
@@ -806,7 +806,7 @@ bool Session::Impl::MoePre(const DeviceLayer& layer, std::uint32_t n,
   const std::uint32_t used = c.expert_used;
   if (n > kVecBatch && layer.router.half_data != nullptr) {
     const __half* xh_in = XnHalf(n);
-    if (!qwen38_flash_next::rocm::DenseHalfWeightGemm(
+    if (!gufo::vendor::qwen38_flash_next::rocm::DenseHalfWeightGemm(
             static_cast<const __half*>(layer.router.half_data), xh_in,
             router.get(), n, c.expert_count, c.hidden_size, stream)) {
       return Fail(error_msg, "router GEMM failed");
@@ -869,7 +869,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
                         const float* next_gamma, std::string* error_msg) {
   const Config& c = model->config;
   const std::uint32_t used = c.expert_used;
-  using qwen38_flash_next::rocm::WeightType;
+  using gufo::vendor::qwen38_flash_next::rocm::WeightType;
   const DeviceTensor& ge_check = layer.gate_exps;
   const DeviceTensor& ue_check = layer.up_exps;
   const bool gated_check =
@@ -877,7 +877,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
       (ge_check.type == GgmlType::kQ4_K || ge_check.type == GgmlType::kQ5_K ||
        ge_check.type == GgmlType::kIQ3_S || ge_check.type == GgmlType::kIQ4_XS);
   const bool routed_f16 =
-      (gated_check ? qwen38_flash_next::rocm::RoutedGatedF16Supported(
+      (gated_check ? gufo::vendor::qwen38_flash_next::rocm::RoutedGatedF16Supported(
                          static_cast<WeightType>(ge_check.type))
                    : RoutedF16Weights(ge_check.type) &&
                          RoutedF16Weights(ue_check.type)) &&
@@ -914,7 +914,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
     const bool paired = n * used <= kVecExpertRows && ge.type == ue.type &&
                         ge.rows == ue.rows && ge.cols == ue.cols;
     if (paired) {
-      if (qfn_mmq_moe_vec(static_cast<int>(ge.type), ge.data, cxn,
+      if (flint_mmq_moe_vec(static_cast<int>(ge.type), ge.data, cxn,
                           rt->ids.get(), gate_e.get(),
                           static_cast<int>(ge.rows), static_cast<int>(ge.cols),
                           static_cast<int>(n), static_cast<int>(ge.experts),

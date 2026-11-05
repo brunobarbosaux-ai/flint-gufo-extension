@@ -16,7 +16,7 @@
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
 /// launch is asynchronous on `stream`. Weights referenced here are device
 /// pointers in their GGUF encoding.
-namespace gufo::models::qwen38_flash_next::rocm {
+namespace gufo::vendor::qwen38_flash_next::rocm {
 
 /// Stable per-prefix rollback addresses. Growing the depth does not move
 /// existing buffers or invalidate graphs captured for a smaller batch.
@@ -69,7 +69,7 @@ std::uint32_t HcInjectParts(std::uint32_t hidden);
 std::uint32_t HcInjectPartsVec4(std::uint32_t hidden);
 /// A non-null `mixed_q8` (hidden % 32 == 0) also receives mixed as the
 /// small-batch projections' Q8_1 rows, byte-identical to
-/// qfn_mmq_quantize_q8_1.
+/// flint_mmq_quantize_q8_1.
 void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
@@ -101,7 +101,7 @@ void HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode = false);
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as
-/// qfn_mmq_quantize_q8_1 would) to `xn_q8` for a small-batch mixer down
+/// flint_mmq_quantize_q8_1 would) to `xn_q8` for a small-batch mixer down
 /// projection. False, with nothing launched, without `gamma` or unless
 /// hidden % 32 == 0.
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
@@ -152,7 +152,7 @@ bool HcCombineMoeF16(
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
 /// SiluScale over `rows` rows of `k` that also writes x's Q8_1 rows, each
-/// `k_padded` wide, to `x_q8` as qfn_mmq_quantize_q8_1 would (the padding
+/// `k_padded` wide, to `x_q8` as flint_mmq_quantize_q8_1 would (the padding
 /// blocks are left as they are). False, with nothing launched, unless k and
 /// k_padded >= k are multiples of 32.
 bool SiluScaleQ8_1(float* x, float scale, std::uint32_t rows, std::uint32_t k,
@@ -171,7 +171,7 @@ bool SwigluQ8Tiled(const float* gate, const float* up, void* out_q8,
 void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream);
 /// SigmoidMul that also writes x's Q8_1 rows to `x_q8` as
-/// qfn_mmq_quantize_q8_1 would for unpadded rows. False, with nothing
+/// flint_mmq_quantize_q8_1 would for unpadded rows. False, with nothing
 /// launched, unless count is a multiple of 32.
 bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
                     hipStream_t stream);
@@ -394,7 +394,7 @@ struct GdnCheckpoint {
 /// (K = v_heads * d) instead of `out`. With null `out_q8`, a non-null
 /// `out_half` receives F16 rows instead of `out`. With both null, a non-null
 /// `out_q8_1` also receives the rows' unpadded Q8_1 rows (as
-/// qfn_mmq_quantize_q8_1 writes them; d == 128). The epilogue, the reader
+/// flint_mmq_quantize_q8_1 writes them; d == 128). The epilogue, the reader
 /// of `z`, waits for `z_ready` when it is set. Returns false when that wait
 /// cannot be queued. `convolved`
 /// consumes convolution rows already in conv_scratch; it requires null
@@ -669,6 +669,6 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::vendor::qwen38_flash_next::rocm
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_

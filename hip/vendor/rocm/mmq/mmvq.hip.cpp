@@ -1,5 +1,5 @@
-#include "qfn_mmq_prelude.h"
-namespace qfn_mmq {
+#include "flint_mmq_prelude.h"
+namespace flint_mmq {
 #include "mmvq.hpp"
 #include "unary.hpp"
 #include "vecdotq.hpp"
@@ -919,4 +919,4 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
   }
 }
 
-}  // namespace qfn_mmq
+}  // namespace flint_mmq

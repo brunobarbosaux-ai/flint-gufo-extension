@@ -1,3 +1,4 @@
+#include <gufo/ext/generated/flint_constants.hpp>
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
 
@@ -5,12 +6,14 @@
 #include "probe.hpp"
 #include "runner.hpp"
 
-// Provider metadata (ProviderInfo) is generated from extension.json and
-// registered by the generated registry, so this entry point only adds the text
-// provider. The CPU build registers nothing: flint_register already reports the
-// artifact through the probe-only provider.
+// Provider entry point, run by the host's generated registry only when the
+// provider target is enabled. Metadata comes from extension.json and lives in
+// the generated header, so registration adds the generated ProviderInfo first
+// and then the typed text callbacks. The probe-only provider for CPU builds is
+// registered by flint_register from extension.cpp.
 void flint_provider_register(gufo::ext::Registry& registry) {
-#if defined(ENGINE_ENABLE_HIP)
+  registry.AddProvider(
+      gufo::ext::generated::extension_flint::kProvider_flint);
   registry.AddTextProvider({
       .id = "flint",
       .probe = &gufo::models::flint::ProbeFlint,
@@ -20,7 +23,4 @@ void flint_provider_register(gufo::ext::Registry& registry) {
       .prompt_driver = &gufo::models::flint::RunFlintPrompt,
       .chat_driver = &gufo::models::flint::RunFlintChat,
   });
-#else
-  (void)registry;
-#endif
 }

@@ -1,5 +1,7 @@
 #include "probe.hpp"
 
+#include "gguf_test_shim.hpp"
+
 #include <cstring>
 #include <filesystem>
 #include <fstream>

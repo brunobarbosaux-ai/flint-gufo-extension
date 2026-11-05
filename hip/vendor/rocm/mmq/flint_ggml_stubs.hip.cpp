@@ -1,14 +1,14 @@
-#include "qfn_mmq_prelude.h"
+#include "flint_mmq_prelude.h"
 #include "gufo/ext/experimental/managed_alloc.hpp"
-namespace qfn_mmq {
+namespace flint_mmq {
 // SPDX-License-Identifier: MIT
-// Implementations of the ggml-API stubs declared in qfn_ggml_stubs.h plus
+// Implementations of the ggml-API stubs declared in flint_ggml_stubs.h plus
 // the bodies of ggml_backend_hip_context / ggml_hip_info /
 // new_pool_for_device that the vendored common.hpp declares without
 // defining.
 //
 
-#include "common.hpp"   // pulls in qfn_ggml_stubs.h via redirect headers
+#include "common.hpp"   // pulls in flint_ggml_stubs.h via redirect headers
 
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
@@ -187,7 +187,7 @@ ggml_hip_pool & qfn_pool_for_stream(int device, hipStream_t stream) {
 
 // The caller must have stopped every host submission and allocation on `stream` first: the
 // lock protects the map, not the pool references handed out by qfn_pool_for_stream.
-extern "C" void qfn_mmq_release_stream(hipStream_t stream) {
+extern "C" void flint_mmq_release_stream(hipStream_t stream) {
     const std::lock_guard<std::mutex> lock(g_stream_pools_mutex);
     for (auto it = g_stream_pools.begin(); it != g_stream_pools.end();) {
         if (it->first.second != stream) {
@@ -198,7 +198,7 @@ extern "C" void qfn_mmq_release_stream(hipStream_t stream) {
         // may still be running, so keep (leak) the arena rather than free memory in use.
         const hipError_t status = hipStreamSynchronize(stream);
         if (status != hipSuccess) {
-            fprintf(stderr, "qfn_mmq_release_stream: stream %p not synchronized (%s); keeping its scratch arena\n",
+            fprintf(stderr, "flint_mmq_release_stream: stream %p not synchronized (%s); keeping its scratch arena\n",
                     (void *) stream, hipGetErrorString(status));
             (void) it->second.release();
         }
@@ -218,4 +218,4 @@ ggml_backend_hip_context::~ggml_backend_hip_context() {
     // unique_ptr.).
 }
 
-}  // namespace qfn_mmq
+}  // namespace flint_mmq

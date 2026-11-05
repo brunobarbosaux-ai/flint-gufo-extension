@@ -229,8 +229,9 @@ cache::Completion FlintContinuationAdapter::CapturePrivatePiece(
   if (offset > total || bytes.size() > total - offset)
     throw std::invalid_argument("invalid Flint private piece");
   // Save into a temporary sized for the live snapshot, then place header and
-  // snapshot into whatever span of the fixed payload this piece covers. Bytes
-  // beyond the live snapshot stay zero, so a payload is deterministic.
+  // snapshot directly into the destination span. Bytes of the payload beyond
+  // the live snapshot are zeroed so a payload is deterministic without
+  // materialising a second full-capacity buffer.
   const auto live_bytes = state.session->SnapshotBytes();
   if (live_bytes > snapshot_bytes_)
     throw std::logic_error("Flint live snapshot exceeds its capacity");
@@ -242,10 +243,25 @@ cache::Completion FlintContinuationAdapter::CapturePrivatePiece(
                              .reserved = 0,
                              .position = state.session->Position(),
                              .snapshot_len = live_bytes};
-  std::vector<std::uint8_t> payload(total, 0);
-  std::memcpy(payload.data(), &header, sizeof(header));
-  std::memcpy(payload.data() + sizeof(header), live.data(), live_bytes);
-  std::memcpy(bytes.data(), payload.data() + offset, bytes.size());
+  const auto copy = [&](std::size_t from, const void* source,
+                        std::size_t count) {
+    const auto to = from + count;
+    if (to <= offset || from >= offset + bytes.size())
+      return;
+    const auto begin = std::max(from, offset);
+    const auto end = std::min(to, offset + bytes.size());
+    std::memcpy(bytes.data() + (begin - offset),
+                static_cast<const std::uint8_t*>(source) + (begin - from),
+                end - begin);
+  };
+  // Zero the region the live snapshot does not cover.
+  const auto covered = sizeof(PayloadHeader) + live_bytes;
+  const auto zero_begin = std::max(offset, covered);
+  const auto zero_end = std::min(offset + bytes.size(), total);
+  if (zero_begin < zero_end)
+    std::memset(bytes.data() + (zero_begin - offset), 0, zero_end - zero_begin);
+  copy(0, &header, sizeof(header));
+  copy(sizeof(PayloadHeader), live.data(), live_bytes);
   return State::Settled(true);
 }
 

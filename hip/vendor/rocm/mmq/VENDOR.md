@@ -15,9 +15,9 @@ upstream runtime aliases, NVIDIA capability dispatch and PTX branches have
 been removed; retained matrix fragments use AMD WMMA/MFMA. Headers use the
 `.hpp` suffix. Gufo owns scheduling and HIP graphs.
 
-When importing an upstream fix, preserve the Gufo namespace, adapter and
-HIP-only dispatch, update the pin, and run the Flash-Next operator tests
-under `tests/models/qwen38_flash_next/` plus the AR/MTP session replay.
-The routed GEMM test compares supported formats against a floating-point
-reference and checks the paired adapter against two separate projections.
-Build and validate through Nix as described in `AGENTS.md`.
+When importing an upstream fix, preserve the namespace mapping documented in
+`THIRD_PARTY_NOTICES.md` (`qfn_mmq` -> `flint_mmq`, `qfn_ggml_stubs` ->
+`flint_ggml_stubs`), update the pin, and run the `flint.ops` operator test
+plus the extension's parity gates (`docs/QUALITY.md`). The routed GEMM test
+compares supported formats against a floating-point reference and checks the
+paired adapter against two separate projections.

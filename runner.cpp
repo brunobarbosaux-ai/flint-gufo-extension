@@ -22,8 +22,8 @@
 #include <utility>
 #include <vector>
 
-#include "hip/vendor/qwen/tokenizer.hpp"
 #include "continuation_adapter.hpp"
+#include "hip/vendor/qwen/tokenizer.hpp"
 #include "src/chat_template.hpp"
 #include "src/gpu/engine.hpp"
 #include "src/runtime/config.hpp"
@@ -60,8 +60,8 @@ std::vector<std::uint8_t> FlintCompatibilityIdentity(
   return {canonical.begin(), canonical.end()};
 }
 
-std::vector<std::uint8_t> ComponentIdentity(
-    const FlintModel* model, std::uint32_t max_context) {
+std::vector<std::uint8_t> ComponentIdentity(const FlintModel* model,
+                                            std::uint32_t max_context) {
   std::ostringstream identity;
   identity << "schema=gufo-process-text-continuation-v1\n"
            << "model_kind=flint\n"
@@ -89,57 +89,44 @@ std::vector<std::int32_t> FlintEngineTokens(
   }
   return converted;
 }
+// Provider sampling defaults for the prompt/chat drivers and the HTTP path.
+// Flint has no published preset; this mirrors a moderate general-purpose
+// setting and is overridden by any explicit CLI or per-request value. Held as
+// one function so the descriptor and the provider probe stay in agreement.
+sampling::TextSamplingDefaults FlintSamplingDefaults() {
+  sampling::TextSamplingValues unspecified;
+  unspecified.temperature = 0.6F;
+  unspecified.top_p = 0.95F;
+  sampling::TextSamplingValues thinking_on = unspecified;
+  thinking_on.top_k = 20;
+  sampling::TextSamplingValues thinking_off = unspecified;
+  thinking_off.top_k = 20;
+  return {unspecified, thinking_on, thinking_off};
+}
 
 class FlintTextRunnerState final : public ext::TextRunnerState {
 public:
-  FlintTextRunnerState(const std::shared_ptr<FlintModel>& model,
-                       std::uint32_t max_context) {
-    std::string error;
-    session_ = model->CreateSession(max_context + FlintSession::kMaxVerifyRows,
-                                    &error);
-    if (session_ == nullptr) {
-      throw std::runtime_error("Failed to create Flint session: " + error);
-    }
-  }
-
   // Component-cache slot: the session is owned by the adapter's slot, which
-  // outlives this state through the retained adapter/slot handles.
+  // outlives this state through the retained adapter/slot handles. Invalidate
+  // routes through the adapter so the slot resets its session and guard.
   FlintTextRunnerState(FlintSession& session, cache::Adapter& adapter,
                        cache::Slot& slot)
-      : bound_session_(&session), adapter_(&adapter), slot_(&slot) {}
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
   void Invalidate() noexcept override {
     position_ = 0;
-    session().Reset();
+    (void)adapter_->Invalidate(*slot_);
   }
 
-  [[nodiscard]] FlintSession& session() const {
-    return bound_session_ != nullptr ? *bound_session_ : *session_;
-  }
+  [[nodiscard]] FlintSession& session() const { return *session_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<FlintSession> session_;
-  FlintSession* bound_session_{nullptr};
+  FlintSession* session_{nullptr};
   cache::Adapter* adapter_{nullptr};
   cache::Slot* slot_{nullptr};
   std::size_t position_{0};
-};
-
-class FlintTextRunnerSnapshot final : public ext::TextRunnerSnapshot {
-public:
-  FlintTextRunnerSnapshot(std::shared_ptr<FlintModel> model,
-                          std::vector<std::uint8_t> bytes, std::size_t position)
-      : model(std::move(model)), bytes(std::move(bytes)), position(position) {}
-
-  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return bytes.size();
-  }
-
-  std::shared_ptr<FlintModel> model;
-  std::vector<std::uint8_t> bytes;
-  std::size_t position;
 };
 
 FlintTextRunnerState& RequireFlintState(ext::TextRunnerState& state) {
@@ -179,21 +166,27 @@ public:
   static constexpr std::size_t kPrefillChunk = 8192;
   static constexpr std::size_t kWarmupTokens = 9000;
 
-  FlintTextRunner(std::shared_ptr<FlintModel> model,
-                  std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer,
-                  std::vector<std::int32_t> stop_tokens,
-                  std::uint32_t max_context,
-                  std::string artifact_fingerprint = {})
+  FlintTextRunner(
+      std::shared_ptr<FlintModel> model,
+      std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer>
+          tokenizer,
+      std::vector<std::int32_t> stop_tokens, std::uint32_t max_context,
+      std::string artifact_fingerprint = {})
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         stop_tokens_(std::move(stop_tokens)),
         max_context_(max_context) {
+    // Durable caches require the validated artifact fingerprint; without it the
+    // loaded model instance is the identity, as for the LFM3 continuation.
     if (!artifact_fingerprint.empty()) {
-      persistence_ = ext::TextRunnerPersistenceDescriptor{
-          .compatibility_identity =
-              FlintCompatibilityIdentity(artifact_fingerprint, max_context_),
-          .payload_version = FlintSession::kSnapshotPayloadVersion,
-      };
+      if (artifact_fingerprint.size() != 64 ||
+          artifact_fingerprint.find_first_not_of("0123456789abcdef") !=
+              std::string::npos)
+        throw std::invalid_argument("invalid Flint artifact fingerprint");
+      component_identity_ =
+          FlintCompatibilityIdentity(artifact_fingerprint, max_context_);
+    } else {
+      component_identity_ = ComponentIdentity(model_.get(), max_context_);
     }
     Warmup();
   }
@@ -251,13 +244,11 @@ public:
         .capabilities =
             ext::TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .prefix_reuse = true,
             },
-        .persistence = persistence_,
+        .sampling_defaults = FlintSamplingDefaults(),
     };
   }
 
@@ -284,20 +275,13 @@ public:
     return {{.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}};
   }
 
-  [[nodiscard]] bool UsesComponentCache() const override { return true; }
-
   [[nodiscard]] std::unique_ptr<ext::ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
     (void)ram;
-    cache::Identity identity;
-    if (persistence_.has_value())
-      identity = persistence_->compatibility_identity;
-    else
-      identity = ComponentIdentity(model_.get(), max_context_);
     return hip::CreateHipComponentCacheResources(
         std::make_unique<FlintContinuationAdapter>(model_, max_context_,
-                                                   std::move(identity)),
+                                                   component_identity_),
         ledger,
         hip::ComponentCacheHooks{
             [] { return ext::HostSnapshotCeilingBytes(); },
@@ -359,11 +343,6 @@ public:
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
     return tokenizer_->Decode(tokens);
-  }
-
-  [[nodiscard]] std::unique_ptr<ext::TextRunnerState> CreateState()
-      const override {
-    return std::make_unique<FlintTextRunnerState>(model_, max_context_);
   }
 
   void PreparePrefixReuse(
@@ -435,73 +414,10 @@ public:
     return RequireFlintState(state).position();
   }
 
-  [[nodiscard]] std::size_t SnapshotPayloadBytes(
-      const ext::TextRunnerState& state) const override {
-    return RequireFlintState(state).session().SnapshotBytes();
-  }
-
-  [[nodiscard]] std::unique_ptr<ext::TextRunnerSnapshot> Snapshot(
-      const ext::TextRunnerState& state) const override {
-    const auto& flint = RequireFlintState(state);
-    std::vector<std::uint8_t> bytes(flint.session().SnapshotBytes());
-    std::string error;
-    if (!flint.session().SaveSnapshot(bytes, &error))
-      throw std::runtime_error("Flint snapshot failed: " + error);
-    return std::make_unique<FlintTextRunnerSnapshot>(model_, std::move(bytes),
-                                                     flint.position());
-  }
-
-  void RestoreOrFork(ext::TextRunnerState& state,
-                     const ext::TextRunnerSnapshot& snapshot) const override {
-    const auto& flint_snapshot = RequireSnapshot(snapshot);
-    auto& restored = RequireFlintState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(flint_snapshot.bytes, &error)) {
-      restored.Invalidate();
-      throw std::runtime_error("Flint snapshot restore failed: " + error);
-    }
-    restored.set_position(flint_snapshot.position);
-  }
-
-  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
-      const ext::TextRunnerSnapshot& snapshot) const override {
-    return RequireSnapshot(snapshot).bytes.size();
-  }
-
-  [[nodiscard]] std::size_t SerializePersistentSnapshot(
-      const ext::TextRunnerSnapshot& snapshot,
-      std::span<std::uint8_t> destination) const override {
-    const auto& bytes = RequireSnapshot(snapshot).bytes;
-    if (destination.size() != bytes.size()) {
-      throw std::invalid_argument(
-          "Flint persistent snapshot serialization failed");
-    }
-    std::memcpy(destination.data(), bytes.data(), bytes.size());
-    return destination.size();
-  }
-
-  void StreamPersistentSnapshot(const ext::TextRunnerSnapshot& snapshot,
-                                const SnapshotSink& sink) const override {
-    sink(RequireSnapshot(snapshot).bytes);
-  }
-
-  void RestorePersistentSnapshot(
-      ext::TextRunnerState& state,
-      std::span<const std::uint8_t> payload) const override {
-    auto& restored = RequireFlintState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(payload, &error)) {
-      restored.Invalidate();
-      throw std::runtime_error("Flint persistent snapshot restore failed: " +
-                               error);
-    }
-    const std::uint32_t position = restored.session().Position();
-    if (position == 0 || position > max_context_) {
-      restored.Invalidate();
-      throw std::runtime_error(
-          "Flint persistent snapshot restored an invalid position");
-    }
-    restored.set_position(position);
+  [[nodiscard]] ext::ReasoningTags ReasoningBudgetTags() const override {
+    // Flint's budget control tokens are its reasoning delimiters; the default
+    // ReasoningDelimiters() then splits them for the response parsers.
+    return {" thinking", " response", {" response"}};
   }
 
 private:
@@ -510,23 +426,19 @@ private:
            stop_tokens_.end();
   }
 
-  [[nodiscard]] const FlintTextRunnerSnapshot& RequireSnapshot(
-      const ext::TextRunnerSnapshot& snapshot) const {
-    const auto* flint = dynamic_cast<const FlintTextRunnerSnapshot*>(&snapshot);
-    if (flint == nullptr || flint->model.get() != model_.get())
-      throw std::invalid_argument(
-          "Flint snapshot does not belong to this model");
-    return *flint;
-  }
-
   std::shared_ptr<FlintModel> model_;
   std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer_;
   std::vector<std::int32_t> stop_tokens_;
   std::uint32_t max_context_;
-  std::optional<ext::TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
 
 }  // namespace
+
+std::optional<sampling::TextSamplingDefaults> FlintTextSamplingDefaults(
+    const core::GgufReader&) {
+  return FlintSamplingDefaults();
+}
 
 std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
     const ext::TextRunnerOptions& options, std::string* error) {
@@ -569,7 +481,8 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
 
     std::string tokenizer_error;
     auto tokenizer =
-        gufo::vendor::qwen::tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
+        gufo::vendor::qwen::tokenization::QwenTokenizer::CreateFromGguf(
+            *reader, &tokenizer_error);
     if (tokenizer == nullptr) {
       if (error)
         *error = "Flint tokenizer failed: " + tokenizer_error;

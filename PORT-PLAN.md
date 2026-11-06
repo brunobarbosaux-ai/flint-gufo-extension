@@ -3,9 +3,9 @@
 ## Target
 
 Standalone repo `flint-gufo-extension` that builds against **unmodified Gufo
-main** (`186a507da77bcbb3e8f0cfbd49f688f88535e9e2`, v0.29.0-era) via
-`-DGUFO_EXTENSION_DIRS=`. Follows `docs/extensions.md` and mirrors
-`gufo-org/lfm3-gufo-extension`.
+main** (`6cc8a42ca84438a0566ee498a315f35c6190dc8e`, v0.31.0, extension API
+series 0.2) via `-DGUFO_EXTENSION_DIRS=`. Follows `docs/extensions.md` and
+mirrors `gufo-org/lfm3-gufo-extension`.
 
 ## Public API boundary (from include/gufo/ext/SURFACE)
 
@@ -77,7 +77,7 @@ flint-gufo-extension/
 
 ## Status
 
-- [x] Gufo main cloned at 186a507d
+- [x] Gufo main cloned at 6cc8a42, extension API series 0.2 (migrated from the 186a507d series-0.1 pin)
 - [x] Public API boundary mapped
 - [x] Vendor closure identified
 - [x] Vendor kernel files (rocm GEMM/MoE, mmq, blaslt)

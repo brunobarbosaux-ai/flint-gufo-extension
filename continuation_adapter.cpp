@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <gufo/ext/experimental/snapshot_copy.hpp>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -319,12 +318,12 @@ bool FlintContinuationAdapter::Validate(
   PayloadHeader header{};
   std::memcpy(&header, state.staging.data(), sizeof(header));
   if (header.version != kPayloadVersion ||
-      header.position != state.expected_position ||
-      header.snapshot_len == 0 || header.snapshot_len > snapshot_bytes_)
+      header.position != state.expected_position || header.snapshot_len == 0 ||
+      header.snapshot_len > snapshot_bytes_)
     return refuse();
   const auto snapshot = std::span<const std::uint8_t>(
       reinterpret_cast<const std::uint8_t*>(state.staging.data() +
-                                             sizeof(PayloadHeader)),
+                                            sizeof(PayloadHeader)),
       header.snapshot_len);
   std::string error;
   if (!state.session->RestoreSnapshot(snapshot, &error))

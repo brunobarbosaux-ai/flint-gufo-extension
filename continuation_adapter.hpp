@@ -3,13 +3,11 @@
 
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/adapter.hpp>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <vector>
-
-#include <gufo/ext/adapter.hpp>
-#include <gufo/ext/experimental/transfer_pool.hpp>
 
 #include "src/gpu/engine.hpp"
 
@@ -55,21 +53,24 @@ public:
                                                  cache::ComponentId,
                                                  std::span<std::byte>,
                                                  cache::Stream&) override;
-  [[nodiscard]] cache::Completion CapturePrivatePiece(
-      const cache::Slot&, cache::ComponentId, std::size_t,
-      std::span<std::byte>, cache::Stream&) override;
+  [[nodiscard]] cache::Completion CapturePrivatePiece(const cache::Slot&,
+                                                      cache::ComponentId,
+                                                      std::size_t,
+                                                      std::span<std::byte>,
+                                                      cache::Stream&) override;
   [[nodiscard]] cache::Completion LoadPrivate(cache::Slot&, cache::ComponentId,
                                               std::span<const std::byte>,
                                               cache::Stream&) override;
-  [[nodiscard]] cache::Completion LoadPrivatePiece(
-      cache::Slot&, cache::ComponentId, std::size_t,
-      std::span<const std::byte>, cache::Stream&) override;
+  [[nodiscard]] cache::Completion LoadPrivatePiece(cache::Slot&,
+                                                   cache::ComponentId,
+                                                   std::size_t,
+                                                   std::span<const std::byte>,
+                                                   cache::Stream&) override;
   [[nodiscard]] cache::Completion CopyRowsOut(
       const cache::Slot&, cache::ComponentId, cache::Rows first,
       cache::Rows end, std::span<std::byte>, cache::Stream&) override;
   [[nodiscard]] cache::Completion CopyRowsIn(cache::Slot&, cache::ComponentId,
-                                             cache::Rows first,
-                                             cache::Rows end,
+                                             cache::Rows first, cache::Rows end,
                                              std::span<const std::byte>,
                                              cache::Stream&) override;
   [[nodiscard]] bool Validate(

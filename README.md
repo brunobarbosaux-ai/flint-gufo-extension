@@ -10,10 +10,11 @@ Working on gfx1151 (AMD Strix Halo) with HIP. See `docs/QUALITY.md` for what
 is validated and what is still open.
 
 - Maintainer: Bruno Barbosa (brunobarbosaux-ai)
-- Gufo pin: `186a507da77bcbb3e8f0cfbd49f688f88535e9e2`
-- Gufo API floor: `>= 0.1.19` (matches the LFM3 reference extension; revalidate
-  when moving the pin — this repository was established against a shallow
-  Gufo checkout, so the floor was not re-derived from upstream history)
+- Gufo pin: `6cc8a42ca84438a0566ee498a315f35c6190dc8e` (v0.31.0)
+- Gufo API floor: `>= 0.2.7`. Derived from the upstream change records this
+  extension relies on: the series-0.2 component-cache-only continuation baseline
+  (`0.2.0`), reasoning delimiters (`0.2.5`) and provider-defined text sampling
+  defaults (`0.2.7`), which the descriptor and provider both set.
 - Platforms: Linux
 
 ## Build

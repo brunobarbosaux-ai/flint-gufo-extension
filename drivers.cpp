@@ -3,54 +3,119 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <gufo/ext/gguf_reader.hpp>
+#include <gufo/ext/sampling.hpp>
 #include <gufo/ext/text.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "runner.hpp"
+#include "hip/vendor/qwen/tokenizer.hpp"
 #include "src/chat_template.hpp"
+#include "src/gpu/engine.hpp"
+#include "src/runtime/config.hpp"
 
+// CLI drivers. Since extension API series 0.2 removed
+// TextModelRunner::CreateState, a driver owns its execution slots directly: it
+// loads the model, creates a session and drives the engine's Append/Logits,
+// mirroring the LFM3 extension. The runner contract is exercised by the host's
+// HTTP/serve path instead.
 namespace gufo::models::flint {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using FlintModel = gpu::Model;
+using FlintSession = gpu::Session;
 
-double Seconds(Clock::time_point start) {
-  return std::chrono::duration<double>(Clock::now() - start).count();
-}
+constexpr std::uint32_t kDriverContext = 8192;
 
 [[noreturn]] void Fail(const std::string& message) {
   throw std::runtime_error(message);
 }
 
-std::shared_ptr<ext::TextModelRunner> LoadRunner(
-    const ext::TextRunnerOptions& options, Clock::time_point load_start) {
+double Seconds(Clock::time_point start) {
+  return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+[[nodiscard]] std::vector<std::int32_t> EngineTokens(
+    std::span<const std::uint32_t> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const auto token : tokens)
+    converted.push_back(static_cast<std::int32_t>(token));
+  return converted;
+}
+
+// The engine, tokenizer and config a driver needs, loaded once.
+struct Loaded {
+  std::shared_ptr<FlintModel> model;
+  std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer;
+};
+
+[[nodiscard]] Loaded Load(const std::string& model_path,
+                          Clock::time_point load_start) {
   std::string error;
+  auto model = FlintModel::Load(model_path, {}, &error);
+  if (model == nullptr)
+    Fail("Failed to create Flint model: " + error);
+  auto metadata = core::GgufReader::OpenFile(model_path, &error);
+  if (!metadata)
+    Fail("Flint GGUF open failed: " + error);
+  auto tokenizer =
+      gufo::vendor::qwen::tokenization::QwenTokenizer::CreateFromGguf(*metadata,
+                                                                      &error);
+  if (tokenizer == nullptr)
+    Fail("Flint tokenizer failed: " + error);
   const auto load =
       load_start == Clock::time_point{} ? Clock::now() : load_start;
-  auto runner = CreateFlintTextRunner(options, &error);
-  if (!runner)
-    Fail(error);
   std::cerr << "[ModelLoad]: " << Seconds(load) << " s\n";
-  return runner;
+  return {std::move(model), std::move(tokenizer)};
 }
 
-ext::TextRunnerOptions RunnerOptions(const std::string& model_path,
-                                     std::uint32_t max_context) {
-  ext::TextRunnerOptions options;
-  options.model_path = model_path;
-  options.max_context = max_context;
-  return options;
+// Appends the whole prompt and samples up to `max_tokens` tokens, streaming
+// pieces to stdout. Returns the generated ids.
+[[nodiscard]] std::vector<std::uint32_t> Generate(
+    FlintSession& session, const sampling::SamplingConfig& sampling,
+    const std::vector<std::uint32_t>& prompt, std::size_t max_tokens,
+    std::size_t context,
+    const gufo::vendor::qwen::tokenization::QwenTokenizer& tokenizer) {
+  std::string error;
+  const auto chunk = EngineTokens(prompt);
+  std::size_t cursor = 0;
+  while (cursor < chunk.size()) {
+    const auto take = std::min<std::size_t>(4096, chunk.size() - cursor);
+    if (!session.Append(
+            std::span<const std::int32_t>(chunk).subspan(cursor, take), &error))
+      Fail("Flint prefill failed: " + error);
+    cursor += take;
+  }
+  sampling::SamplerState sampler(sampling, prompt);
+  std::vector<std::uint32_t> generated;
+  for (std::size_t i = 0; i < max_tokens; ++i) {
+    if (session.Position() >= context)
+      break;
+    const auto logits = session.Logits();
+    if (logits.empty())
+      Fail("Flint token selection has no logits");
+    const auto token = static_cast<std::uint32_t>(sampler.Sample(logits));
+    generated.push_back(token);
+    sampler.Accept(token);
+    std::cout << tokenizer.DecodeToken(token) << std::flush;
+    const std::int32_t input = static_cast<std::int32_t>(token);
+    if (!session.Append({&input, 1}, &error))
+      Fail("Flint decode failed: " + error);
+  }
+  std::cout << '\n';
+  return generated;
 }
 
-// Greedy-decodes `prompt` on `runner`, streaming pieces to stdout.
-int RunPrompt(const ext::TextPromptOptions& opt, Clock::time_point load_start,
-              bool interactive) {
+int RunPromptImpl(const ext::TextPromptOptions& opt, bool interactive,
+                  Clock::time_point load_start) {
   try {
     if (opt.force_cpu || !opt.speculative_backend.empty())
       Fail("Flint supports autoregressive HIP inference");
@@ -64,8 +129,15 @@ int RunPrompt(const ext::TextPromptOptions& opt, Clock::time_point load_start,
     if (!opt.image_paths.empty())
       Fail("Flint does not support image input");
 
-    auto runner = LoadRunner(RunnerOptions(opt.model_path, 8192), load_start);
-    auto state = runner->CreateState();
+    auto loaded = Load(opt.model_path, load_start);
+    std::string error;
+    auto session = loaded.model->CreateSession(kDriverContext, &error);
+    if (session == nullptr)
+      Fail("Failed to create Flint session: " + error);
+
+    std::vector<ChatMessage> history;
+    if (!opt.system_prompt.empty())
+      history.push_back({"system", opt.system_prompt, ""});
     std::string input = opt.prompt_text;
     do {
       if (interactive) {
@@ -73,48 +145,31 @@ int RunPrompt(const ext::TextPromptOptions& opt, Clock::time_point load_start,
         if (!std::getline(std::cin, input) || input == "exit")
           break;
       }
-      ext::ChatRequest request;
-      if (!opt.system_prompt.empty())
-        request.messages.emplace_back(ext::ChatRole::kSystem,
-                                      opt.system_prompt);
-      request.messages.emplace_back(ext::ChatRole::kUser, input);
-      std::optional<std::vector<ext::TextRunnerToken>> tokens =
-          opt.use_chat_template
-              ? runner->RenderAndTokenize(request)
-              : std::optional<std::vector<ext::TextRunnerToken>>(
-                    runner->Tokenize(input));
-      if (!tokens || tokens->empty())
+      history.push_back({"user", input, ""});
+      ChatTemplateOptions template_options;
+      template_options.enable_thinking = opt.reasoning_mode != "off";
+      std::vector<std::uint32_t> tokens;
+      if (opt.use_chat_template) {
+        gufo::vendor::qwen::tokenization::TokenizerOptions encode_options;
+        encode_options.parse_special_tokens = true;
+        tokens = loaded.tokenizer->Encode(
+            RenderPrompt(history, template_options), encode_options);
+      } else {
+        tokens = loaded.tokenizer->Encode(input);
+      }
+      if (tokens.empty())
         Fail("Flint prompt produced no tokens");
 
+      session->Reset();
       const auto prefill = Clock::now();
-      state->Invalidate();
-      std::size_t cursor = 0;
-      while (cursor < tokens->size()) {
-        const auto step = runner->Prefill(*state, *tokens, cursor, 4096);
-        if (step.consumed_tokens == 0)
-          Fail("Flint prefill made no progress");
-        cursor += step.consumed_tokens;
-      }
-      const auto pp = Seconds(prefill);
-
-      sampling::SamplerState sampler(opt.sampling, *tokens);
-      std::vector<ext::TextRunnerToken> generated;
-      const auto decode = Clock::now();
-      for (std::size_t i = 0; i < opt.max_tokens; ++i) {
-        const auto selection = runner->SelectNext(*state, sampler);
-        if (selection.stop)
-          break;
-        generated.push_back(selection.token);
-        sampler.Accept(selection.token);
-        std::cout << selection.piece << std::flush;
-        runner->Advance(*state, selection.token);
-      }
-      const auto tg = Seconds(decode);
-      std::cout << '\n';
+      const auto generated =
+          Generate(*session, opt.sampling, tokens, opt.max_tokens,
+                   kDriverContext, *loaded.tokenizer);
+      const auto total = Seconds(prefill);
       if (opt.verbose)
-        std::cerr << "Flint pp " << tokens->size() << " tokens " << pp
-                  << " s; tg " << generated.size() << " tokens " << tg
-                  << " s\n";
+        std::cerr << "Flint " << tokens.size() << " prompt tokens, "
+                  << generated.size() << " generated, " << total << " s\n";
+      history.push_back({"assistant", loaded.tokenizer->Decode(generated), ""});
     } while (interactive);
     return 0;
   } catch (const std::exception& e) {
@@ -127,12 +182,12 @@ int RunPrompt(const ext::TextPromptOptions& opt, Clock::time_point load_start,
 
 int RunFlintPrompt(const ext::TextPromptOptions& opt, const core::GgufReader&,
                    std::chrono::steady_clock::time_point load_start) {
-  return RunPrompt(opt, load_start, false);
+  return RunPromptImpl(opt, false, load_start);
 }
 
 int RunFlintChat(const ext::TextPromptOptions& opt, const core::GgufReader&,
                  std::chrono::steady_clock::time_point load_start) {
-  return RunPrompt(opt, load_start, true);
+  return RunPromptImpl(opt, true, load_start);
 }
 
 int RunFlintBench(const ext::TextBenchOptions& opt,
@@ -144,51 +199,50 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
         opt.validate_prefill_tokens)
       Fail("Flint bench supports C1 autoregressive timing only");
 
+    auto loaded = Load(opt.model_path, load_start);
     const auto max = [](const auto& v) {
       return v.empty() ? std::size_t(0) : *std::max_element(v.begin(), v.end());
     };
     const std::size_t context =
         max(opt.n_depths) + std::max(max(opt.n_prompts), max(opt.n_gens)) + 1;
-    auto runner = LoadRunner(
-        RunnerOptions(opt.model_path, static_cast<std::uint32_t>(context)),
-        load_start);
-    auto state = runner->CreateState();
+    if (context > kDriverContext)
+      Fail("Flint benchmark exceeds the driver context");
+    std::string error;
+    auto session = loaded.model->CreateSession(
+        static_cast<std::uint32_t>(context), &error);
+    if (session == nullptr)
+      Fail("Failed to create Flint session: " + error);
 
-    const auto seed =
-        runner->Tokenize("The quick brown fox jumps over the lazy dog. ");
+    const auto seed = loaded.tokenizer->Encode(
+        "The quick brown fox jumps over the lazy dog. ");
     if (seed.empty())
       Fail("Flint bench seed text produced no tokens");
     const auto fill = [&](std::size_t n) {
-      std::vector<ext::TextRunnerToken> ids(n);
+      std::vector<std::uint32_t> ids(n);
       for (std::size_t i = 0; i < n; ++i)
         ids[i] = seed[i % seed.size()];
       return ids;
     };
-    // Prefill `ids` into `state` from its current position.
-    const auto prefill_all = [&](const std::vector<ext::TextRunnerToken>& ids) {
-      std::size_t cursor = 0;
-      while (cursor < ids.size()) {
-        const auto step = runner->Prefill(*state, ids, cursor, 4096);
-        if (step.consumed_tokens == 0)
-          Fail("Flint prefill made no progress");
-        cursor += step.consumed_tokens;
-      }
+    const auto append_all = [&](const std::vector<std::uint32_t>& ids) {
+      const auto chunk = EngineTokens(ids);
+      if (!session->Append(chunk, &error))
+        Fail("Flint bench forward failed: " + error);
     };
 
     std::cout << "| model | test | depth | repetition | tokens/s | seconds "
                  "|\n| :-- | :-- | --: | --: | --: | --: |\n";
     for (const auto depth : opt.n_depths) {
-      auto prepare = [&] {
-        state->Invalidate();
+      const auto prepare = [&] {
+        session->Reset();
         if (depth)
-          prefill_all(fill(depth));
+          append_all(fill(depth));
       };
-      // Warm the prompt shapes before timing, as LFM3 does.
+      // Warm the prompt shapes before timing.
       for (const auto n : opt.n_prompts) {
         if (!n)
           continue;
         prepare();
-        prefill_all(fill(n));
+        append_all(fill(n));
       }
       for (std::size_t r = 0; r < opt.repetitions; ++r) {
         for (const auto n : opt.n_prompts) {
@@ -197,7 +251,7 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
           prepare();
           const auto prompt = fill(n);
           const auto start = Clock::now();
-          prefill_all(prompt);
+          append_all(prompt);
           const auto dt = Seconds(start);
           std::cout << "| Flint | pp" << n << " | " << depth << " | " << r
                     << " | " << n / dt << " | " << dt << " |\n";
@@ -207,19 +261,25 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
             continue;
           prepare();
           const auto first = fill(1);
-          prefill_all(first);
+          append_all(first);
           sampling::SamplerState sampler(opt.sampling, first);
           const auto start = Clock::now();
+          std::size_t generated = 0;
           for (std::size_t i = 0; i < n; ++i) {
-            const auto selection = runner->SelectNext(*state, sampler);
-            if (selection.stop)
+            const auto logits = session->Logits();
+            if (logits.empty())
               break;
-            sampler.Accept(selection.token);
-            runner->Advance(*state, selection.token);
+            const auto token =
+                static_cast<std::uint32_t>(sampler.Sample(logits));
+            sampler.Accept(token);
+            const std::int32_t input = static_cast<std::int32_t>(token);
+            if (!session->Append({&input, 1}, &error))
+              Fail("Flint bench decode failed: " + error);
+            ++generated;
           }
           const auto dt = Seconds(start);
           std::cout << "| Flint | tg" << n << " | " << depth << " | " << r
-                    << " | " << n / dt << " | " << dt << " |\n";
+                    << " | " << generated / dt << " | " << dt << " |\n";
         }
       }
     }

@@ -6,7 +6,7 @@ inconclusive checks stay visible until they pass.
 ## Environment
 
 - GPU: AMD Strix Halo (gfx1151), ROCm 7.2.1
-- Gufo: main `186a507da77bcbb3e8f0cfbd49f688f88535e9e2`
+- Gufo: main `6cc8a42ca84438a0566ee498a315f35c6190dc8e`, v0.31.0 (extension API series 0.2)
 - Build: `gpu-test` preset (`RelWithDebInfo`, HIP on, tests on)
 
 ## Passing checks
@@ -22,6 +22,8 @@ inconclusive checks stay visible until they pass.
 | G8 (concurrency determinism) | Identical greedy output across 1..8 concurrent sessions (314-char stream, 1 distinct) | `g8-quick.log`, `g8-full.log`, `serve_gates.py g8 --gate` |
 | GX (greedy exactness) | Two independent greedy captures bit-identical on all five prompts (1140/1229/1125/427/171 chars) | `gx-q4.json` vs `gx-q4-b.json`, `gx_compare.py` |
 | Component-cache reuse | Warm-path output byte-identical to cold path for the same prompt ("What is 2+2?" -> `4`); serve logs show `reuse=ram`, `cached_tokens=1208`, `prefill_tokens=0` at ~2.8x lower latency | `/tmp/opencode/prefix_test.py`, `serve.log` |
+| API boundary | Series-0.2 component-cache-only continuation; every include lands on the audited `gufo/ext/SURFACE` (the only exception, `gufo/ext/generated/flint_constants.hpp`, is host-generated from `extension.json`); no private `gufo/` includes | `grep` over the tree vs `include/gufo/ext/SURFACE` |
+| Sampling defaults | One function sets both `TextRunnerDescriptor::sampling_defaults` and `TextProvider::sampling_defaults` (temp 0.6, top_p 0.95, top_k 20) | `runner.cpp` `FlintSamplingDefaults`, `provider.cpp` registration |
 
 ## Gate notes
 
@@ -45,8 +47,6 @@ inconclusive checks stay visible until they pass.
 - [ ] G4 Q4-specific near-tie delta envelope (one row at rank 3, delta 0.5978).
 - [ ] Tokenizer parity gates (G1) against the Strycast in-tree reference.
 - [ ] Install into a fresh prefix + runtime closure inventory.
-- [ ] `api_version` floor `0.1.19` re-derivation from upstream change history
-      (established from a shallow Gufo clone; see README).
 - [ ] Nix flake for reproducible extension builds.
 
 ## Artifacts

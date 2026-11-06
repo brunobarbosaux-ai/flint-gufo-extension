@@ -1,0 +1,42 @@
+{
+  "cell": "flint-q4",
+  "ctx": 131072,
+  "mode": "serial cold prefill, --no-cache-prompt",
+  "rows": [
+    {
+      "depth": 514,
+      "runs": 3,
+      "prefill_tps": 37.4,
+      "decode_tps": 70.1,
+      "ttft_s": 13.75
+    },
+    {
+      "depth": 2041,
+      "runs": 3,
+      "prefill_tps": 146.0,
+      "decode_tps": 68.9,
+      "ttft_s": 13.99
+    },
+    {
+      "depth": 8183,
+      "runs": 3,
+      "prefill_tps": 488.5,
+      "decode_tps": 64.2,
+      "ttft_s": 16.76
+    },
+    {
+      "depth": 32748,
+      "runs": 3,
+      "prefill_tps": 1137.3,
+      "decode_tps": 51.1,
+      "ttft_s": 28.8
+    },
+    {
+      "depth": 65265,
+      "runs": 3,
+      "prefill_tps": 1133.0,
+      "decode_tps": 40.2,
+      "ttft_s": 57.9
+    }
+  ]
+}

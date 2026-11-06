@@ -1,0 +1,15 @@
+{
+  "cell": "flint-q4",
+  "runs": 3,
+  "max_tokens": 256,
+  "port": "http://127.0.0.1:8016/v1/chat/completions",
+  "rows": [
+    {
+      "depth": 130808,
+      "prefill": 1035.8,
+      "decode": 27.59,
+      "decode_sd": 0.24,
+      "n": 3
+    }
+  ]
+}

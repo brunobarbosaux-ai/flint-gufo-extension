@@ -1,0 +1,25 @@
+  ascii: fork at char 198 — serve pick ranks #2, delta 0.0140 (OK)
+    oracle: ' cipher or encoded message\n3. Words from a specific context '
+    serve : ' cipher or encoded message\n3. A list of words that might be '
+  code: fork at char 15 — serve pick ranks #2, delta 0.1342 (OK)
+    oracle: 'We are given a snippet of code and some comme'
+    serve : 'We are given a code snippet:\n\n```\nx830 = fn(1'
+  cjk: fork at char 19 — serve pick ranks #2, delta 0.1191 (OK)
+    oracle: '用户提到了语言模型需要统一的分词规则，并且强调数据必须准确。这是一个关于自然语言处理技术的专业话题'
+    serve : '用户提到了语言模型需要统一的分词规则，以及数据需要准确。这是一个关于自然语言处理技术的讨论。\n\n我'
+  mixed: fork at char 13 — serve pick ranks #2, delta 0.3554 (OK)
+    oracle: 'The user has sent a message that appears to'
+    serve : 'The user has provided a string that appears'
+  numeric: fork at char 62 — serve pick ranks #2, delta 0.0315 (OK)
+    oracle: ' User just "12,345". Could be number, maybe wants something?'
+    serve : ' User just "12,345". Could be asking? Maybe wants something?'
+  contraction: fork at char 165 — serve pick ranks #2, delta 0.0746 (OK)
+    oracle: '\n\nThis looks like a keyboard slip or some kind of scrambled '
+    serve : '\n\nThis looks like a keyboard smash or possibly a garbled tex'
+  whitespace: fork at char 59 — serve pick ranks #3, delta 0.5978 (FAIL)
+    oracle: 's to be a fragment of text or a test input:\n\n```\nwordend   \n'
+    serve : 's to be a fragment of text or code:\n\n```\nwordend   \nline\nbre'
+  tool_xml: DIVERGES at char 101 (unverified)
+    oracle: ' malformed XML/HTML tag. Possibly they meant to ask somethin'
+    serve : "n attempt to use a custom tag or something, but it's incompl"
+G4 VERDICT: FAIL (2 rows failed)

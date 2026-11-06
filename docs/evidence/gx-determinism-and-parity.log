@@ -1,0 +1,30 @@
+=== noise floor ===
+--- fork run1 vs fork run2 ---
+  tech: IDENTICAL (1150 chars)
+  code: IDENTICAL (1213 chars)
+  prose: IDENTICAL (1062 chars)
+  enum: IDENTICAL (434 chars)
+  math: IDENTICAL (171 chars)
+GX VERDICT: PASS (identical)
+--- ours run1 vs ours run2 ---
+  tech: IDENTICAL (1140 chars)
+  code: IDENTICAL (1229 chars)
+  prose: IDENTICAL (1125 chars)
+  enum: IDENTICAL (427 chars)
+  math: IDENTICAL (171 chars)
+GX VERDICT: PASS (identical)
+=== parity ===
+--- ours vs fork (run1) ---
+  tech: DIVERGES at char 964
+  code: DIVERGES at char 121
+  prose: DIVERGES at char 427
+  enum: DIVERGES at char 256
+  math: IDENTICAL (171 chars)
+GX VERDICT: FAIL (4 rows differ)
+--- ours vs fork (run2) ---
+  tech: DIVERGES at char 964
+  code: DIVERGES at char 121
+  prose: DIVERGES at char 427
+  enum: DIVERGES at char 256
+  math: IDENTICAL (171 chars)
+GX VERDICT: FAIL (4 rows differ)

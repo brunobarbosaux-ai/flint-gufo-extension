@@ -317,6 +317,17 @@ public:
     return tokenizer_->Encode(text);
   }
 
+  // The reasoning budget tokenizes its delimiters in isolation and requires
+  // each to be exactly one control token. Flint's framing is the special-token
+  // pair the chat template names, so special-token parsing is on here even
+  // though ordinary prompt text does not need it.
+  [[nodiscard]] std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const override {
+    gufo::vendor::qwen::tokenization::TokenizerOptions options;
+    options.parse_special_tokens = true;
+    return tokenizer_->Encode(text, options);
+  }
+
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ext::ChatRequest& request) const override {
     if (!request.tools.empty() &&
@@ -415,9 +426,15 @@ public:
   }
 
   [[nodiscard]] ext::ReasoningTags ReasoningBudgetTags() const override {
-    // Flint's budget control tokens are its reasoning delimiters; the default
-    // ReasoningDelimiters() then splits them for the response parsers.
-    return {" thinking", " response", {" response"}};
+    // Flint emits the plain XML reasoning framing, the same literals its
+    // chat template uses (kThinkOpen/kThinkClose).
+    return {"<think>", "</think>", {"</think>"}};
+  }
+
+  [[nodiscard]] ext::ReasoningMarkup ReasoningDelimiters() const override {
+    // Literal delimiters for the response parsers. open must not begin with
+    // whitespace; the leading '<' satisfies that and matches the model bytes.
+    return {"<think>", "</think>"};
   }
 
 private:

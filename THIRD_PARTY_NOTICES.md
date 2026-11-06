@@ -6,6 +6,17 @@ code, vendored at Gufo main
 `186a507da77bcbb3e8f0cfbd49f688f88535e9e2`, except the quantized kernel tier,
 which Gufo itself derives from `ggml-org/llama.cpp` (also MIT).
 
+## Flint model implementation
+
+The Flint model implementation itself (the runner, engine, chat template and
+tokenizer support) is derived from [`mikealanni/gufo`](https://github.com/mikealanni/gufo),
+an MIT-licensed Gufo fork that adds Flint 40B support. This extension adapts
+that implementation to the external extension contract and to a Gufo main
+tree: the model, kernel and tokenizer code is carried over largely as-is, with
+the fork's NPU-specific sections removed (the extension targets the HIP/GPU
+path on gfx1151). Later sections of this file cover the Gufo upstream tiers the
+implementation depends on.
+
 ## Vendored tiers
 
 | Path | Origin | Notes |

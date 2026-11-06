@@ -9,6 +9,10 @@ framing it needs, so it builds against an unmodified Gufo checkout.
 Working on gfx1151 (AMD Strix Halo) with HIP. See `docs/QUALITY.md` for what
 is validated and what is still open.
 
+The Flint model implementation is derived from [`mikealanni/gufo`](https://github.com/mikealanni/gufo),
+an MIT-licensed Gufo fork, with its NPU-specific sections removed and the code
+adapted to the external extension contract. See `THIRD_PARTY_NOTICES.md`.
+
 - Maintainer: Bruno Barbosa (brunobarbosaux-ai)
 - Gufo pin: `6cc8a42ca84438a0566ee498a315f35c6190dc8e` (v0.31.0)
 - Gufo API floor: `>= 0.2.7`. Derived from the upstream change records this

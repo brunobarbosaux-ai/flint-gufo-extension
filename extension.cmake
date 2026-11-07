@@ -53,9 +53,18 @@ gufo_extension_target(
 )
 
 if(TARGET gufo_flint_hip)
+  # Flint's own kernels mirror the reference fork's flint target: -O3, no
+  # fast-math.
   gufo_extension_hip_sources(gufo_flint_hip
     SOURCES
       src/gpu/kernels/kernels.hip.cpp
+  )
+  # The vendored Qwen GEMM tier mirrors the in-tree qwen38_flash_next tiers:
+  # its HIP targets compile with fast-math, and the mmq tier adds
+  # -Wno-unused-value. Same source, same options, same arithmetic as the
+  # reference builds.
+  gufo_extension_hip_sources(gufo_flint_hip
+    SOURCES
       hip/vendor/rocm/kernels.hip.cpp
       hip/vendor/rocm/mmq/mmid.hip.cpp
       hip/vendor/rocm/mmq/mmvq.hip.cpp
@@ -63,16 +72,20 @@ if(TARGET gufo_flint_hip)
       hip/vendor/rocm/mmq/flint_ggml_stubs.hip.cpp
       hip/vendor/rocm/mmq/flint_mmq.hip.cpp
       hip/vendor/rocm/mmq/quantize.hip.cpp
+    OPTIONS
+      -ffast-math
+      -fno-finite-math-only
+      -Wno-unused-value
   )
   # The wave64 W8A8 launcher instantiates the blocked WMMA GEMM, which needs
-  # the wave64 subtarget; SLP vectorization spills the Q-quant tiles (mirrors
-  # the in-tree per-source flags for the Qwen wave64 units).
+  # the wave64 subtarget; the in-tree Qwen unit compiles it with fast-math.
   gufo_extension_hip_sources(gufo_flint_hip
     SOURCES
       hip/vendor/rocm/w8a8_wave64.hip
     OPTIONS
       -mwavefrontsize64
-      -fno-slp-vectorize
+      -ffast-math
+      -fno-finite-math-only
   )
   if(DEFINED GUFO_EXTENSION_BUILD_ROOT)
     target_sources(gufo_flint_hip PRIVATE
@@ -82,9 +95,17 @@ if(TARGET gufo_flint_hip)
   endif()
   target_compile_definitions(gufo_flint_hip PRIVATE ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_flint_hip PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>
+  )
+  # The pinned Nix toolchain keeps each HIP library under its own prefix, so
+  # the hipCUB/rocPRIM/rocWMMA include paths must come from the host's
+  # discovered variables; a system ROCm install shares one prefix and masks
+  # the need for them.
+  target_include_directories(gufo_flint_hip SYSTEM PUBLIC
+    ${HIPCUB_INCLUDE_DIR}
+    ${ROCPRIM_INCLUDE_DIR}
+    ${ROCWMMA_INCLUDE_DIR}
   )
   target_include_directories(gufo_flint_hip PUBLIC
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
@@ -111,7 +132,6 @@ gufo_extension_target(
 )
 
 if(TARGET gufo_flint_text)
-  target_compile_options(gufo_flint_text PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
   target_include_directories(gufo_flint_text PUBLIC
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
   )

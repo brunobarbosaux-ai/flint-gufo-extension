@@ -1,0 +1,25 @@
+  ascii: fork at char 0 — serve pick ranks #2, delta 0.0178 (OK)
+    oracle: 'We need answer user. Need pars'
+    serve : 'The user has provided a string'
+  code: DIVERGES at char 79 (unverified)
+    oracle: '// TODO\n# path: /var/log/app-69.log  // TODO\n```\n\nThe user l'
+    serve : ' // TODO\n# path: /var/log/app-69.log   // TODO\n```\n\nThe user'
+  cjk: fork at char 389 — serve pick ranks #2, delta 0.1450 (OK)
+    oracle: '. 为什么需要统一的分词规则？\n- **模型输入一致性**：语言模型在训练时需要处理固定长度的输入序列。统一的分词规则（'
+    serve : '. 为什么需要统一的分词规则？\n- **模型输入一致性**：Transformer 等模型通常需要将文本转换为固定长度的'
+  mixed: fork at char 13 — serve pick ranks #2, delta 0.1101 (OK)
+    oracle: 'The user has sent a message that appears to'
+    serve : 'The user has provided a string that appears'
+  numeric: fork at char 62 — serve pick ranks #2, delta 0.1136 (OK)
+    oracle: ' User just "12,345". Could be number, maybe wants something?'
+    serve : ' User just "12,345". Could be asking? Maybe wants something?'
+  contraction: fork at char 0 — serve pick ranks #2, delta 0.1635 (OK)
+    oracle: 'We need answer user. Need pars'
+    serve : 'The user has provided a string'
+  whitespace: fork at char 59 — serve pick ranks #4, delta 0.5665 (FAIL)
+    oracle: 's to be a fragment of text or a test input: "wordend", "line'
+    serve : 's to be a fragment of text or code:\n\n```\nwordend   \nline\nbre'
+  tool_xml: DIVERGES at char 101 (unverified)
+    oracle: ' malformed XML/HTML tag. Possibly they meant to ask somethin'
+    serve : "n attempt to use a custom tag or something, but it's incompl"
+G4 VERDICT: FAIL (3 rows failed)

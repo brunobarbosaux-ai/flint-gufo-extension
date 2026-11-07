@@ -1,0 +1,8 @@
+  left  oracle T1.0 p0.95 k20: n=200 missing=0
+  right serve T1.0 p0.95 k20: n=200 missing=0
+  category           left  right
+  '1.'                 95    100
+  'We'                 60     61
+  'The'                45     39
+  support: OK | ordering: OK | TV=0.0300 (OK <= 0.25) | missing: OK
+G5 VERDICT: PASS (same support, same ordering, TV within noise bound)

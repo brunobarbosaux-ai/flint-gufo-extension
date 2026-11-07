@@ -1,0 +1,25 @@
+  ascii: fork at char 498 — serve pick ranks #2, delta 0.5947 (FAIL)
+    oracle: 'o romeo quick the the"\n\nMaybe initials? N S B D M A R R Q T '
+    serve : 'o romeo quick the the"\n\nMaybe first letters: n s b d m a r r'
+  code: fork at char 15 — serve pick ranks #2, delta 0.1045 (OK)
+    oracle: 'We are given a code snippet:\n\n```\nx830 = fn(1'
+    serve : 'We are given a snippet of code:\n\n```\nx830 = f'
+  cjk: fork at char 0 — serve pick ranks #2, delta 0.2075 (OK)
+    oracle: '用户提到了语言模型需要统一的分词规则，以及数据需要准确。这是'
+    serve : '我们被问到："语言模型需要统一的分词规则。데이터는 정확해야'
+  mixed: fork at char 78 — serve pick ranks #2, delta 0.1046 (OK)
+    oracle: ' mix of characters and symbols, including "romeo" and some u'
+    serve : ' mix of characters and symbols: "romeo ۢ؎ۯۯ 🚀 ыВ"\n\nLet me br'
+  numeric: fork at char 243 — serve pick ranks #2, delta 0.0169 (OK)
+    oracle: 'u like to know about 12,345?" Or maybe convert? Need maybe h'
+    serve : 'u like to know about 12,345?" But maybe expected factorizati'
+  contraction: fork at char 0 — serve pick ranks #2, delta 0.1635 (OK)
+    oracle: 'We need answer user. Need pars'
+    serve : 'The user has provided a string'
+  whitespace: DIVERGES at char 72 (unverified)
+    oracle: ' "wordend", "line", "break". This looks like it might be:\n\n1'
+    serve : '\n\n```\nwordend   \nline\nbreak\n```\n\nThis looks like it could be'
+  tool_xml: fork at char 26 — serve pick ranks #2, delta 0.0486 (OK)
+    oracle: 'We need to parse the user query. The user wrote: "<run_q'
+    serve : 'We need to parse the user input. The user wrote: "<run_q'
+G4 VERDICT: FAIL (2 rows failed)

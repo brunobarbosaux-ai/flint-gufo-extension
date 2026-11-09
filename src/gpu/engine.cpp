@@ -1431,6 +1431,14 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   return session;
 }
 
+std::uint64_t Model::FreeDeviceBytes() noexcept {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
+    return 0;
+  return free_bytes;
+}
+
 const Config& Model::config() const noexcept {
   return state_->config;
 }

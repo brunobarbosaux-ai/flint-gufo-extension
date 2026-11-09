@@ -85,6 +85,9 @@ public:
 
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// Free device memory right now, in bytes; 0 when unknown (CPU build).
+  /// Session sizing uses this so long contexts degrade instead of failing.
+  [[nodiscard]] static std::uint64_t FreeDeviceBytes() noexcept;
   /// Device bytes of one session with `max_context` positions.
   [[nodiscard]] std::size_t SessionBytes(
       std::uint32_t max_context) const noexcept;

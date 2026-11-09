@@ -166,6 +166,39 @@ implementation but not yet observed under a constrained heap):
   (the `[ModelLoad]` wall-clock line is excluded from the comparison);
 - throughput unchanged: pp512 ~2.1-2.2k tok/s, tg128 ~69 tok/s at depth 0.
 
+### Demand-sized session contexts (v0.2.0, 2026-11-09)
+
+Sessions were created with a hardcoded 8192-token context
+(`kDriverContext`), so every prompt, chat and bench request was capped at
+8192 total tokens regardless of the model's 262144 native context. The cap
+was the extension's own constant, not a driver or hardware limit.
+
+Sessions are now sized to what the request needs (`PickContext`):
+
+- prompt + generation for one-shot prompts, recreated when a later chat
+  turn needs more room;
+- clamped to the model's native `context_length` from GGUF config;
+- clamped to device memory: `Model::FreeDeviceBytes()` (hipMemGetInfo) is
+  queried at session creation and the request is halved until
+  `Model::SessionBytes` fits within 75% of free — long contexts degrade
+  gracefully on small-heap machines instead of failing.
+
+KV cost is linear: 49 layers x 2 x (4 KV heads x 128 head_dim) x 2 B =
+~98 KiB/token, i.e. 0.77 GiB at 8k, 3.1 GiB at 32k, 24.6 GiB at 262k.
+
+Measured depth curve (runtime image, depth + 512-token prompt + 128
+generated, 1 repetition):
+
+| depth | pp512 tok/s | tg128 tok/s |
+| --: | --: | --: |
+| 0 | 2252 | 69.5 |
+| 8192 | 1988 | 60.6 |
+| 32768 | 1421 | 47.9 |
+| 131072 | 641 | 25.2 |
+
+Previously depths beyond ~6.6k were rejected outright. Short-prompt greedy
+output is unchanged (no regression).
+
 ## Open / not yet validated
 
 - [ ] The `kManaged` weight-placement branch needs confirmation on a machine

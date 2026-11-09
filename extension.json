@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "flint",
   "api_version": ">= 0.2.7",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "depends": [],
   "platforms": ["linux"],
   "entry": "flint_register",

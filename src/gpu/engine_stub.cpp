@@ -48,5 +48,8 @@ const Config& Model::config() const noexcept {
 std::size_t Model::ResidentBytes() const noexcept {
   return 0;
 }
+std::uint64_t Model::FreeDeviceBytes() noexcept {
+  return 0;
+}
 
 }  // namespace gufo::models::flint::gpu

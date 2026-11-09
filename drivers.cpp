@@ -32,7 +32,34 @@ using Clock = std::chrono::steady_clock;
 using FlintModel = gpu::Model;
 using FlintSession = gpu::Session;
 
-constexpr std::uint32_t kDriverContext = 8192;
+// Session contexts are sized to what the request needs, clamped by the
+// model's native context and the device memory actually free. KV caches
+// grow linearly with the session length, so a fixed cap would either waste
+// memory on short requests or refuse long ones the hardware can serve.
+[[nodiscard]] std::uint32_t PickContext(const FlintModel& model,
+                                        std::uint64_t wanted) {
+  constexpr std::uint64_t kMinContext = 2048;
+  constexpr std::uint64_t kFallbackContext = 262144;
+  // Keep a margin for allocator overhead, workspace and transient buffers
+  // beyond what SessionBytes accounts for.
+  constexpr std::uint64_t kFreeMarginNum = 3;
+  constexpr std::uint64_t kFreeMarginDen = 4;
+
+  const std::uint64_t native = model.config().context_length != 0
+                                   ? model.config().context_length
+                                   : kFallbackContext;
+  std::uint64_t budget = std::min(wanted, native);
+  const std::uint64_t free_bytes = FlintModel::FreeDeviceBytes();
+  if (free_bytes > 0) {
+    const std::uint64_t usable = free_bytes * kFreeMarginNum / kFreeMarginDen;
+    std::uint64_t feasible = budget;
+    while (feasible > kMinContext &&
+           model.SessionBytes(static_cast<std::uint32_t>(feasible)) > usable)
+      feasible /= 2;
+    budget = std::min(budget, feasible);
+  }
+  return static_cast<std::uint32_t>(std::max<std::uint64_t>(budget, 1));
+}
 
 [[noreturn]] void Fail(const std::string& message) {
   throw std::runtime_error(message);
@@ -131,14 +158,13 @@ int RunPromptImpl(const ext::TextPromptOptions& opt, bool interactive,
 
     auto loaded = Load(opt.model_path, load_start);
     std::string error;
-    auto session = loaded.model->CreateSession(kDriverContext, &error);
-    if (session == nullptr)
-      Fail("Failed to create Flint session: " + error);
 
     std::vector<ChatMessage> history;
     if (!opt.system_prompt.empty())
       history.push_back({"system", opt.system_prompt, ""});
     std::string input = opt.prompt_text;
+    std::unique_ptr<FlintSession> session;
+    std::uint32_t context = 0;
     do {
       if (interactive) {
         std::cout << ">>> User: " << std::flush;
@@ -160,11 +186,24 @@ int RunPromptImpl(const ext::TextPromptOptions& opt, bool interactive,
       if (tokens.empty())
         Fail("Flint prompt produced no tokens");
 
-      session->Reset();
+      // Size the session to this turn: prompt plus generation. A later chat
+      // turn that needs more room recreates the session with a larger one.
+      const std::uint32_t wanted = PickContext(
+          *loaded.model,
+          static_cast<std::uint64_t>(tokens.size()) + opt.max_tokens + 1);
+      if (session == nullptr || wanted > context) {
+        context = wanted;
+        session = loaded.model->CreateSession(context, &error);
+        if (session == nullptr)
+          Fail("Failed to create Flint session: " + error);
+      } else {
+        session->Reset();
+      }
+
       const auto prefill = Clock::now();
       const auto generated =
           Generate(*session, opt.sampling, tokens, opt.max_tokens,
-                   kDriverContext, *loaded.tokenizer);
+                   context, *loaded.tokenizer);
       const auto total = Seconds(prefill);
       if (opt.verbose)
         std::cerr << "Flint " << tokens.size() << " prompt tokens, "
@@ -205,11 +244,10 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
     };
     const std::size_t context =
         max(opt.n_depths) + std::max(max(opt.n_prompts), max(opt.n_gens)) + 1;
-    if (context > kDriverContext)
-      Fail("Flint benchmark exceeds the driver context");
     std::string error;
     auto session = loaded.model->CreateSession(
-        static_cast<std::uint32_t>(context), &error);
+        PickContext(*loaded.model, static_cast<std::uint64_t>(context)),
+        &error);
     if (session == nullptr)
       Fail("Failed to create Flint session: " + error);
 

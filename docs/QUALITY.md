@@ -195,9 +195,13 @@ generated, 1 repetition):
 | 8192 | 1988 | 60.6 |
 | 32768 | 1421 | 47.9 |
 | 131072 | 641 | 25.2 |
+| 261503 | 383 | 15.8 |
 
 Previously depths beyond ~6.6k were rejected outright. Short-prompt greedy
-output is unchanged (no regression).
+output is unchanged (no regression). The 261503 depth is the maximum that
+fits the 262144 native context alongside the 512-token prompt and 128
+generated tokens; degradation is smooth across the whole range with no
+cliff.
 
 ## Open / not yet validated
 

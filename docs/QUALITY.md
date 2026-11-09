@@ -134,7 +134,45 @@ reports prefill/decode throughput and treats TTFT as a benchmark cost, not a
 correctness signal. No per-row KV access exists in the Flint engine API to make
 this incremental.
 
+### Weight placement (v0.1.1, 2026-11-09)
+
+Flint's weight loader allocated every tensor with a bare `hipMalloc`. On APU
+machines the device heap is a cap below physical unified memory
+(`ttm.pages_limit`), so a small heap cap made the first large tensor fail with
+`device allocation failed` and the model never loaded. The loader now follows
+the Flash-Next canonical pattern
+(`src/models/qwen38_flash_next/kernels/rocm/device_model.cpp`):
+
+1. a measuring pass sums the bytes every allocation requests;
+2. `gufo::hip::WeightAllocator` (SDK `experimental/managed_alloc.hpp`) decides
+   `kMalloc` vs `kManaged` once, from the heap free at construction;
+3. the upload pass allocates through `weights.Allocate()`, which still falls
+   back per-call to managed memory on `hipErrorOutOfMemory` — so a wrong
+   one-time decision on an unusual machine degrades to slower paging, not a
+   load failure.
+
+`hipFree` remains correct for both allocation kinds on ROCm (confirmed against
+Gufo's own models).
+
+Validation on the development machine (Ryzen AI Max+ 395, 124 GiB LPDDR5X,
+device heap 112 GiB — this machine cannot reproduce the small-heap condition,
+so the `kManaged` branch is code-reviewed against the reference
+implementation but not yet observed under a constrained heap):
+
+- builds and installs through `gufo extension install` in the official
+  runtime image (Gufo 0.32.0, API 0.2.16);
+- greedy output identical to the previous module (no regression);
+- GX self-determinism: 5 prompts x 2 greedy captures, all bit-identical
+  (the `[ModelLoad]` wall-clock line is excluded from the comparison);
+- throughput unchanged: pp512 ~2.1-2.2k tok/s, tg128 ~69 tok/s at depth 0.
+
 ## Open / not yet validated
+
+- [ ] The `kManaged` weight-placement branch needs confirmation on a machine
+      with a small device-heap cap (BIOS-reserved GPU memory or a low
+      `ttm.pages_limit`). The per-call OOM fallback bounds the risk, but the
+      one-time placement decision has not been observed under a constrained
+      heap.
 
 - [ ] Land the Q4 envelope proposal in the Strycast harness (`g4-compare`
       constants: delta <= 0.8, rank <= 4) with the calibration data — the

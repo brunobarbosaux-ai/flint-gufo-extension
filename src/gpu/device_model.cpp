@@ -3,11 +3,13 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
 
 #include "gufo/ext/experimental/ggml_dequant.hpp"
+#include "gufo/ext/experimental/managed_alloc.hpp"
 #include "src/gpu/kernels/kernels.hpp"
 #include "hip/vendor/rocm/kernels.hpp"
 
@@ -38,13 +40,24 @@ std::uint16_t FloatToHalf(float f) {
 
 class Uploader {
 public:
-  Uploader(const core::GgufReader& reader, std::vector<void*>* allocations,
-           std::size_t* bytes, std::string* error)
-      : allocations_(allocations), bytes_(bytes), error_(error) {
+  /// With `weights` null the walk only measures: it sums the bytes every
+  /// allocation would request and does no device work, so the weight
+  /// placement can be decided once from the whole model (see Upload).
+  Uploader(const core::GgufReader& reader, const hip::WeightAllocator* weights,
+           std::vector<void*>* allocations, std::size_t* bytes,
+           std::string* error)
+      : weights_(weights),
+        allocations_(allocations),
+        bytes_(bytes),
+        error_(error) {
     for (const auto& t : reader.GetTensors()) {
       tensors_.emplace(std::string(t.name), &t);
     }
   }
+
+  [[nodiscard]] bool Measuring() const noexcept { return weights_ == nullptr; }
+
+  [[nodiscard]] std::uint64_t requested() const noexcept { return requested_; }
 
   /// Binds q, k and v as one stacked Q8_0 matrix when all three are Q8_0 and
   /// reports whether it did; otherwise nothing is uploaded.
@@ -72,6 +85,13 @@ public:
     out->experts = 1;
     if (!Alloc(out, bytes))
       return false;
+    *stacked = true;
+    if (Measuring()) {
+      for (const auto* t : parts) {
+        out->rows += static_cast<std::uint32_t>(t->dimensions[1]);
+      }
+      return true;
+    }
     std::size_t offset = 0;
     for (const auto* t : parts) {
       if (hipMemcpy(static_cast<char*>(out->data) + offset, t->data,
@@ -82,7 +102,6 @@ public:
       offset += t->size_bytes;
       out->rows += static_cast<std::uint32_t>(t->dimensions[1]);
     }
-    *stacked = true;
     return true;
   }
 
@@ -104,6 +123,8 @@ public:
     DeviceTensor half;
     if (!Alloc(&half, count * sizeof(__half)))
       return false;
+    if (Measuring())
+      return true;
     if (hipMemcpy(half.data, host.data(), count * sizeof(__half),
                   hipMemcpyHostToDevice) != hipSuccess) {
       SetError(error_, "device copy failed");
@@ -115,7 +136,7 @@ public:
 
   /// Adds an F16 copy of a dense matrix for wide-batch GEMMs.
   bool ExpandHalf(DeviceTensor* t) {
-    if (t->data == nullptr || t->experts != 1 ||
+    if ((t->data == nullptr && !Measuring()) || t->experts != 1 ||
         t->type == core::GgmlType::kQ8_0) {
       return true;
     }
@@ -123,6 +144,8 @@ public:
     DeviceTensor half;
     if (!Alloc(&half, count * sizeof(std::uint16_t)))
       return false;
+    if (Measuring())
+      return true;
     t->half_data = half.data;
     if (t->type == core::GgmlType::kQ8_0) {
       rocm::ExpandQ8ToHalf(t->data, static_cast<__half*>(t->half_data), count,
@@ -161,7 +184,11 @@ public:
 
 private:
   bool Alloc(DeviceTensor* out, std::size_t bytes) {
-    if (hipMalloc(&out->data, bytes) != hipSuccess) {
+    requested_ += bytes;
+    if (Measuring()) {
+      return true;
+    }
+    if (weights_->Allocate(&out->data, bytes) != hipSuccess) {
       SetError(error_, "device allocation failed (" + std::to_string(bytes) +
                            " bytes)");
       return false;
@@ -174,6 +201,8 @@ private:
   bool Copy(DeviceTensor* out, const void* src, std::size_t bytes) {
     if (!Alloc(out, bytes))
       return false;
+    if (Measuring())
+      return true;
     for (std::size_t off = 0; off < bytes; off += kCopyChunk) {
       const std::size_t n = std::min(kCopyChunk, bytes - off);
       if (hipMemcpy(static_cast<char*>(out->data) + off,
@@ -193,6 +222,8 @@ private:
     const std::size_t dst_row = out->cols / kQ8Block * kQ8Bytes;
     if (!Alloc(out, dst_row * n_rows))
       return false;
+    if (Measuring())
+      return true;
     const std::uint64_t rows_per_chunk =
         std::max<std::uint64_t>(1, kCopyChunk / dst_row);
     std::vector<char> host(rows_per_chunk * dst_row);
@@ -230,9 +261,11 @@ private:
   }
 
   std::unordered_map<std::string, const core::GgufTensorInfo*> tensors_;
+  const hip::WeightAllocator* weights_;
   std::vector<void*>* allocations_;
   std::size_t* bytes_;
   std::string* error_;
+  std::uint64_t requested_{0};
 };
 
 }  // namespace
@@ -248,68 +281,102 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const core::GgufReader& reader,
                                                  std::string* error_msg) {
   std::unique_ptr<DeviceModel> model(new DeviceModel());
   model->config_ = config;
-  Uploader up(reader, &model->allocations_, &model->bytes_, error_msg);
 
-  if (!up.Bind(&model->token_embd_, "token_embd.weight") ||
-      !up.Bind(&model->output_norm_, "output_norm.weight") ||
-      !up.Bind(&model->output_, "output.weight")) {
-    return nullptr;
-  }
-  if (model->token_embd_.type != core::GgmlType::kQ8_0) {
-    SetError(error_msg, "Flint: token_embd must be Q8_0");
-    return nullptr;
-  }
-
-  model->layers_.resize(config.num_layers);
-  for (std::uint32_t il = 0; il < config.num_layers; ++il) {
-    auto& L = model->layers_[il];
-    L.is_moe = il >= config.leading_dense;
-    bool stacked = false;
-    bool ok = up.Bind(&L.attn_norm, P(il, "attn_norm.weight")) &&
-              up.BindStacked(&L.attn_qkv, P(il, "attn_q.weight"),
-                             P(il, "attn_k.weight"), P(il, "attn_v.weight"),
-                             &stacked) &&
-              (stacked || (up.Bind(&L.attn_q, P(il, "attn_q.weight")) &&
-                           up.Bind(&L.attn_k, P(il, "attn_k.weight")) &&
-                           up.Bind(&L.attn_v, P(il, "attn_v.weight")))) &&
-              up.Bind(&L.attn_output, P(il, "attn_output.weight")) &&
-              up.Bind(&L.attn_q_norm, P(il, "attn_q_norm.weight")) &&
-              up.Bind(&L.attn_k_norm, P(il, "attn_k_norm.weight")) &&
-              up.Bind(&L.attn_sinks, P(il, "attn_sinks.weight")) &&
-              up.Bind(&L.ffn_norm, P(il, "ffn_norm.weight"));
-    if (ok && !L.is_moe) {
-      ok = up.Bind(&L.ffn_gate, P(il, "ffn_gate.weight")) &&
-           up.Bind(&L.ffn_up, P(il, "ffn_up.weight")) &&
-           up.Bind(&L.ffn_down, P(il, "ffn_down.weight"));
+  // Pass 1 measures the bytes every allocation would request, without
+  // touching the device, so the weight placement is decided once for the
+  // whole model. On an APU whose device heap is a small cap below physical
+  // unified memory (1 GiB here) this selects managed placement, which draws
+  // on the full system pool, instead of failing the first hipMalloc.
+  auto walk = [&reader, &config, &error_msg](Uploader& up,
+                                 DeviceModel* model) -> bool {
+    if (!up.Bind(&model->token_embd_, "token_embd.weight") ||
+        !up.Bind(&model->output_norm_, "output_norm.weight") ||
+        !up.Bind(&model->output_, "output.weight")) {
+      return false;
     }
-    if (ok && L.is_moe) {
-      ok = up.Bind(&L.router, P(il, "ffn_gate_inp.weight")) &&
-           up.BindHalfFromBf16(&L.router, P(il, "ffn_gate_inp.weight")) &&
-           up.Bind(&L.gate_exps, P(il, "ffn_gate_exps.weight")) &&
-           up.Bind(&L.up_exps, P(il, "ffn_up_exps.weight")) &&
-           up.Bind(&L.down_exps, P(il, "ffn_down_exps.weight"), true, true) &&
-           up.Bind(&L.gate_shexp, P(il, "ffn_gate_shexp.weight")) &&
-           up.Bind(&L.up_shexp, P(il, "ffn_up_shexp.weight")) &&
-           up.Bind(&L.down_shexp, P(il, "ffn_down_shexp.weight"));
+    if (model->token_embd_.type != core::GgmlType::kQ8_0) {
+      SetError(error_msg, "Flint: token_embd must be Q8_0");
+      return false;
     }
-    if (!ok)
-      return nullptr;
-    {
-      // F16 copies where the matrix-core GEMM beats the quantized wide path.
-      for (DeviceTensor* t : {&L.attn_qkv, &L.attn_q, &L.attn_k, &L.attn_v,
-                              &L.gate_shexp, &L.up_shexp, &L.down_shexp}) {
-        if (!up.ExpandHalf(t)) {
+    model->layers_.resize(config.num_layers);
+    for (std::uint32_t il = 0; il < config.num_layers; ++il) {
+      auto& L = model->layers_[il];
+      L.is_moe = il >= config.leading_dense;
+      bool stacked = false;
+      bool ok = up.Bind(&L.attn_norm, P(il, "attn_norm.weight")) &&
+                up.BindStacked(&L.attn_qkv, P(il, "attn_q.weight"),
+                               P(il, "attn_k.weight"), P(il, "attn_v.weight"),
+                               &stacked) &&
+                (stacked || (up.Bind(&L.attn_q, P(il, "attn_q.weight")) &&
+                             up.Bind(&L.attn_k, P(il, "attn_k.weight")) &&
+                             up.Bind(&L.attn_v, P(il, "attn_v.weight")))) &&
+                up.Bind(&L.attn_output, P(il, "attn_output.weight")) &&
+                up.Bind(&L.attn_q_norm, P(il, "attn_q_norm.weight")) &&
+                up.Bind(&L.attn_k_norm, P(il, "attn_k_norm.weight")) &&
+                up.Bind(&L.attn_sinks, P(il, "attn_sinks.weight")) &&
+                up.Bind(&L.ffn_norm, P(il, "ffn_norm.weight"));
+      if (ok && !L.is_moe) {
+        ok = up.Bind(&L.ffn_gate, P(il, "ffn_gate.weight")) &&
+             up.Bind(&L.ffn_up, P(il, "ffn_up.weight")) &&
+             up.Bind(&L.ffn_down, P(il, "ffn_down.weight"));
+      }
+      if (ok && L.is_moe) {
+        ok = up.Bind(&L.router, P(il, "ffn_gate_inp.weight")) &&
+             up.BindHalfFromBf16(&L.router, P(il, "ffn_gate_inp.weight")) &&
+             up.Bind(&L.gate_exps, P(il, "ffn_gate_exps.weight")) &&
+             up.Bind(&L.up_exps, P(il, "ffn_up_exps.weight")) &&
+             up.Bind(&L.down_exps, P(il, "ffn_down_exps.weight"), true, true) &&
+             up.Bind(&L.gate_shexp, P(il, "ffn_gate_shexp.weight")) &&
+             up.Bind(&L.up_shexp, P(il, "ffn_up_shexp.weight")) &&
+             up.Bind(&L.down_shexp, P(il, "ffn_down_shexp.weight"));
+      }
+      if (!ok)
+        return false;
+      {
+        // F16 copies where the matrix-core GEMM beats the quantized wide path.
+        for (DeviceTensor* t : {&L.attn_qkv, &L.attn_q, &L.attn_k, &L.attn_v,
+                                &L.gate_shexp, &L.up_shexp, &L.down_shexp}) {
+          if (!up.ExpandHalf(t)) {
+            SetError(error_msg, "F16 weight expansion failed");
+            return false;
+          }
+        }
+        if (L.attn_output.type != core::GgmlType::kQ8_0 &&
+            !up.ExpandHalf(&L.attn_output)) {
           SetError(error_msg, "F16 weight expansion failed");
-          return nullptr;
+          return false;
         }
       }
-      if (L.attn_output.type != core::GgmlType::kQ8_0 &&
-          !up.ExpandHalf(&L.attn_output)) {
-        SetError(error_msg, "F16 weight expansion failed");
-        return nullptr;
-      }
     }
+    return true;
+  };
+
+  // Pass 1: measure only. A throwaway model collects the layer geometry the
+  // walk needs (dimensions come from the GGUF, not the device), so no device
+  // pointer is ever dereferenced.
+  std::uint64_t measured = 0;
+  {
+    DeviceModel scratch;
+    scratch.config_ = config;
+    std::vector<void*> allocations;
+    std::size_t bytes = 0;
+    Uploader up(reader, nullptr, &allocations, &bytes, error_msg);
+    if (!walk(up, &scratch)) {
+      SetError(error_msg, "Flint: weight measurement failed");
+      return nullptr;
+    }
+    measured = up.requested();
   }
+
+
+  // Pass 2: place once from the measured total, then upload.
+  const hip::WeightAllocator weights(measured);
+  Uploader up(reader, &weights, &model->allocations_, &model->bytes_, error_msg);
+  if (!walk(up, model.get())) {
+    return nullptr;
+  }
+  // The two passes walk the same tensors, so they request the same bytes.
+  assert(up.requested() == measured);
   return model;
 }
 

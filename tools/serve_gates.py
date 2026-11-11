@@ -51,8 +51,16 @@ G4_TOKENS = 512  # prompt length target and generation length (gate spec)
 # 0.001-0.367 (all rank #2), and the oracle flips the same class of
 # near-ties between its own prefill/decode paths. Structural bugs fork
 # early and land outside the top ranks.
-G4_NEAR_TIE_DELTA = 0.5
-G4_MAX_RANK = 3
+# Q4 envelope (UD-Q4_K_XL, 2026-11-08): 397 near-tie positions measured by
+# oracle prefill-vs-decode self-flip. The oracle flips 15.9% of them
+# (63/397) against itself, P95 self-flip delta 0.709, max 1.335, all at
+# decode gap < 0.478, zero structural disagreements. The previous envelope
+# (delta <= 0.5, rank <= 3) is stricter than the oracle's own
+# self-consistency on Q4; delta <= 0.8 / rank <= 4 (P97 of self-flips,
+# covering the full observed rank range) matches the gate to the oracle's
+# measured behavior. See docs/evidence/g4-envelope-calibration.json.
+G4_NEAR_TIE_DELTA = 0.8
+G4_MAX_RANK = 4
 G4_TOP_K = 20  # oracle top-k captured per token (must match the arm capture)
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)

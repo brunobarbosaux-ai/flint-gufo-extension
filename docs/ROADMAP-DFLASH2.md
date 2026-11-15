@@ -21,12 +21,15 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 - The fork has no Flint drafter either ("no MTP head and no drafter yet"), but
   its GLM-5.3 Flash integration (DFlash2 + prompt-lookup drafts, adaptive
   length, no MTP head) is the exact blueprint for a model like Flint.
-- Drafter candidate: `incoai/Flint-DFlash2-GGUF` (presumably Flint-arch — our
-  loader already reads Flint tensors).
+- Drafter: `incoai/Flint-DFlash2-GGUF` — inspected 2026-11-14: dedicated
+  `dflash` arch (not Flint-arch), hidden-state-conditioned, drafts 8 tokens
+  per pass with selector confidences. Details in Phase 1.
 - Standing lessons: per-quant validation is mandatory (Q6_K_XL loads, benches
   fine, and generates garbage — issue open); speed claims only on the
   runtime-image toolchain (Nix build ~3x slower, diverges); acceptance is
   sharply content-dependent (Laguna: 79-81% code/JSON vs 35% prose; 27B ~61%).
+- Multi-row verification (`AppendAll`, `Logits(row)`, `Rewind`,
+  `kMaxVerifyRows = 5`) already exists in the extension engine.
 
 ## Phase 0 — Quick wins from the fork (drafter-independent)
 
@@ -42,42 +45,77 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 - [ ] Decide whether sparse ships as v0.3.0 with prompt-lookup deferred, or
       waits for the full v0.4.0 (decision pending).
 
-## Phase 1 — Acceptance-rate study (go/no-go decision gate)
+## Phase 1 — Drafter study (go/no-go decision gate)  **[status: inspection done, measurement pending]**
 
-- [ ] Fetch `incoai/Flint-DFlash2-GGUF`; inspect architecture (Flint-arch?
-      head size? vocab coverage? quant?).
-- [ ] Build a throwaway acceptance harness: load drafter alongside the
-      target; drafts can initially be scored through the existing single-row
-      path (correctness of the harness matters, not its speed).
+The original plan assumed a standalone acceptance loop. Step 1 disproved that:
+the drafter is hidden-state-conditioned, so acceptance cannot be measured
+without the drafter forward and a target hidden-state export. Phase 1 now
+shares its harness with Phase 2.
+
+- [x] Fetch `incoai/Flint-DFlash2-GGUF`; inspect architecture. **Done
+      2026-11-14** (BF16 drafter at `/home/bruno/AI/GGUF/mtp/`, quants
+      Q4_K_M/Q5_K_M/Q6_K/Q8_0 also present). Findings:
+  - dedicated `dflash` architecture, 403M params, 5 blocks, hidden 2048,
+    32 q / 8 kv heads, head_dim 128, non-causal block attention with
+    sliding window 2048, 2-tap conv layers (`conv_kernel_size=2`,
+    `conv_group_size=16`);
+  - `dflash.block_size = 8` (drafts 8 tokens per pass);
+  - `fc.weight` (2048 -> 10240) projects the **target hidden state**; there
+    is **no token-embedding tensor** — the drafter does not embed tokens
+    and cannot run standalone;
+  - `selector_hidden` (2048 -> 256) plus rank-256 factorized
+    `selector_predecessor`/`selector_successor` over the 150,144-token
+    vocabulary produce the per-token selector confidences (the fork's >=0.7
+    running-product cut applies to these);
+  - tokenizer is Flint's own (bos 150000, eos 150001) — no vocab remap;
+  - license: apache-2.0 (drafter), base model RecursiveSI/flint.
+- [ ] Build the acceptance harness (requires Phase 2's drafter forward and
+      the hidden-state export).
 - [ ] Measure acceptance on REAL workloads (own chat/code/JSON traffic), not
       filler prompts.
 - [ ] DECISION POINT: projected speedup =
       `acceptance x draft_length / (1 + verify_cost_ratio)`.
       - If realistic acceptance cannot beat ~1.5x on our text: stop, close
         issue #1 with the data, keep Phase 0 wins.
-      - If >= 2x looks reachable: proceed to Phase 2.
+      - If >= 2x looks reachable: proceed to full integration.
 
-## Phase 2 — Drafter loading in the extension
+## Phase 2 — Drafter loading and forward in the extension  **[current work]**
 
-- [ ] Second model instance: drafter is a small Flint-arch GGUF; reuse the
-      existing loader, config parser and tokenizer.
-- [ ] Drafter forward on our own kernels (mmq MoE path covers it).
+- [ ] **Target hidden-state export**: Flint's engine produces logits only;
+      the drafter's `fc` needs the pre-`lm_head` 2048-float row
+      (`Session::LastHidden()` or equivalent).
+- [ ] Drafter loader: the drafter is `dflash` arch (81 tensors), not
+      Flint-arch, so a small dedicated loader is needed (BF16/F32 only — no
+      quantized kernels). Reuse Flint's tokenizer.
+- [ ] Drafter forward on our own kernels: RMSNorm, BF16 matmuls, the 2-tap
+      conv layers, non-causal block attention, factorized selector logits.
+      Self-contained module; establish correctness against a CPU reference
+      before GPU tuning.
 - [ ] Wire the SDK draft-backend interface on the provider
       (`draft_backend.hpp`, `speculative_verifier.hpp`).
 - [ ] Gate: drafter-only agreement check against the drafter's own reference
       (per-quant paranoia; Q6 lesson).
 
-## Phase 3 — Multi-row verification on the Flint engine
+## Phase 3 — Draft/verify loop  **[current work, shares Phase 2]**
 
-The real engineering. Decode is currently 1 row; DFlash2 verifies up to 7
-draft tokens per step.
+**Updated 2026-11-14:** the multi-row verification scaffolding already
+exists in the extension — `Session::AppendAll`, `Logits(row)`, `Rewind`,
+`kMaxVerifyRows = 5` — shipped with the fork lineage. The remaining work is
+smaller than originally planned:
 
-- [ ] Batched decode rows: attention with per-row positions, routed experts
-      with M>1 (mmq MoE kernels already take M — prefill proves it), batched
-      LM head.
-- [ ] Verifier contract: prefix acceptance against target logits, adaptive
-      draft length, optionally the fork's >=0.7 running-confidence cut for
-      greedy (+8-9% on prose/math with identical output).
+- [ ] Verify rows beyond 5 if the 8-token block is kept whole (fork's 27B
+      drafts 7; either raise `kMaxVerifyRows` or cap draft length at 5).
+- [ ] Implement the draft/verify loop: drafter drafts a block, target
+      verifies each row via `AppendAll`, prefix acceptance with adaptive
+      length, optional >=0.7 selector-confidence cut for greedy.
+      Reference: the fork's prompt-lookup loop in its CLI driver.
+- [x] Multi-row logits (`AppendAll` / `Logits(row)`) — present.
+- [ ] Prompt-lookup drafting (moved here from Phase 0): the same
+      append/verify/rewind machinery; the fork implements it in its CLI
+      driver, not in serve.
+- [ ] Gates: GX with speculation on (drafted greedy text must equal plain
+      greedy text except at near-ties), G8 concurrency with speculation,
+      no-regression on plain decode.
 - [ ] Tool-call / grammar turns: keep verification on-GPU (fork lesson:
       59 -> 90+ t/s on 27B).
 - [ ] Gates: GX with speculation on (drafted greedy text must equal plain
@@ -95,10 +133,12 @@ draft tokens per step.
 
 ## Parallel track — int4 quant (independent, interleavable)
 
-- [ ] `RecursiveSI/flint-int4-gguf`: check the format against kernel
-      coverage first (kernel port vs validation run).
-- [ ] If supported: full per-quant gate battery (GX + G4 + coherence smoke —
-      Q6 lesson), then a second llama-swap entry.
+- [x] `RecursiveSI/flint-int4-gguf`: format checked — it is **Q4_1**, which
+      the extension's kernels do not cover (Q4_K/Q5_K/Q6_K/Q5_1/Q8_0/IQ4_XS
+      only). **Does not run; track parked.** Unsloth GGUFs
+      (UD-Q4_K_XL, UD-Q6_K_XL) remain the supported checkpoints.
+- [ ] Revisit only if a Q4_1 (or other supported-format) int4 artifact
+      appears, or if a Q4_1 kernel is worth writing.
 - [ ] Compounds with DFlash2: smaller target weights -> cheaper verify rows.
 
 ## Parallel track — rec cross-check
@@ -113,9 +153,24 @@ draft tokens per step.
 - MTP (Flint has no MTP head; prompt lookup is the only drafter-less option).
 - Cross-binary bit-parity (declared out of scope in QUALITY.md).
 
-## Effort shape
+## Reference notes (fork `mikealanni/gufo`, audited 2026-11-14)
 
-Phase 0: ~a day each. Phase 1: 1-2 days and it decides the project.
-Phases 2-3: the bulk (~a week of careful work with gates). Phase 4: a day.
-If Phase 1's number is bad, total sunk cost is two days and Phase 0's wins
-are kept regardless.
+- The fork has **no DFlash2 / draft-model speculation for Flint**: its
+  Flint speculation is lossless prompt-lookup only, on by default in
+  `gufo prompt`, explicitly not in serve; its README states "there is no
+  draft model for Flint". Speeds: plain/lookup 72.6/74.9 code,
+  72.6/72.3 prose, 72.6/73.3 JSON.
+- Its Flint engine has the verification scaffolding we also have
+  (`AppendAll`, `Logits(row)`, `Rewind`, `kMaxVerifyRows = 5`), so the
+  incoai drafter is new ground for every Gufo lineage.
+- Its prompt-lookup loop lives in the CLI driver, not in serve — the
+  reference to read when implementing ours.
+
+## Effort shape (revised 2026-11-14)
+
+Phase 0: done (validation only). Phase 1: inspection done; measurement
+folds into Phase 2. Phase 2: the current bulk (hidden export + dflash
+drafter module). Phase 3: smaller than planned — the multi-row verification
+scaffolding already exists; the loop logic remains. Phase 4: a day.
+If the acceptance number is bad, total sunk cost is the drafter module,
+which is reusable for any future Flint drafter.

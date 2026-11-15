@@ -8,6 +8,38 @@ their fabric-clock requirements stay out).
 
 Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 
+## Current state (2026-11-15) — build approved
+
+**Decision: build it.** The gate below was measured twice and the 2x target is
+not reachable on this engine; we are building for the bounded win instead
+(~1.5x at depth 0, ~1.4x at 8k, ~1.0x at 131k on code/JSON). Execution plan:
+[`PLAN-DFLASH2.md`](PLAN-DFLASH2.md).
+
+| | state |
+| :-- | :-- |
+| verify rows bit-identical to decode | **yes**, 256/256 at 0/8k/32k/131k (`FLINT_CHECK_ROWS`) |
+| verify cost, width 8 | 2.21 / 2.48 / 3.16 / 4.25 at 0 / 8k / 32k / 131k |
+| acceptance (oracle, `p_min=0.5`) | 51.1% — code 50.0, JSON 62.8, prose 41.9 |
+| drafter quant | Q6_K (336 MB) |
+| drafter code | **none** — loader, forward, adapters and loop are all unbuilt |
+
+Three findings from Steps 0-2 changed the shape of the work and are worth
+keeping in view:
+
+1. `kVecExpertRows = 32` silently sent verify widths 6-8 down the routed MoE
+   path, whose logits differed from single-token decode (5/256 argmax flips).
+   At 48 every width is exact, which is why a lossless gate is possible at all.
+2. Multi-row attention helps the engine (verify -20% and plain decode -7% at
+   131k) but barely moves the gate, because it helps the denominator too.
+3. llama.cpp greedy output is **not batch-invariant** (`-ub 512/8/4` give
+   different text on 12/12 prompts), so cross-engine and cross-quant acceptance
+   figures are not comparable at the sample level. Our own row invariance is
+   the property that matters.
+
+Measurement rule from here: paired measurements must be an interleaved A/B of
+two saved binaries. A 40-minute gap between runs on this machine moved numbers
+~8% and produced one wrong conclusion already.
+
 ## Context
 
 - Decode baseline (extension, runtime image, UD-Q4_K_XL): 69.5 t/s at depth 0,
@@ -361,7 +393,7 @@ acceptance figure describes a different workload. Aggregate placement stands
 (all quants 49-56%), but no per-quant winner can be read from it. Q6_K is the
 pick on size alone (336 MB vs 811 MB BF16, 2.4x less drafter traffic per cycle).
 
-## Implementation plan (recorded, not pursued)
+## Implementation plan (superseded by PLAN-DFLASH2.md)
 
 **Step 0 did not pass (2026-11-14).** The table stays as the cost model: it
 applies unchanged if a multi-row attention kernel ever brings the ratio under
@@ -378,7 +410,7 @@ applies unchanged if a multi-row attention kernel ever brings the ratio under
 Memory envelope: drafter weights 1.6 GB (F32) + feature rows 80 MB + drafter
 KV ring 40 MB — negligible against the 112 GiB heap.
 
-## Phase 2 — Drafter module  **[on hold — gated on Step 0]**
+## Phase 2 — Drafter module  **[superseded by PLAN-DFLASH2.md, M1]**
 
 **Corrected by the llama.cpp reference (2026-11-14).** The drafter is an
 EAGLE-style model with its own KV cache, not a standalone block model. What the
@@ -410,7 +442,7 @@ extension would actually need:
 - [ ] Gate: drafter-only agreement check against the drafter's own reference
       (per-quant paranoia; Q6 lesson).
 
-## Phase 3 — Draft/verify loop  **[core-owned, not extension work]**
+## Phase 3 — Draft/verify loop  **[superseded by PLAN-DFLASH2.md, M3]**
 
 **Updated 2026-11-14:** this phase largely disappears. gufo core owns the loop,
 adaptive length, prefix acceptance and rejection sampling (see the SDK section).

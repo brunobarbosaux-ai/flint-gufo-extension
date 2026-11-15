@@ -10,85 +10,21 @@
   "entry": "flint_register",
   "registration_target": "gufo_flint",
   "targets": {
-    "gufo_flint": {
-      "requires": []
-    },
-    "gufo_flint_hip": {
-      "requires": [
-        "hip"
-      ]
-    },
-    "gufo_flint_text": {
-      "requires": [
-        "hip"
-      ]
-    },
-    "flint_config_test": {
-      "requires": [
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_probe_test": {
-      "requires": [
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_ops_test": {
-      "requires": [
-        "hip",
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_dflash_ops_test": {
-      "requires": [
-        "hip",
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_dflash_forward_test": {
-      "requires": [
-        "hip",
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_target_adapter_test": {
-      "requires": [
-        "hip",
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_draft_policy_test": {
-      "requires": [
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_drafter_probe": {
-      "requires": [
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_drafter_parity": {
-      "requires": [
-        "hip",
-        "testing"
-      ],
-      "role": "test"
-    },
-    "flint_spec_gate": {
-      "requires": [
-        "hip",
-        "testing"
-      ],
-      "role": "test"
-    }
+    "gufo_flint": { "requires": [] },
+    "gufo_flint_hip": { "requires": ["hip"] },
+    "gufo_flint_text": { "requires": ["hip"] },
+    "flint_config_test": { "requires": ["testing"], "role": "test" },
+    "flint_probe_test": { "requires": ["testing"], "role": "test" },
+    "flint_ops_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_dflash_ops_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_dflash_forward_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_target_adapter_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_draft_policy_test": { "requires": ["testing"], "role": "test" },
+    "flint_drafter_probe": { "requires": ["testing"], "role": "test" },
+    "flint_drafter_parity": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_spec_gate": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_tool_template_test": { "requires": ["testing"], "role": "test" },
+    "flint_tool_scan_test": { "requires": ["testing"], "role": "test" }
   },
   "providers": [
     {

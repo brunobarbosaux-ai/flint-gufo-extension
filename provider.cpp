@@ -5,6 +5,7 @@
 #include "drivers.hpp"
 #include "probe.hpp"
 #include "runner.hpp"
+#include "src/tool_dialect.hpp"
 
 // Provider entry point, run by the host's generated registry only when the
 // provider target is enabled. Metadata comes from extension.json and lives in
@@ -12,6 +13,8 @@
 // and then the typed text callbacks. The probe-only provider for CPU builds is
 // registered by flint_register from extension.cpp.
 void flint_provider_register(gufo::ext::Registry& registry) {
+  // The runner selects this dialect by identity, so it is registered first.
+  gufo::models::flint::RegisterFlintToolDialect();
   registry.AddProvider(gufo::ext::generated::extension_flint::kProvider_flint);
   registry.AddTextProvider({
       .id = "flint",

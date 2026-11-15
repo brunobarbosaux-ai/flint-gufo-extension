@@ -94,9 +94,10 @@ public:
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
 
   /// Exact continuation at the current position: the K and V rows of every
-  /// layer plus the last logits, so a restored state can sample at once.
+  /// layer plus the last logits, so a restored state can sample at once. A
+  /// sliding-window layer keeps only its last `sliding_window` positions.
   /// Bumped when the layout changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 1;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 2;
   [[nodiscard]] std::size_t SnapshotBytes() const noexcept;
   [[nodiscard]] bool SaveSnapshot(std::span<std::uint8_t> out,
                                   std::string* error_msg) const;

@@ -166,6 +166,36 @@ implementation but not yet observed under a constrained heap):
   (the `[ModelLoad]` wall-clock line is excluded from the comparison);
 - throughput unchanged: pp512 ~2.1-2.2k tok/s, tg128 ~69 tok/s at depth 0.
 
+### Block-sparse attention: `FLINT_SPARSE_ATTN` (validated 2026-11-14)
+
+Long-context prefill uses Quest-style block-sparse attention on the global
+(non-sliding-window) layers when `FLINT_SPARSE_ATTN` is set: keys are pooled
+per 64-key block into max/min bounds (`PoolKeyBlocksKernel`) and the attention
+kernel keeps the top `FLINT_SPARSE_ATTN=<top-blocks>` (default 256) highest
+scoring blocks plus sink and local blocks. The code shipped with the fork
+lineage and was already wired end to end; it had simply never been exercised.
+
+Measured (runtime image, UD-Q4_K_XL, depth + 512-token prompt + 128
+generated):
+
+| depth | pp512 dense | pp512 sparse | tg128 |
+| --: | --: | --: | --: |
+| 4096 | ~2128 | ~2128 | ~64.5 |
+| 131072 | 641 | **1681** | 25.4 |
+
+- **Exactness:** at 4k depth the on/off greedy outputs are bit-identical
+  (same md5, correct answer on a 4k-token prompt) — the block selection is
+  exact there.
+- **Approximation:** beyond ~19k tokens the bounds prune keys the dense path
+  would keep, so outputs may differ; at 32k both arms stay coherent and
+  answer the needle question correctly, but this is **not** bit-exact and
+  must be documented as approximate. Do not use sparse outside acceptance
+  of that boundary.
+- Decode is unaffected (sparse covers the batched prefill path only; the
+  single-token vec path is dense), matching the reference fork.
+- Prefill at 131k depth: 2.6x faster; the crossover where sparse wins is not
+  yet measured in detail (open item).
+
 ### Demand-sized session contexts (v0.2.0, 2026-11-09)
 
 Sessions were created with a hardcoded 8192-token context

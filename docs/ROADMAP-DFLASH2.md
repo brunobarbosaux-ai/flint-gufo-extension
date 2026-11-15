@@ -30,14 +30,17 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 
 ## Phase 0 — Quick wins from the fork (drafter-independent)
 
-- [ ] Port `FLINT_SPARSE_ATTN` block-sparse attention (fork: 131k prefill
-      89 s dense -> 48 s / 2,716 tok/s; approximate beyond ~19k tokens).
-      Validate with G4 at depths where it is exact; document the
-      approximation boundary in QUALITY.md.
-- [ ] Port prompt-lookup drafting (lossless, no drafter; fork: 72.6 ->
-      74.9 t/s on code, neutral on prose). `prompt_lookup.hpp` is on SURFACE.
-- [ ] Ship as v0.3.0 with the standard gate battery (GX, G4, G5, G8) —
-      re-exercises the release pipeline before the bigger change.
+- [x] `FLINT_SPARSE_ATTN` block-sparse attention — **already wired** in the
+      extension (shipped with the fork lineage); Phase 0 turned into
+      validation: prefill at 131k depth 641 -> 1,681 tok/s (2.6x), decode
+      unchanged, bit-identical greedy output at 4k depth, coherent at 32k
+      (approximate beyond ~19k, documented in QUALITY.md).
+- [ ] (moved to Phase 3) Prompt-lookup drafting — needs per-row logits to
+      verify a draft block, i.e. the same multi-row verification foundation
+      as DFlash2. Not a standalone quick win.
+- [x] Document sparse-attention results in QUALITY.md — done 2026-11-14.
+- [ ] Decide whether sparse ships as v0.3.0 with prompt-lookup deferred, or
+      waits for the full v0.4.0 (decision pending).
 
 ## Phase 1 — Acceptance-rate study (go/no-go decision gate)
 

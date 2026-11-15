@@ -190,6 +190,105 @@ public:
       component_identity_ = ComponentIdentity(model_.get(), max_context_);
     }
     Warmup();
+    SnapshotSelfTest();
+  }
+
+  // FLINT_SNAPSHOT_SELFTEST=1: with throw-away sessions, checks that a snapshot
+  // restores the state exactly. A 9000-token prefix is longer than the ring of
+  // a sliding-window layer, so the ring has wrapped when the snapshot is taken.
+  // The snapshot is restored into the session that has since moved on and into
+  // a fresh one; each must give the logits of the original state, then the
+  // logits the original run gave for the same continuation, bit for bit.
+  void SnapshotSelfTest() const {
+    const char* enabled = std::getenv("FLINT_SNAPSHOT_SELFTEST");
+    if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0')
+      return;
+    try {
+      constexpr std::uint32_t kPrefix = 9000;
+      constexpr std::uint32_t kBlock = 1200;
+      constexpr std::uint32_t kSteps = 24;
+      constexpr std::uint32_t kCapacity = kPrefix + kBlock + kSteps + 16;
+      std::string error;
+      auto session = model_->CreateSession(kCapacity, &error);
+      auto fresh = model_->CreateSession(kCapacity, &error);
+      if (session == nullptr || fresh == nullptr) {
+        Log("event=snapshot_selftest result=skipped reason=" + error);
+        return;
+      }
+      const auto token = [](std::uint32_t i) {
+        return static_cast<std::int32_t>((i * 2654435761U) % 100000U + 1000U);
+      };
+      std::vector<std::int32_t> prefix(kPrefix);
+      std::vector<std::int32_t> block(kBlock);
+      for (std::uint32_t i = 0; i < kPrefix; ++i)
+        prefix[i] = token(i);
+      for (std::uint32_t i = 0; i < kBlock; ++i)
+        block[i] = token(kPrefix + i);
+      struct Tail {
+        std::vector<float> after_block;
+        std::vector<float> after_steps;
+      };
+      const auto copy = [](std::span<const float> logits) {
+        return std::vector<float>(logits.begin(), logits.end());
+      };
+      const auto run_tail = [&](FlintSession& target, Tail* out) {
+        if (!target.Append(block, &error))
+          return false;
+        out->after_block = copy(target.Logits());
+        for (std::uint32_t k = 0; k < kSteps; ++k) {
+          const std::int32_t next = token(kPrefix + kBlock + k);
+          if (!target.Append({&next, 1}, &error))
+            return false;
+        }
+        out->after_steps = copy(target.Logits());
+        return true;
+      };
+      const auto same = [](const std::vector<float>& a,
+                           const std::vector<float>& b) {
+        return a.size() == b.size() &&
+               std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+      };
+      if (!session->Append(prefix, &error)) {
+        Log("event=snapshot_selftest result=FAIL step=prefix reason=" + error);
+        return;
+      }
+      const std::vector<float> at_snapshot = copy(session->Logits());
+      std::vector<std::uint8_t> snapshot(session->SnapshotBytes());
+      if (!session->SaveSnapshot(snapshot, &error)) {
+        Log("event=snapshot_selftest result=FAIL step=save reason=" + error);
+        return;
+      }
+      Tail original;
+      if (!run_tail(*session, &original)) {
+        Log("event=snapshot_selftest result=FAIL step=continue reason=" + error);
+        return;
+      }
+      bool all_ok = true;
+      for (const bool use_fresh : {false, true}) {
+        FlintSession& target = use_fresh ? *fresh : *session;
+        Tail restored;
+        const bool ok =
+            target.RestoreSnapshot(snapshot, &error) &&
+            target.Position() == kPrefix &&
+            same(copy(target.Logits()), at_snapshot) &&
+            run_tail(target, &restored) &&
+            same(restored.after_block, original.after_block) &&
+            same(restored.after_steps, original.after_steps);
+        all_ok = all_ok && ok;
+        Log(std::string("event=snapshot_selftest result=") +
+            (ok ? "pass" : "FAIL") +
+            " target=" + (use_fresh ? "fresh_session" : "same_session") +
+            " position=" + std::to_string(target.Position()) +
+            (ok ? "" : " reason=" + error));
+      }
+      Log("event=snapshot_selftest_summary result=" +
+          std::string(all_ok ? "pass" : "FAIL") +
+          " prefix_tokens=" + std::to_string(kPrefix) +
+          " snapshot_bytes=" + std::to_string(snapshot.size()) +
+          " state_bytes=" + std::to_string(session->AllocatedBytes()));
+    } catch (const std::exception& e) {
+      Log(std::string("event=snapshot_selftest result=FAIL reason=") + e.what());
+    }
   }
 
   void Warmup() const {

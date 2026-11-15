@@ -1526,6 +1526,21 @@ __global__ void AddKernel(float* x, const float* y, std::size_t count) {
     x[i] += y[i];
 }
 
+__global__ void HiddenCaptureKernel(const float* __restrict__ x,
+                                    float* __restrict__ ring,
+                                    const std::uint32_t* __restrict__ pos,
+                                    std::uint32_t pos_offset,
+                                    std::uint32_t ring_rows,
+                                    std::uint32_t taps, std::uint32_t tap,
+                                    std::uint32_t hidden) {
+  const std::uint32_t r = blockIdx.x;
+  const std::uint32_t slot = (pos[0] + pos_offset + r) % ring_rows;
+  const float* src = x + static_cast<std::size_t>(r) * hidden;
+  float* dst = ring + (static_cast<std::size_t>(slot) * taps + tap) * hidden;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
+    dst[i] = src[i];
+}
+
 }  // namespace
 
 void EmbedQ8(const void* table, const std::int32_t* tokens, float* out,
@@ -1732,6 +1747,17 @@ void ExpandQ8ToHalf(const void* q8, __half* out, std::size_t count,
 void AddInPlace(float* x, const float* y, std::size_t count,
                 hipStream_t stream) {
   AddKernel<<<Blocks(count), kBlock, 0, stream>>>(x, y, count);
+}
+
+void HiddenCapture(const float* x, float* ring, const std::uint32_t* start_pos,
+                   std::uint32_t pos_offset, std::uint32_t rows,
+                   std::uint32_t ring_rows, std::uint32_t taps,
+                   std::uint32_t tap, std::uint32_t hidden,
+                   hipStream_t stream) {
+  if (rows == 0 || ring_rows == 0 || hidden == 0)
+    return;
+  HiddenCaptureKernel<<<rows, 128, 0, stream>>>(x, ring, start_pos, pos_offset,
+                                                ring_rows, taps, tap, hidden);
 }
 
 }  // namespace gufo::models::flint::gpu::rocm

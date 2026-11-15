@@ -564,6 +564,214 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
         }
       }
     }
+
+    // Layer-residual capture check (FLINT_CHECK_HIDDEN=1): the DFlash2 drafter
+    // reads the residual of five layers, so each captured row must equal what a
+    // single-token decode produced at that position, at every verify width.
+    // Anything else silently changes the drafter's context. Also measures the
+    // capture's cost on the eager single-token path.
+    if (const char* env = std::getenv("FLINT_CHECK_HIDDEN");
+        env != nullptr && env[0] != '\0' && env[0] != '0') {
+      const std::vector<std::uint32_t> taps{5, 15, 26, 36, 46};
+      const Config& config = loaded.model->config();
+      for (const auto tap : taps) {
+        if (tap >= config.num_layers)
+          Fail("Flint hidden check: tap layer out of range");
+      }
+      const std::size_t hidden = config.hidden_size;
+      const auto pool = loaded.tokenizer->Encode(
+          "Layer residuals are the drafter's input: every captured row must "
+          "equal the single-token decode's residual at the same position, or a "
+          "draft block starts from the wrong context and acceptance drops. ");
+      if (pool.empty())
+        Fail("Flint hidden check text produced no tokens");
+
+      // The bench session is sized to the requested workload; the check needs
+      // its own context regardless of what was asked for on the command line.
+      auto probe =
+          loaded.model->CreateSession(PickContext(*loaded.model, 8192), &error);
+      if (probe == nullptr)
+        Fail("Flint hidden check session failed: " + error);
+      const auto prefill = [&](std::size_t n) {
+        const auto chunk = EngineTokens(fill(n));
+        if (!probe->Append(chunk, &error))
+          Fail("Flint hidden check prefill failed: " + error);
+      };
+      if (!probe->SetHiddenCapture(taps, &error))
+        Fail("Flint hidden check: capture setup failed: " + error);
+      std::cout << "\n| capture | taps | ring rows | ring rows expected |\n"
+                   "| :-- | --: | --: | --: |\n"
+                << "| on | " << probe->HiddenCaptureLayers().size() << " | "
+                << probe->HiddenRingRows() << " | "
+                << std::min(FlintSession::kHiddenRingRows, probe->Capacity())
+                << " |\n";
+
+      std::cout << "\n| width | eager | capture | replay | max |dhidden| "
+                   "| tap spread |\n| --: | --: | --: | --: | --: | --: |\n";
+      const std::uint32_t widths = FlintSession::kMaxVerifyRows;
+      for (std::uint32_t w = 1; w <= widths; ++w) {
+        probe->Reset();
+        prefill(64);
+        const auto pos0 = probe->Position();
+        std::vector<std::int32_t> ids(w);
+        for (std::uint32_t j = 0; j < w; ++j)
+          ids[j] =
+              static_cast<std::int32_t>(pool[(j * 7 + w) % pool.size()]);
+
+        // Reference: one Append per row, captured where the row was produced.
+        std::vector<std::vector<std::vector<float>>> ref(w);
+        for (std::uint32_t j = 0; j < w; ++j) {
+          if (!probe->Append({&ids[j], 1}, &error))
+            Fail("Flint hidden check failed: " + error);
+          ref[j].resize(taps.size());
+          for (std::size_t t = 0; t < taps.size(); ++t) {
+            const auto row = probe->CapturedHidden(pos0 + j, t);
+            if (row.size() != hidden)
+              Fail("Flint hidden check: reference row missing");
+            ref[j][t].assign(row.begin(), row.end());
+          }
+        }
+        probe->Rewind(pos0);
+
+        // Pass 0 runs eagerly, pass 1 captures the width's step graph and
+        // replays it, pass 2 is a pure replay: the capture copies live inside
+        // the step, so all three must agree with the reference.
+        std::vector<std::size_t> exact(3, 0);
+        std::size_t total = 0;
+        double worst = 0.0;
+        double spread = 0.0;
+        for (int pass = 0; pass < 3; ++pass) {
+          probe->Rewind(pos0);
+          if (!probe->AppendAll(ids, &error))
+            Fail("Flint hidden check failed: " + error);
+          for (std::uint32_t j = 0; j < w; ++j) {
+            for (std::size_t t = 0; t < taps.size(); ++t) {
+              const auto row = probe->CapturedHidden(pos0 + j, t);
+              if (row.size() != hidden)
+                Fail("Flint hidden check: captured row missing");
+              exact[pass] += std::memcmp(row.data(), ref[j][t].data(),
+                                         hidden * sizeof(float)) == 0;
+              if (pass == 0)
+                ++total;
+              for (std::size_t i = 0; i < hidden; ++i)
+                worst = std::max(worst, static_cast<double>(std::abs(
+                                            row[i] - ref[j][t][i])));
+            }
+            // Distinct layers, distinct residuals: a capture that copied one
+            // buffer into every tap would pass the comparison above. The host
+            // accessor reuses one scratch row, so copy before the second read.
+            const auto first = probe->CapturedHidden(pos0 + j, 0);
+            std::vector<float> first_row(first.begin(), first.end());
+            const auto last = probe->CapturedHidden(pos0 + j, taps.size() - 1);
+            for (std::size_t i = 0; i < first_row.size(); ++i)
+              spread = std::max(
+                  spread,
+                  static_cast<double>(std::abs(first_row[i] - last[i])));
+          }
+        }
+        for (int pass = 0; pass < 3; ++pass) {
+          if (exact[pass] != total)
+            Fail("Flint hidden check: width " + std::to_string(w) +
+                 " capture differs from single-token decode");
+        }
+        // Ring bounds: everything before Position() and inside the ring.
+        if (!probe->HasHidden(pos0) ||
+            probe->HasHidden(probe->Position()) ||
+            !probe->HasHidden(probe->Position() - 1)) {
+          Fail("Flint hidden check: ring bounds are wrong");
+        }
+        probe->Rewind(pos0);
+        std::cout << "| " << w << " | " << exact[0] << "/" << total << " | "
+                  << exact[1] << "/" << total << " | " << exact[2] << "/"
+                  << total << " | " << worst << " | " << spread << " |\n";
+      }
+
+      // Ring wraparound: slots are position % ring_rows, so a context longer
+      // than the ring is the only path that exercises the wrap. Prefill past
+      // it, then repeat the width-8 comparison and the oldest-row bounds.
+      {
+        probe->Reset();
+        prefill(FlintSession::kHiddenRingRows + 52);
+        const auto pos0 = probe->Position();
+        if (pos0 <= FlintSession::kHiddenRingRows)
+          Fail("Flint hidden check: prefill did not pass the ring");
+        std::vector<std::int32_t> ids(FlintSession::kMaxVerifyRows);
+        for (std::uint32_t j = 0; j < ids.size(); ++j)
+          ids[j] = static_cast<std::int32_t>(pool[(j * 11) % pool.size()]);
+
+        std::vector<std::vector<std::vector<float>>> ref(ids.size());
+        for (std::uint32_t j = 0; j < ids.size(); ++j) {
+          if (!probe->Append({&ids[j], 1}, &error))
+            Fail("Flint hidden check failed: " + error);
+          ref[j].resize(taps.size());
+          for (std::size_t t = 0; t < taps.size(); ++t) {
+            const auto row = probe->CapturedHidden(pos0 + j, t);
+            if (row.size() != hidden)
+              Fail("Flint hidden check: wrapped reference row missing");
+            ref[j][t].assign(row.begin(), row.end());
+          }
+        }
+        std::size_t exact = 0;
+        std::size_t total = 0;
+        for (int pass = 0; pass < 3; ++pass) {
+          probe->Rewind(pos0);
+          if (!probe->AppendAll(ids, &error))
+            Fail("Flint hidden check failed: " + error);
+          for (std::uint32_t j = 0; j < ids.size(); ++j) {
+            for (std::size_t t = 0; t < taps.size(); ++t) {
+              const auto row = probe->CapturedHidden(pos0 + j, t);
+              if (row.size() != hidden)
+                Fail("Flint hidden check: wrapped row missing");
+              exact += std::memcmp(row.data(), ref[j][t].data(),
+                                   hidden * sizeof(float)) == 0;
+              if (pass == 0)
+                ++total;
+            }
+          }
+        }
+        if (exact != 3 * total)
+          Fail("Flint hidden check: wrapped capture differs from "
+               "single-token decode");
+        const auto end = probe->Position();
+        const auto ring = probe->HiddenRingRows();
+        if (probe->HasHidden(end - ring) ||
+            !probe->HasHidden(end - ring + 1)) {
+          Fail("Flint hidden check: wrapped ring bounds are wrong");
+        }
+        probe->Rewind(pos0);
+        std::cout << "\n| wrap | exact rows over 3 passes | ring rows |\n"
+                     "| :-- | --: | --: |\n"
+                  << "| position " << pos0 << " | " << exact << "/"
+                  << 3 * total << " | " << ring << " |\n";
+      }
+
+      // Cost on the eager single-token path: the capture never touches the
+      // model's arithmetic, so the only cost is the D2D copies.
+      const auto step_ms = [&](bool capture) {
+        const std::span<const std::uint32_t> layers =
+            capture ? std::span<const std::uint32_t>(taps)
+                    : std::span<const std::uint32_t>();
+        if (!probe->SetHiddenCapture(layers, &error))
+          Fail("Flint hidden check: capture setup failed: " + error);
+        probe->Reset();
+        prefill(256);
+        constexpr std::size_t kSteps = 64;
+        const auto start = Clock::now();
+        for (std::size_t i = 0; i < kSteps; ++i) {
+          const std::int32_t id =
+              static_cast<std::int32_t>(pool[i % pool.size()]);
+          if (!probe->Append({&id, 1}, &error))
+            Fail("Flint hidden check failed: " + error);
+        }
+        return Seconds(start) * 1000.0 / kSteps;
+      };
+      const double off = step_ms(false);
+      const double on = step_ms(true);
+      std::cout << "\n| capture | ms/token | vs off |\n| :-- | --: | --: |\n"
+                << "| off | " << off << " | 1.00 |\n"
+                << "| on | " << on << " | " << (on / off) << " |\n";
+    }
+
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Flint: " << e.what() << '\n';

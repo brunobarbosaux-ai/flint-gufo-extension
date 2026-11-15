@@ -310,6 +310,13 @@ struct Session::Impl {
   DeviceBuffer<float> gate_e, up_e, down_e, sh_gate, sh_up, sh_out;
   DeviceBuffer<float> expert_scale, shared_scale, expert_const;
   DeviceBuffer<float> dense_gate, dense_up, last, d_logits, attn_part;
+  /// Layer-residual capture for the DFlash2 drafter: `tap_layers` names the
+  /// layers and the ring keeps the last `hidden_ring_rows` positions as
+  /// [row][tap][hidden] F32.
+  std::vector<std::uint32_t> tap_layers;
+  DeviceBuffer<float> hidden_ring;
+  std::uint32_t hidden_ring_rows{0};
+  std::vector<float> h_hidden;
 
   ~Impl() {
     if (stream != nullptr) {
@@ -389,6 +396,12 @@ struct Session::Impl {
            std::string* error_msg);
   bool Moe(const DeviceLayer& layer, std::uint32_t n, const float* next_gamma,
            std::string* error_msg);
+  /// Copies the residual of layer `il` (rows [0, rows) of cx) into the ring.
+  bool CaptureHidden(std::uint32_t il, std::uint32_t n, std::uint32_t rows,
+                     std::string* error_msg);
+  /// Drops every captured step graph: the capture copies are part of a step,
+  /// so a change to the tap set changes the graph.
+  void InvalidateGraphs();
 };
 
 constexpr std::uint32_t kW8A8MinK = 4096;
@@ -961,6 +974,43 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
   return true;
 }
 
+bool Session::Impl::CaptureHidden(std::uint32_t il, std::uint32_t n,
+                                  std::uint32_t rows, std::string*) {
+  std::uint32_t tap = 0;
+  while (tap < tap_layers.size() && tap_layers[tap] != il)
+    ++tap;
+  if (tap == tap_layers.size())
+    return true;
+  // AttnCore's pruned final-layer path keeps only the last row and moves it to
+  // cx row 0, so it is the residual of position n - 1, not of the chunk start.
+  const bool pruned = rows < n;
+  std::uint32_t count = pruned ? 1 : n;
+  const std::uint32_t pos_offset = pruned ? n - 1 : 0;
+  // A prefill chunk can be wider than the ring; only the newest rows survive.
+  std::uint32_t first = 0;
+  if (count > hidden_ring_rows) {
+    first = count - hidden_ring_rows;
+    count = hidden_ring_rows;
+  }
+  const std::size_t hidden = model->config.hidden_size;
+  rocm::HiddenCapture(cx + std::size_t{first} * hidden, hidden_ring.get(),
+                      pos.get(), pos_offset + first, count, hidden_ring_rows,
+                      static_cast<std::uint32_t>(tap_layers.size()), tap,
+                      static_cast<std::uint32_t>(hidden), stream);
+  return true;
+}
+
+void Session::Impl::InvalidateGraphs() {
+  for (auto& g : graphs) {
+    if (g.exec != nullptr) {
+      (void)hipGraphExecDestroy(g.exec);
+      g.exec = nullptr;
+    }
+    g.failed = false;
+    g.steps = 0;
+  }
+}
+
 bool Session::Impl::AttnCore(std::uint32_t il, std::uint32_t n, bool prune,
                              std::string* error_msg) {
   const Config& c = model->config;
@@ -1114,6 +1164,9 @@ bool Session::Impl::Enqueue(std::uint32_t n, bool all_rows,
                    : Ffn(L, ln, next_gamma, error_msg))) {
       return false;
     }
+    // The residual of this layer is now final: cx holds the layer output.
+    if (!tap_layers.empty() && !CaptureHidden(il, n, ln, error_msg))
+      return false;
   }
 
   std::uint32_t head_rows = 1;
@@ -1236,6 +1289,87 @@ void Session::Rewind(std::uint32_t position) noexcept {
     impl_->position = position;
 }
 
+bool Session::SetHiddenCapture(std::span<const std::uint32_t> layer_output_ids,
+                               std::string* error_msg) {
+  const Config& c = impl_->model->config;
+  std::vector<std::uint32_t> layers(layer_output_ids.begin(),
+                                    layer_output_ids.end());
+  {
+    std::vector<std::uint32_t> sorted(layers);
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
+      return Fail(error_msg, "Flint: duplicate hidden capture layer");
+  }
+  if (layers.size() > kMaxHiddenTaps)
+    return Fail(error_msg, "Flint: too many hidden capture taps");
+  for (const auto il : layers) {
+    if (il >= c.num_layers)
+      return Fail(error_msg, "Flint: hidden capture layer out of range");
+  }
+  // The capture copies live inside the step, so the step graphs change.
+  impl_->InvalidateGraphs();
+  impl_->tap_layers.clear();
+  impl_->hidden_ring_rows = 0;
+  impl_->hidden_ring.Reset();
+  if (layers.empty()) {
+    impl_->h_hidden.clear();
+    return true;
+  }
+  const std::uint32_t rows = std::min(kHiddenRingRows, impl_->capacity);
+  if (rows == 0)
+    return Fail(error_msg, "Flint: session capacity is zero");
+  if (!impl_->hidden_ring.Allocate(std::size_t{rows} * layers.size() *
+                                   c.hidden_size)) {
+    return Fail(error_msg, "Flint: hidden capture ring allocation failed");
+  }
+  impl_->hidden_ring_rows = rows;
+  impl_->tap_layers = std::move(layers);
+  impl_->h_hidden.assign(c.hidden_size, 0.0F);
+  return true;
+}
+
+std::span<const std::uint32_t> Session::HiddenCaptureLayers() const noexcept {
+  return impl_->tap_layers;
+}
+
+std::uint32_t Session::HiddenRingRows() const noexcept {
+  return impl_->hidden_ring_rows;
+}
+
+const float* Session::CapturedHiddenDevice(std::uint32_t row,
+                                           std::uint32_t tap) const noexcept {
+  const auto& s = *impl_;
+  const std::size_t taps = s.tap_layers.size();
+  if (taps == 0 || tap >= taps || s.hidden_ring_rows == 0)
+    return nullptr;
+  // Only positions at or after the ring start, and before the next token, are
+  // still in the ring.
+  if (row >= s.position || row + s.hidden_ring_rows <= s.position)
+    return nullptr;
+  const std::size_t hidden = s.model->config.hidden_size;
+  const std::size_t slot = row % s.hidden_ring_rows;
+  return s.hidden_ring.get() + (slot * taps + tap) * hidden;
+}
+
+bool Session::HasHidden(std::uint32_t row) const noexcept {
+  return CapturedHiddenDevice(row, 0) != nullptr;
+}
+
+std::span<const float> Session::CapturedHidden(std::uint32_t row,
+                                               std::uint32_t tap) {
+  const float* src = CapturedHiddenDevice(row, tap);
+  const std::uint32_t hidden = impl_->model->config.hidden_size;
+  if (src == nullptr || hidden == 0)
+    return {};
+  impl_->h_hidden.resize(hidden);
+  if (hipMemcpy(impl_->h_hidden.data(), src,
+                std::size_t{hidden} * sizeof(float),
+                hipMemcpyDeviceToHost) != hipSuccess) {
+    return {};
+  }
+  return std::span<const float>(impl_->h_hidden.data(), hidden);
+}
+
 std::span<const float> Session::Logits() const noexcept {
   const std::uint32_t vocab = impl_->model->config.vocab_size;
   return {impl_->h_logits + std::size_t{impl_->logit_rows - 1} * vocab, vocab};
@@ -1291,6 +1425,7 @@ std::size_t Session::AllocatedBytes() const noexcept {
     total += b.bytes();
   for (const auto& b : impl_->kmm)
     total += b.bytes();
+  total += impl_->hidden_ring.bytes();
   return total;
 }
 

@@ -101,6 +101,17 @@ void MoeCombineNormQuant(float* x, const float* expert_out,
                          void* q8, std::uint32_t n_tokens, std::uint32_t dim,
                          float eps, hipStream_t stream);
 
+/// Copies `rows` residual rows x[r] into a capture ring at absolute positions
+/// *start_pos + pos_offset + r, each landing at
+/// ring[(position % ring_rows) * taps + tap]. The position is read from device
+/// memory, so a captured decode graph replays at any depth instead of pinning
+/// the destination to the step that was captured.
+void HiddenCapture(const float* x, float* ring, const std::uint32_t* start_pos,
+                   std::uint32_t pos_offset, std::uint32_t rows,
+                   std::uint32_t ring_rows, std::uint32_t taps,
+                   std::uint32_t tap, std::uint32_t hidden,
+                   hipStream_t stream);
+
 /// gate[r][i] = silu(gate[r][i]) * up[r][i] for `rows` rows of `cols`, divided
 /// by a power-of-two scale[r] when the row maximum exceeds a limit that keeps
 /// the half-precision block sums of a Q8_1 quantization finite (scale[r] is 1

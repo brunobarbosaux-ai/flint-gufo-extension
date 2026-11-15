@@ -23,6 +23,7 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | verify rows bit-identical to decode | **yes**, 256/256 at 0/8k/32k/131k (`FLINT_CHECK_ROWS`) |
 | verify cost, width 8 | 2.21 / 2.48 / 3.16 / 4.25 at 0 / 8k / 32k / 131k |
 | acceptance (oracle, `p_min=0.5`) | 51.1% — code 50.0, JSON 62.8, prose 41.9 |
+| hidden capture (engine) | **done** — 5 taps x 2048 rows, rows bit-identical to single-token decode at widths 1-8, 0.3-1.7% of a decode step (`FLINT_CHECK_HIDDEN`) |
 | drafter quant | Q6_K (336 MB) |
 | drafter code | **none in the extension.** The forward is vendored-ready in-tree: `QwenDFlashConfig` is file-driven and the loader handles Q6_K, so M1a is an adoption probe, not a rewrite |
 

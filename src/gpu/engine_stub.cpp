@@ -18,6 +18,26 @@ bool Session::AppendAll(std::span<const std::int32_t>, std::string* error_msg) {
   return false;
 }
 void Session::Rewind(std::uint32_t) noexcept {}
+bool Session::SetHiddenCapture(std::span<const std::uint32_t>,
+                               std::string* error_msg) {
+  if (error_msg != nullptr)
+    *error_msg = "Flint GPU path not compiled in";
+  return false;
+}
+std::span<const std::uint32_t> Session::HiddenCaptureLayers() const noexcept {
+  return {};
+}
+std::uint32_t Session::HiddenRingRows() const noexcept {
+  return 0;
+}
+const float* Session::CapturedHiddenDevice(std::uint32_t,
+                                           std::uint32_t) const noexcept {
+  return nullptr;
+}
+bool Session::HasHidden(std::uint32_t) const noexcept { return false; }
+std::span<const float> Session::CapturedHidden(std::uint32_t, std::uint32_t) {
+  return {};
+}
 std::span<const float> Session::Logits() const noexcept {
   return {};
 }

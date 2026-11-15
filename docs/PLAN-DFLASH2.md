@@ -216,13 +216,21 @@ the in-tree Qwen DFlash2 stack and carry `THIRD_PARTY_NOTICES.md` attribution.
 
 ## 6. Milestones
 
-### M0 — Hidden capture (0.5 d)
-- `Session::SetHiddenCapture(std::span<const uint32_t> layer_output_ids)` and
-  `Session::Hidden(row, tap)`; capture after the residual add of the named
-  layers, D2D into a ring sized 2048 rows (SWA-2048 is all the drafter reads).
-- Acceptance: capture off costs 0; on costs **< 2%** of a decode step; rows are
-  identical across widths.
-- Files: `src/gpu/engine.{hpp,cpp}`.
+### M0 — Hidden capture (0.5 d)  **[done]**
+- `Session::SetHiddenCapture(std::span<const uint32_t> layer_output_ids)`,
+  `CapturedHidden(row, tap)` (host scratch) and `CapturedHiddenDevice(row, tap)`
+  (in-place read for the drafter). Capture happens after the residual add of the
+  named layers; tap order is the caller's. Ring: 2048 rows x taps x hidden F32.
+- The copy is a kernel that reads the position from **device memory**, not a
+  host-baked offset: the captured step graph replays at any depth, and changing
+  the tap set invalidates the graphs.
+- Measured (`FLINT_CHECK_HIDDEN`, `flint-UD-Q4_K_XL`): rows **bit-identical** to
+  a single-token decode at every width 1..8 on all three paths (eager, graph
+  capture, graph replay); wraparound verified at position 2100; distinct taps
+  hold distinct residuals; cost **0.3-1.7%** of a decode step (noise band), and
+  capture off launches nothing. `tg1` with capture off stays at 71.8 t/s.
+- Files: `src/gpu/engine.{hpp,cpp}`, `src/gpu/kernels/kernels.{hpp,hip.cpp}`,
+  `drivers.cpp` (`FLINT_CHECK_HIDDEN`).
 
 ### M1a — Adoption probe (0.5 d)  **[first thing built]**
 - `tools/drafter_probe.cpp`: vendor `dflash/model.cpp` and the forward behind a

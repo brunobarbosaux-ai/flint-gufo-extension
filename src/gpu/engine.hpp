@@ -40,6 +40,44 @@ public:
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
 
+  // --- Layer-residual capture (DFlash2 drafter input) ---------------------
+  //
+  // `SetHiddenCapture` names zero-based layers whose residual output is what
+  // CapturedHidden() later exposes: the stream that layer's attention and
+  // FFN/MoE wrote, before the next layer's norm. The copies are part of the
+  // step, so a captured decode graph replays them; changing the set therefore
+  // invalidates those graphs.
+  //
+  // Tap order is the caller's order, verbatim (HiddenCaptureLayers() returns
+  // it). Positions older than the ring, or at/after Position(), are not
+  // available. The ring is not part of a snapshot: a restored session must
+  // re-prime it from fresh appends before a drafter can read past positions.
+
+  /// Positions the ring covers; covers the drafter's 2048-token window.
+  static constexpr std::uint32_t kHiddenRingRows = 2048;
+  /// Taps one ring can hold; the drafter uses five.
+  static constexpr std::uint32_t kMaxHiddenTaps = 16;
+
+  /// Enables capture of `layer_output_ids` (empty disables and frees the ring).
+  [[nodiscard]] bool SetHiddenCapture(
+      std::span<const std::uint32_t> layer_output_ids,
+      std::string* error_msg = nullptr);
+  [[nodiscard]] std::span<const std::uint32_t> HiddenCaptureLayers()
+      const noexcept;
+  /// Rows the ring holds for this session (0 when capture is off).
+  [[nodiscard]] std::uint32_t HiddenRingRows() const noexcept;
+  /// True when `row` is still in the ring at the current position.
+  [[nodiscard]] bool HasHidden(std::uint32_t row) const noexcept;
+  /// Copies row `row`, tap `tap` to host scratch; empty when unavailable.
+  /// The span aliases per-session scratch: copy it before the next call.
+  [[nodiscard]] std::span<const float> CapturedHidden(std::uint32_t row,
+                                                      std::uint32_t tap);
+  /// Device pointer to the same row, for a consumer that reads it in place.
+  /// nullptr when unavailable; valid until the row leaves the ring.
+  [[nodiscard]] const float* CapturedHiddenDevice(std::uint32_t row,
+                                                  std::uint32_t tap)
+      const noexcept;
+
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   /// Row `row` of the last AppendAll (or Append of up to kMaxVerifyRows).
   [[nodiscard]] std::span<const float> Logits(std::uint32_t row) const noexcept;

@@ -10,9 +10,12 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 
 ## Current state (2026-11-15) — build approved
 
-**Decision: build it.** The gate below was measured twice and the 2x target is
-not reachable on this engine; we are building for the bounded win instead
-(~1.5x at depth 0, ~1.4x at 8k, ~1.0x at 131k on code/JSON). Execution plan:
+**Decision: build it, sampler-agnostic.** The gate below was measured twice and
+the 2x target is not reachable on this engine, so we build for the bounded win:
+**~1.4-1.5x greedy**, **~1.1-1.2x at temperature ~0.7**, ~1.0x at 131k, best on
+code/JSON. The cycle batches the forward pass and samples one row per token with
+the live sampler, so any temperature, penalty and grammar setting behaves as it
+does without speculation; the sampler is never reimplemented. Execution plan:
 [`PLAN-DFLASH2.md`](PLAN-DFLASH2.md).
 
 | | state |

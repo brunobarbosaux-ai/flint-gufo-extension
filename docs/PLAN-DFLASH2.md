@@ -3,14 +3,23 @@
 Status: approved to build (2026-11-15). Decision history and measurements live in
 [`ROADMAP-DFLASH2.md`](ROADMAP-DFLASH2.md); this document is the execution plan.
 
+The extension is **generic**: it serves whatever the end user asks for, on any
+content, at any temperature. Nothing below may assume greedy decoding, coding
+traffic, or a particular sampling configuration.
+
 ## 1. What we are shipping, honestly
 
-| depth | plain decode | projected with DFlash2 | content |
-| --: | --: | --: | :-- |
-| 0 | 71 t/s | **~1.5x** | code/JSON; prose ~1.2x |
-| 8k | 63 t/s | ~1.4x | code/JSON; prose ~1.1x |
-| 32k | 50 t/s | ~1.2x | code/JSON only |
-| 131k | 28 t/s | ~1.0x | neutral |
+| depth | plain decode | greedy (temp 0) | sampled (temp >= 0.6) |
+| --: | --: | --: | --: |
+| 0 | 71 t/s | ~1.4-1.5x | ~1.1-1.2x |
+| 8k | 63 t/s | ~1.3-1.4x | ~1.05-1.15x |
+| 32k | 50 t/s | ~1.1-1.2x | ~1.0x |
+| 131k | 28 t/s | ~1.0x | ~1.0x |
+
+Best content is code and JSON; prose is ~0.2x lower in every column. The greedy
+column is an upper bound — it is the one measured on the oracle (51.1%
+acceptance). The sampled column is estimated from distribution overlap and must
+be **measured** in M3, because it is the common case for a generic extension.
 
 The 2x gate this project started with is not reachable on this engine, and the
 reasons are measured rather than assumed: verify rows genuinely route to
@@ -29,8 +38,8 @@ Done and committed:
 
 - `Session::AppendAll` verifies 1..8 rows **bit-identically to single-token
   decode** at 0 / 8k / 32k / 131k (`FLINT_CHECK_ROWS=1`, 256 positions each,
-  256/256 exact, zero argmax flips). This is the precondition for a lossless
-  gate and it did not hold before `kVecExpertRows` 32 -> 48.
+  256/256 exact, zero argmax flips). This is the precondition for everything in
+  §3 and it did not hold before `kVecExpertRows` 32 -> 48.
 - Multi-row attention (split `s` owns key blocks `b % splits == s`): width-8
   verify 192.2 -> 153.2 ms at 131k, plain decode 38.7 -> 36.0 ms there.
 - Verify cost ratio at width 8: **2.21 / 2.48 / 3.16 / 4.25** at 0 / 8k / 32k /
@@ -48,69 +57,127 @@ Done and committed:
 Not built — the entire deliverable:
 
 - drafter GGUF loader and forward pass
-- `IDraftBackend` and `ISpeculativeTargetExecutor` implementations
+- draft backend, target adapter and the speculative cycle
 - target hidden-state capture in the engine
 - any integration with the decode loop
 
-## 3. The integration gap (read this first)
+## 3. How the cycle integrates without a core hook
+
+### 3.1 The gap
 
 `ext::TextModelRunner` is **single-token**: core's serve loop calls `SelectNext`
 then `Advance` once per token. There is **no extension-facing speculative hook**
-in `src/ext/` — verified 2026-11-15: the only speculative symbols on the ext
+in `src/ext/` — verified 2026-11-15; the only speculative symbols on the ext
 surface are `TextSpeculativeConfig` / `TextSpeculativeDefaults` (settings, no
 factory).
 
 Qwen does speculation because it is in-tree: `src/models/qwen/drivers.cpp`
 constructs `SpeculativeVerifier` and `QwenDFlashGpuDraftBackend` and drives the
-loop itself. The interfaces are public
-(`build/gpu-test/sdk/public-include/src/core/speculative/{draft_backend,
-speculative_verifier,prompt_lookup}.hpp`), so an extension can implement them —
-it just has nowhere to hand them over.
+loop itself. The interfaces under `src/core/speculative/` are present in the SDK
+include tree, but they live on a core path, not on `gufo/ext/`, and they are
+aimed at in-tree multi-request serving with distribution-exact `q`. For a
+generic, self-contained extension they are the wrong dependency: implementing
+`IDraftBackend` means honouring ~25 virtuals (snapshot and persistent payload
+semantics, `ProposeSampled` exactness, distinct-session batch rules) to use
+about six, and the loop still has to be driven from the runner.
 
-Two ways forward:
+### 3.2 The design: batched forward, lazy per-row sampling
 
-**A — runner-internal loop with a token buffer (recommended).**
-`SelectNext` runs one draft/verify cycle, rewinds to the accepted prefix, buffers
-the accepted tokens and returns the first. `Advance` pops the buffer without a
-forward pass (the KV already holds those tokens). No core change. Constraints:
-greedy only; must keep `position()`, `CheckpointPosition` and EOS handling
-consistent; must no-op `PreviewFirstToken` correctly.
+The speculative part is the batched **forward**, not the sampling. Per cycle:
 
-**B — upstream a hook into gufo.** A virtual on `TextModelRunner` (or a
-capability struct in `TextRunnerDescriptor`) that lets a provider own the
-speculative loop, matching what Qwen already does internally. Correct long term;
-adds review latency and is not under our control.
+1. **Prime.** Ask the drafter for up to `k` tokens from the accepted prefix.
+2. **Verify once.** `AppendAll([anchor, drafts])` — one pass, logits and the five
+   hidden taps for every row, then `Rewind` to the anchor.
+3. **Accept lazily, one row per `SelectNext`.** Sample row *i* with the live
+   `sampler`. If it equals draft *i*, the token is returned and the next call
+   continues at row *i+1*. On the first mismatch, return the sampled token, drop
+   the remaining rows (`Rewind`) and resume ordinary single-token decoding.
+4. **`Advance` is a no-op during a cycle** — the KV already holds those
+   positions. Position and `CheckpointPosition` are advanced as rows are
+   consumed.
 
-Plan: build **A** behind `FLINT_SPEC=dflash`, and open the B proposal upstream in
-parallel. A is abandoned in favour of B the moment core exposes a hook.
+Sampling therefore happens exactly once per emitted token, in order, through the
+same `sampling::SamplerState` core would have used, with its state intact. No
+part of the sampler is reimplemented or bypassed.
+
+### 3.3 Why this is correct for any sampler
+
+At each position the emitted token is a draw from the user's own constrained
+distribution: either the draft matched that draw, or the draw itself is emitted
+and the cycle ends. Temperature, top-k, top-p, min-p, repeat and frequency
+penalties, and any bound grammar or reasoning budget apply exactly as in
+non-speculative decoding, because they are applied by the same sampler object.
+
+This is only valid because row *i*'s logits are bit-identical to a single-token
+decode at that position (§2, first item). If they were not, sampling row *i* from
+a verify pass would not be the draw core would have made, and the scheme would
+be silently wrong. This is the property Step 0.5 bought.
+
+### 3.4 Expected acceptance
+
+Acceptance is `P(the target's own draw equals the draft)`, i.e. distribution
+overlap — not the `min(1, p/q)` rate proper speculative sampling achieves:
+
+| settings | tokens/cycle (est.) | where it lands |
+| :-- | --: | :-- |
+| temperature 0 | ~2.9 (measured, 51.1%) | the 1.4-1.5x column |
+| temperature 0.6-0.8 | ~1.6-1.9 | ~1.1-1.2x |
+| high temperature / flat | ~1.1 | controller drafts 1-2, near-neutral |
+
+Rejection sampling with the draft's `q` would raise the middle row, but it needs
+the *transformed* target distribution (after penalties and constraint masking)
+and `SamplerState` exposes only `Sample`, not that distribution. Reconstructing
+it inside the extension would couple us to host internals and drift. Keeping the
+sampler a black box is the right trade for a generic extension; the adaptive
+controller is what keeps the high-temperature case from becoming a slowdown.
+
+### 3.5 Limits to document, not to fix
+
+- With a fixed seed, output is **not byte-identical** to non-speculative decoding
+  (different RNG realization), though the distribution is identical. Greedy is
+  exact and byte-identical.
+- `FLINT_SPEC=off` must exist and be the default in the shipped config until the
+  M5 gates pass, and a documented way to disable speculation per deployment is
+  required for anyone needing seed-exact reproduction.
+
+### 3.6 Upstream hook (optional, not a replacement)
+
+A virtual on `TextModelRunner` (or a capability in `TextRunnerDescriptor`) would
+let a provider own the loop the way Qwen does, and would make proper rejection
+sampling possible. Worth proposing upstream, but the design here does not depend
+on it and nothing is throwaway if it lands: the drafter, the adapter and the
+cycle all stay; only the `runner.cpp` glue would be rewired.
 
 ## 4. Reference assets
 
 | asset | path | use |
 | :-- | :-- | :-- |
 | Qwen DFlash2 stack | `/home/bruno/AI/Gufo/src/models/qwen/hip/dflash/` — `model.cpp` 415 L, `backend.cpp` 977 L, `executor.cpp` 1327 L, `batch.cpp` 607 L, `dflash.hpp` 485 L | port target; same drafter arch |
-| Qwen verifier | `src/models/qwen/hip/qwen_speculative_verifier.{hpp,cpp}` | `ISpeculativeTargetExecutor` shape |
+| Qwen verifier | `src/models/qwen/hip/qwen_speculative_verifier.{hpp,cpp}` | verify-pass shape, row acceptance |
 | layer capture | `src/models/qwen/hip/arena.cpp` `SetTargetLayerCapture`, `kMaxTargetLayerTaps` | how taps are wired |
 | llama.cpp | `/tmp/opencode/llamacpp-ref/speculative.cpp`; upstream `src/models/dflash.cpp`, `dflash2.cpp` | lattice, target layers, `p_min` |
 | drafter | `/home/bruno/AI/GGUF/mtp/Flint-DFlash2-Q6_K.gguf` | 81 tensors (32 F32, 49 Q6_K), 5 blocks, hidden 2048, block 8, SWA 2048, fc 2048->10240, no token embedding, `target_layers=[6,16,27,37,47]` |
 | oracle | `/home/bruno/AI/llama/llama-b11804-rocm/` | acceptance/parity reference |
 
 Layer-id mapping trap: llama.cpp lists the taps as layer **inputs**
-`[6,16,27,37,47]`. `IDraftBackend::TargetHiddenLayerIds` wants zero-based layer
-**outputs**, i.e. `[5,15,26,36,46]`.
+`[6,16,27,37,47]`; the tap is the residual **output** of layers
+`[5,15,26,36,46]`.
 
 ## 5. Architecture
 
 ```
-runner.cpp ──(buffered tokens)── SpecCycle (src/spec/cycle.{hpp,cpp})
-                                   ├── TargetExecutor  (src/spec/executor.{hpp,cpp})
-                                   │     └── gpu::Session::Append / AppendAll / Rewind
-                                   ├── DflashBackend   (src/drafter/backend.{hpp,cpp})
-                                   │     └── DflashForward (src/drafter/forward.{hpp,cpp})
-                                   │           └── DflashModel (src/drafter/model.{hpp,cpp})
-                                   └── speculative::SpeculativeVerifier (core, public)
+runner.cpp ──(lazy rows)── SpecCycle (src/spec/cycle.{hpp,cpp})
+                              ├── TargetAdapter  (src/spec/target_adapter.{hpp,cpp})
+                              │     └── gpu::Session::Append / AppendAll / Logits / Rewind
+                              ├── DflashDrafter  (src/drafter/backend.{hpp,cpp})
+                              │     └── DflashForward (src/drafter/forward.{hpp,cpp})
+                              │           └── DflashModel (src/drafter/model.{hpp,cpp})
+                              └── sampling::SamplerState (host-owned, one Sample per token)
 engine.cpp ── hidden capture ring: SetHiddenCapture(ids) / Hidden(row, tap)
 ```
+
+Nothing under `src/core/` is used. The extension depends only on `gufo/ext/*`,
+the sampling and GGUF headers already in use, and its own engine.
 
 New files, all under the extension's `src/` (vendored code namespaced
 `gufo::vendor::*` where it is copied from in-tree sources):
@@ -119,9 +186,9 @@ New files, all under the extension's `src/` (vendored code namespaced
 | :-- | :-- | --: |
 | `src/drafter/model.{hpp,cpp}` | `dflash` GGUF load, 81 tensors, F32 promotion | 400 |
 | `src/drafter/forward.{hpp,cpp}` | encoder, 5 blocks (dynamic grouped conv, non-causal SWA 2048, gated MLP), selector lattice | 900 |
-| `src/drafter/backend.{hpp,cpp}` | `IDraftBackend`: `Name`, `RequiresTargetHiddenStates=true`, `TargetHiddenLayerIds`, `PrimeTargetContext`, `AppendTargetContext`, `UpdateTargetHidden`, `AcceptFeedback`, `Propose`, `ProposeSampled`, `ProposeBatch`, snapshot hooks | 500 |
-| `src/spec/executor.{hpp,cpp}` | `ISpeculativeTargetExecutor` over `gpu::Session` | 350 |
-| `src/spec/cycle.{hpp,cpp}` | greedy cycle: draft -> `AppendAll` -> prefix accept -> `Rewind`; adaptive length; stats | 300 |
+| `src/drafter/backend.{hpp,cpp}` | internal drafter: context priming from the five taps, KV ring, `Propose(prefix, pos, max)`, `AcceptFeedback`; no `IDraftBackend` | 250 |
+| `src/spec/target_adapter.{hpp,cpp}` | internal adapter over `gpu::Session`: prompt append, batched verify, row logits, hidden rows, rewind; no `ISpeculativeTargetExecutor` | 200 |
+| `src/spec/cycle.{hpp,cpp}` | draft -> `AppendAll` -> lazy row acceptance -> `Rewind`; adaptive length from measured per-row cost; stats | 450 |
 | engine changes | hidden capture ring (~80 MB at 2048 rows x 5 taps x 2048 F32) | 150 |
 
 Memory: drafter Q6_K 336 MB + feature ring 80 MB + draft KV ring 40 MB, against
@@ -131,55 +198,61 @@ a 112 GiB unified heap.
 
 ### M0 — Hidden capture (0.5 d)
 - `Session::SetHiddenCapture(std::span<const uint32_t> layer_output_ids)` and
-  `Session::Hidden(row, tap)`; capture happens after the residual add of the
-  named layers, D2D into a ring buffer sized 2048 rows (SWA-2048 is all the
-  drafter reads).
+  `Session::Hidden(row, tap)`; capture after the residual add of the named
+  layers, D2D into a ring sized 2048 rows (SWA-2048 is all the drafter reads).
 - Acceptance: capture off costs 0; on costs **< 2%** of a decode step; rows are
-  identical across widths (use the M3 GX gate as the real check).
+  identical across widths.
 - Files: `src/gpu/engine.{hpp,cpp}`.
 
 ### M1 — Drafter loader + forward, parity against llama.cpp (2-3 d)  **[kills or confirms the track]**
 - Load the GGUF; run the encoder + 5 blocks + lattice on a fixed
   (token, 5-tap) sequence.
-- Parity harness: same prompt and same target, compare our draft tokens and
-  selector scores against the oracle. Two levels, cheapest first:
-  1. acceptance on the 12-prompt set must land within ±3 points of 51.1%;
-  2. draft tokens must be **identical** to the oracle's on 20 fixed positions
-     (add a `--dump-drafts` build of the oracle if needed).
+- Parity harness, cheapest level first:
+  1. greedy acceptance on the 12-prompt set within ±3 points of 51.1%;
+  2. draft tokens **identical** to the oracle's on 20 fixed positions (add a
+     `--dump-drafts` build of the oracle if needed).
 - Acceptance: level 2 passes on all 20 positions.
 - Failure action: if not converged in 3 days, stop per the kill criterion.
 
-### M2 — Target executor (1-2 d)
-- `ISpeculativeTargetExecutor` over `Session`: `ForwardPromptBatch`,
-  `ForwardPromptSuffix`, `ForwardToken`, `SaveState`/`RestoreState` (snapshot
-  API already exists), `CopyLastLogits`, `CopyVerificationLogits(row)`,
-  `SetPromptHiddenCapture`/`GetPromptHiddenStates`.
-- Acceptance: replaying a 2k prompt through the executor produces logits
-  **bit-identical** to plain `Append`; `CopyVerificationLogits(k)` equals
-  `Logits(k)`.
+### M2 — Target adapter (1-1.5 d)
+- Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row
+  logits and per-row 5-tap hidden rows, `Rewind`, and position tracking.
+- Acceptance: `VerifyRows` rows are **bit-identical** to `Append` one token at a
+  time (the `FLINT_CHECK_ROWS` property, asserted from inside the adapter);
+  hidden rows equal the captured values; rewind leaves identical state.
 
-### M3 — Greedy loop + runner integration (1-2 d)
-- `SpecCycle`: draft up to 7 -> `AppendAll([anchor, drafts])` -> walk rows ->
-  `Rewind` to accepted prefix -> emit accepted tokens; buffer the extras.
-- `runner.cpp`: `SelectNext` fills the buffer, `Advance` drains it; guard every
-  invariant (position, checkpoints, EOS, `PreviewFirstToken`).
-- Enabled only when `FLINT_SPEC=dflash` **and** sampling is greedy.
-- Acceptance: **GX gate** — 12 greedy prompts byte-identical to plain decode.
-  Any mismatch means the cycle is not lossless; do not proceed.
+### M3 — Cycle + runner integration (2 d)
+- `SpecCycle` per §3.2, including `Advance` no-op, position bookkeeping, EOS
+  mid-block (drop remaining rows), and `PreviewFirstToken` **must not** start a
+  cycle.
+- `FLINT_SPEC=dflash|off|null`: `null` proposes deliberately wrong drafts, so the
+  cycle runs but nothing is ever accepted.
+- Acceptance:
+  - **GX gate** — greedy spec-on is byte-identical to spec-off, 12 prompts.
+  - **null-drafter gate** — `FLINT_SPEC=null` reproduces spec-off **byte for
+    byte with any sampler and seed**, because exactly one `Sample` is consumed
+    per token. This is the strongest available test that sampler state and RNG
+    order are preserved, and it is the one that protects non-greedy users.
+  - measured tokens/cycle and speedup at temperature 0, 0.6 and 1.0 on the
+    12-prompt set; the table in §1 is replaced with measurements.
+- If either gate fails, do not proceed: the cycle is not distribution-correct.
 
 ### M4 — Draft policy (1 d)
-- Adaptive length priced by measured per-row cost (the Strycast pattern), plus
-  `fixed`; honour `max_draft_tokens` / `min_draft_tokens` / `dflash_policy`.
-- Acceptance: adaptive >= fixed at every depth in the sweep; stats
-  (`draft_rounds`, `draft_tokens`, `draft_accepted_tokens`) match the oracle's
-  within noise.
+- Adaptive length priced by measured per-row cost at the current depth (the
+  Strycast pattern), plus `fixed`; honour `max_draft_tokens` /
+  `min_draft_tokens` / `dflash_policy`.
+- Acceptance: adaptive >= fixed at every depth, at temperature 0 **and** 0.7;
+  never slower than spec-off at temperature 1.0; stats (`draft_rounds`,
+  `draft_tokens`, `draft_accepted_tokens`) match the oracle within noise.
 
 ### M5 — Gates (2-3 d)
 | gate | criterion |
 | :-- | :-- |
-| GX | spec on == spec off, byte-identical, 12 prompts x 4 depths |
+| GX | greedy spec on == spec off, byte-identical, 12 prompts x 4 depths |
+| null drafter | byte-identical to spec-off, temp 0 / 0.7 / 1.0, fixed seeds |
+| settings honour | top-k, top-p, min-p, repeat/frequency penalty, grammar: no constraint violations, same settings as spec-off |
 | drafter quant | Q6_K primary; Q4_K_M and BF16 sanity, each validated for output (per-quant lesson) |
-| depth curve | 0 / 8k / 32k / 131k, both policies |
+| depth curve | 0 / 8k / 32k / 131k, both policies, temp 0 and 0.7 |
 | no regression | spec off == current numbers (71/63/50/28 t/s) |
 | cost | verify width 8 ratio unchanged at 2.21 / 2.48 / 3.16 / 4.25 |
 | memory | drafter + ring accounted in `ResourceClaim` |
@@ -188,23 +261,28 @@ a 112 GiB unified heap.
 ### M6 — Release (1 d)
 - `docs/QUALITY.md` evidence, roadmap update, `extension.json` -> 0.3.0 +
   `speculative_defaults` (`dflash2`, max 7, min 1, policies fixed+adaptive),
-  registry PR, llama-swap entry, issue #1 reply with the final table.
+  registry PR, llama-swap entry, issue #1 reply with the measured table.
+- Ship with speculation **opt-in** (`FLINT_SPEC=dflash`) until the sampled-mode
+  numbers are known-good in the field; document the seed-reproducibility caveat.
 
-**Total: 9-13 working days**, of which M1 is the only real technical unknown.
+**Total: 10-14 working days**, of which M1 is the only real technical unknown.
 
 ## 7. Risks
 
 | risk | impact | mitigation |
 | :-- | :-- | :-- |
 | Drafter forward mismatches the oracle (lattice, dynamic conv, SWA masking) | track dies | M1 parity gate before any integration; llama.cpp source is the spec; 3-day box |
-| Buffered-token integration breaks a runner invariant | corruption | greedy-only, feature flag, GX gate, fall back to single-token on any mismatch |
-| Hidden capture perturbs decode | silent quality issue | D2D copies only on 5 taps, measured < 2%, GX catches the rest |
-| Adaptive policy over-drafts at depth | slower than plain | price per-row cost by depth; `min_draft_tokens` floor |
+| Sampler state or RNG order disturbed by lazy acceptance | wrong distribution for every non-greedy user | null-drafter gate (byte-identical, any seed), one `Sample` per token by construction, `PreviewFirstToken` must not cycle |
+| Row logits drift from single-token decode | silent, subtle, content-dependent | M2 asserts bit-identity from inside the adapter; re-run `FLINT_CHECK_ROWS` after any engine change |
+| Adaptive policy over-drafts at temperature and depth | slower than plain | price per-row cost; `min_draft_tokens` floor; M4 requires temp-1.0 never slower |
 | Per-quant drafter regression (the Q6_K_XL lesson) | garbage output | M5 validates output per drafter quant, not just load/bench |
-| Upstream hook (B) lands and differs from A | rework | A is thin: `SpecCycle` is the seam, only `runner.cpp` glue is A-specific |
+| Hidden capture perturbs decode | silent quality issue | D2D copies only on 5 taps, measured < 2%, GX/null gates catch the rest |
+| Upstream hook (B) lands and differs | rework | only `runner.cpp` glue is design-specific; drafter, adapter and cycle are unaffected |
 
 ## 8. Out of scope
 
 - Reaching 2x; expert-grouped verify; prompt-lookup drafting (separate track,
   shares the cycle); batched speculation across concurrent requests; int4
-  attention/`lm_head` requant (independent engine track with better ROI).
+  attention/`lm_head` requant (independent engine track with better ROI);
+  distribution-exact rejection sampling (needs the transformed target
+  distribution, see §3.4).

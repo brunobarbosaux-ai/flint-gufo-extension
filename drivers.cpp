@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/sampling.hpp>
 #include <gufo/ext/text.hpp>
@@ -385,6 +387,181 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
         for (std::uint32_t w = 1; w <= widths; ++w)
           std::cout << "| " << w << " | " << depth << " | " << ms[w] << " | "
                     << ms[w] / ms[1] << " | " << w / (ms[w] / 1000.0) << " |\n";
+      }
+    }
+
+    // Row-invariance check (FLINT_CHECK_ROWS=1): greedy speculation is only
+    // lossless if the target's argmax does not depend on the row count of the
+    // pass that produced it. At one cache position, the production single-token
+    // Append must agree with row 0 of AppendAll(w) for every width w, because
+    // the verifier compares draft tokens against exactly those rows. llama.cpp
+    // fails this: its greedy output changes with ubatch size. Ours decides
+    // whether a lossless gate is reachable.
+    if (const char* env = std::getenv("FLINT_CHECK_ROWS");
+        env != nullptr && env[0] != '\0' && env[0] != '0') {
+      constexpr std::size_t kChecks = 256;
+      const auto pool = loaded.tokenizer->Encode(
+          "Row invariance decides whether verification can be lossless: the "
+          "anchor row of a batched verify pass must return the same argmax as "
+          "a single-token decode at the same position, or greedy drafts flip "
+          "on near ties and the output diverges from the reference stream. ");
+      if (pool.empty())
+        Fail("Flint row check text produced no tokens");
+
+      const std::uint32_t widths = FlintSession::kMaxVerifyRows;
+      // FLINT_CHECK_ROWS=2 walks the widths in reverse: if the mismatches move
+      // from the last calls to the first ones, the cause is state leaked across
+      // calls rather than the row count itself.
+      std::vector<std::uint32_t> order(widths);
+      for (std::uint32_t w = 1; w <= widths; ++w)
+        order[w - 1] = w;
+      if (env[0] == '2')
+        std::reverse(order.begin(), order.end());
+      // FLINT_CHECK_ROWS=3 changes only the trailing rows of the same verify
+      // width: row 0 must not depend on them at all. A change means the batch
+      // lets later rows leak into earlier ones, which is a causal-mask fault
+      // and not a numerics one.
+      const bool tail_test = env[0] == '3';
+      const auto argmax = [](std::span<const float> v) {
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < v.size(); ++i)
+          if (v[i] > v[best])
+            best = i;
+        return best;
+      };
+
+      if (tail_test) {
+        session->Reset();
+        const std::size_t ctx_len =
+            session->Capacity() > 32 ? session->Capacity() - 24 : 8;
+        std::vector<std::int32_t> ctx;
+        for (std::size_t i = 0; i < ctx_len; ++i)
+          ctx.push_back(static_cast<std::int32_t>(pool[i % pool.size()]));
+        if (!session->Append(ctx, &error))
+          Fail("Flint tail check prefill failed: " + error);
+        const auto pos0 = session->Position();
+        const std::uint32_t vocab = session->Logits().size();
+        std::vector<float> ref(vocab);
+
+        std::cout << "\n| width | same row0 | max |dlogit| | argmax flips |\n"
+                     "| --: | --: | --: | --: |\n";
+        for (const std::uint32_t w : order) {
+          if (w < 2)
+            continue;
+          std::size_t same = 0;
+          std::size_t flips = 0;
+          double worst = 0.0;
+          for (std::size_t i = 0; i < kChecks; ++i) {
+            std::vector<std::int32_t> a(w);
+            std::vector<std::int32_t> b(w);
+            for (std::uint32_t j = 0; j < w; ++j) {
+              a[j] = static_cast<std::int32_t>(
+                  pool[(i * 13 + j * 7) % pool.size()]);
+              b[j] = static_cast<std::int32_t>(
+                  pool[(i * 29 + j * 11 + 5) % pool.size()]);
+            }
+            b[0] = a[0];
+            if (!session->AppendAll({a.data(), w}, &error))
+              Fail("Flint tail check failed: " + error);
+            const auto row_a = session->Logits(0);
+            std::copy(row_a.begin(), row_a.end(), ref.begin());
+            session->Rewind(pos0);
+            if (!session->AppendAll({b.data(), w}, &error))
+              Fail("Flint tail check failed: " + error);
+            const auto row_b = session->Logits(0);
+            double dmax = 0.0;
+            for (std::size_t t = 0; t < row_b.size(); ++t)
+              dmax = std::max(
+                  dmax, static_cast<double>(std::abs(row_b[t] - ref[t])));
+            same += std::memcmp(row_b.data(), ref.data(),
+                                vocab * sizeof(float)) == 0;
+            flips += argmax(row_b) != argmax(ref);
+            worst = std::max(worst, dmax);
+            session->Rewind(pos0);
+          }
+          std::cout << "| " << w << " | " << same << "/" << kChecks << " | "
+                    << worst << " | " << flips << " |\n";
+        }
+        return 0;
+      }
+
+      std::cout << "\n| depth | width | flips | bit-identical | max |dlogit| |"
+                   " median |dlogit| | top1-top2 min | flip checks |\n"
+                   "| --: | --: | --: | --: | --: | --: | --: | --: |\n";
+      for (const auto depth : opt.n_depths) {
+        session->Reset();
+        if (depth)
+          append_all(fill(depth));
+        const auto pos0 = session->Position();
+        const std::uint32_t vocab = session->Logits().size();
+        std::vector<float> ref(vocab);
+
+        std::vector<std::size_t> flips(widths + 1, 0);
+        std::vector<std::size_t> exact(widths + 1, 0);
+        std::vector<double> worst(widths + 1, 0.0);
+        std::vector<std::vector<std::size_t>> flip_at(widths + 1);
+        std::vector<std::vector<double>> deltas(widths + 1);
+        double tightest = 1e9;  // smallest top1-top2 gap seen in the reference
+
+        for (std::size_t i = 0; i < kChecks; ++i) {
+          std::vector<std::int32_t> ids(widths);
+          for (std::uint32_t j = 0; j < widths; ++j)
+            ids[j] = static_cast<std::int32_t>(
+                pool[(i * 13 + j * 7 + depth) % pool.size()]);
+
+          const std::int32_t first = ids[0];
+          if (!session->Append({&first, 1}, &error))
+            Fail("Flint row check failed: " + error);
+          const auto ref_logits = session->Logits();
+          std::copy(ref_logits.begin(), ref_logits.end(), ref.begin());
+          session->Rewind(pos0);
+
+          // Top-two gap on the reference row: a flip inside this gap is a
+          // near tie, not a bug.
+          std::size_t top1 = 0, top2 = 1;
+          for (std::size_t t = 1; t < ref.size(); ++t) {
+            if (ref[t] > ref[top1]) {
+              top2 = top1;
+              top1 = t;
+            } else if (t != top1 && ref[t] > ref[top2]) {
+              top2 = t;
+            }
+          }
+          tightest = std::min(tightest,
+                              static_cast<double>(ref[top1] - ref[top2]));
+
+          for (const std::uint32_t w : order) {
+            const std::span<const std::int32_t> rows{ids.data(), w};
+            if (!session->AppendAll(rows, &error))
+              Fail("Flint row check failed: " + error);
+            const auto row = session->Logits(0);
+            double dmax = 0.0;
+            for (std::size_t t = 0; t < row.size(); ++t)
+              dmax = std::max(dmax, static_cast<double>(
+                                        std::abs(row[t] - ref[t])));
+            if (argmax(row) != argmax(ref)) {
+              ++flips[w];
+              if (flip_at[w].size() < 8)
+                flip_at[w].push_back(i);
+            }
+            deltas[w].push_back(dmax);
+            if (std::memcmp(row.data(), ref.data(), vocab * sizeof(float)) == 0)
+              ++exact[w];
+            worst[w] = std::max(worst[w], dmax);
+            session->Rewind(pos0);
+          }
+        }
+        for (std::uint32_t w = 1; w <= widths; ++w) {
+          auto d = deltas[w];
+          std::sort(d.begin(), d.end());
+          const double med = d.empty() ? 0.0 : d[d.size() / 2];
+          std::cout << "| " << depth << " | " << w << " | " << flips[w] << "/"
+                    << kChecks << " | " << exact[w] << "/" << kChecks << " | "
+                    << worst[w] << " | " << med << " | " << tightest << " | ";
+          for (const auto i : flip_at[w])
+            std::cout << i << " ";
+          std::cout << "|\n";
+        }
       }
     }
     return 0;

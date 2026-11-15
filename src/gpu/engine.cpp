@@ -26,7 +26,12 @@ constexpr std::uint32_t kVecBatch = 8;
 constexpr float kRoutedActScale = 64.0F;
 constexpr std::uint32_t kSparseSinkBlocks = 2;
 constexpr std::uint32_t kSparseLocalBlocks = 32;
-constexpr std::uint32_t kVecExpertRows = 32;
+// Rows the gather-style MoE path accepts: kVecBatch (8) tokens times the
+// model's 6 routed experts. Widths 6..8 must stay on this path — it is the one
+// whose logits are bit-identical to single-token decode, and it avoids the
+// per-layer host round-trip of the routed path. At 32 the verify widths DFlash2
+// needs silently took the routed path, which broke both properties.
+constexpr std::uint32_t kVecExpertRows = 48;
 constexpr std::uint32_t kMaxTopK = 16;
 constexpr std::uint32_t kMaxExperts = 256;
 constexpr std::uint32_t kSwaSplits = 8;
@@ -1150,7 +1155,14 @@ bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
   logit_rows = all_rows ? n : 1;
 
   StepGraph& g = graphs[std::min<std::uint32_t>(n, Session::kMaxVerifyRows)];
-  const bool graphable = all_rows && n <= Session::kMaxVerifyRows;
+  // FLINT_NO_GRAPH=1 keeps every step on the eager path: the row check uses it
+  // to separate a kernel that depends on the row count from a captured graph
+  // that replays with stale state.
+  static const bool graphs_off = [] {
+    const char* env = std::getenv("FLINT_NO_GRAPH");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  const bool graphable = all_rows && n <= Session::kMaxVerifyRows && !graphs_off;
   if (graphable)
     ++g.steps;
   // The first step of each width runs eagerly so the quantized kernels'
@@ -1177,7 +1189,7 @@ bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
   }
   if (graphable && g.exec != nullptr) {
     FLINT_HIP(hipGraphLaunch(g.exec, stream));
-  } else if (!Enqueue(n, graphable, error_msg)) {
+  } else if (!Enqueue(n, all_rows, error_msg)) {
     return false;
   }
   FLINT_HIP(hipStreamSynchronize(stream));

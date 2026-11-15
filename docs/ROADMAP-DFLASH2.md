@@ -172,7 +172,7 @@ layer **outputs**, while llama.cpp's `dflash.target_layers = [6, 16, 27, 37,
 attention is SWA-2048, so only the last ~2048 feature rows need to exist
 (`~80 MB`), not the whole prompt.
 
-## Step 0 — Verify-cost bench  **[DONE — gate FAILED: 2.55x at depth 0, 5.13x at 131k]**
+## Step 0 — Verify-cost bench  **[DONE — numbers superseded by Step 0.5]**
 
 Built at gufo 0.32.0 (`gpu-test`, `RelWithDebInfo`, gfx1151, BUILD_TESTING=OFF,
 `GUFO_EXTENSIONS=flint`) with `Session::kMaxVerifyRows` raised 5 -> 8 to match
@@ -228,6 +228,88 @@ project, and it is the prerequisite for *any* speculation on this engine.
       eager step path — the same path the shipped 69.5 t/s figure uses.
 - [ ] Oracle n-gram probe skipped as moot: n-gram drafts are 48-64 tokens wide,
       where the ratio is far worse than 2.5x.
+
+## Step 0.5 — Row invariance  **[DONE 2026-11-15: fixed, and it moved the gate]**
+
+Greedy speculation is only lossless if the target's argmax does not depend on
+how many rows the pass that produced it carried: the verifier compares draft
+tokens against row *i* of a batched pass, while production decode produces that
+row one token at a time. `FLINT_CHECK_ROWS=1` measures it directly — at a fixed
+cache position, compare the argmax of `Logits(0)` from `Append` against row 0 of
+`AppendAll(w)` for w = 1..8, 256 positions per depth.
+
+**It failed, with a clean boundary at width 6:**
+
+| width | flips | bit-identical | median max \|dlogit\| |
+| --: | --: | --: | --: |
+| 1-5 | 0/256 | 256/256 | 0 |
+| 6-8 | 5/256 | 0/256 | 0.578 |
+
+Two probes localised it. Reversing the width order changed nothing (not state
+leak), and `FLINT_CHECK_ROWS=3` — same width, different trailing rows — left
+row 0 bit-identical at every width, so the batch is causally correct: later
+drafts cannot contaminate earlier rows.
+
+The cause was one constant. `kVecExpertRows = 32` splits the MoE in two: for
+`n * expert_used <= 32` (n <= 5 at 6 routed experts) the gather path runs, above
+it the routed path with per-expert tile lists, padding and a per-layer host
+round-trip. DFlash2's verify width is 8, so the widths that matter were on the
+routed path — different kernels, different rounding, and a router whose top-6
+selection can flip on a near tie, which is what the 0.578 median delta and the
+2.07 outlier were.
+
+**Fix: `kVecExpertRows` 32 -> 48** (8 verify rows x 6 experts; the vector MoE
+dispatch is capped at `MMVQ_MAX_BATCH_SIZE = 8`). Effect, all depths, all
+widths: 256/256 bit-identical to decode, zero flips. It also removed the
+host round-trip from the verify step:
+
+| width | ratio @0 | @8k | @32k | @131k |
+| --: | --: | --: | --: | --: |
+| 5 | 1.81 | 1.93 | 2.38 | 3.08 |
+| 7 | 2.06 | 2.27 | 2.99 | 4.13 |
+| 8 | **2.18** | **2.44** | **3.35** | **4.75** |
+| 8 (before) | 2.55 | 2.81 | 3.73 | 5.13 |
+
+The 5 -> 6 step in the old curve (1.80 -> 2.25) was the path switch, not the
+extra row; the curve is now smooth. No change to plain decode or prefill
+(71.6-72.2 tok/s, 2395-2405 tok/s), because n = 1 never crosses either
+threshold.
+
+**Re-projected speedup.** With the oracle's measured schedule (3.69 drafts per
+cycle, 1.89 accepted, so 2.89 tokens per verify) and a Q6_K drafter (+2.1 ms
+per cycle), against each depth's own plain decode:
+
+| depth | plain | verify@~4.7 rows + draft | tokens/cycle | projected |
+| --: | --: | --: | --: | --: |
+| 0 | 71.9 | 26.0 ms | 2.89 | **1.54x** |
+| 8k | 63.0 | 32.2 ms | 2.89 | 1.42x |
+| 32k | 49.5 | 47.6 ms | 2.89 | 1.22x |
+| 131k | 26.7 | 112 ms | 2.89 | 0.97x |
+
+Before this fix the same arithmetic gave 1.07x / 1.00x / 0.77x / 0.61x.
+
+So the track is no longer blocked on correctness, and the projected gain roughly
+doubled — but the gate (2x) is still missed at every depth, and the reason is now
+purely the depth term: at 131k a width-8 verify pays 178 ms against 37.5 ms for
+one row, ~140 ms of which is the same global KV re-read eight times (26.3 GB at
+~188 GB/s). Widths 1-8 are otherwise row-invariant and cheap.
+
+- [x] Row-invariance check (`FLINT_CHECK_ROWS=1|2|3`), 256 positions x 4 depths.
+- [x] Cause: MoE path switch at `kVecExpertRows`; not a mask or state fault.
+- [x] Fix: `kVecExpertRows` 48; bit-identical widths, verify 10-14% cheaper.
+- [ ] Multi-row attention: read each global KV block once for all verify rows.
+      That is the only remaining term between 1.5x and 2x+ at long context.
+- [ ] Re-run the quant sweep against a fixed token stream once acceptance is
+      measured on our engine rather than llama.cpp's (see Step 1.5 note).
+
+## Step 1.5 — Why cross-quant acceptance numbers are not comparable
+
+llama.cpp greedy output is not batch-invariant: with speculation off, `-ub 512`,
+`-ub 8` and `-ub 4` produced different text on 12/12 prompts. Drafters change
+the verify batch shape, so each quant generated slightly different text and its
+acceptance figure describes a different workload. Aggregate placement stands
+(all quants 49-56%), but no per-quant winner can be read from it. Q6_K is the
+pick on size alone (336 MB vs 811 MB BF16, 2.4x less drafter traffic per cycle).
 
 ## Implementation plan (recorded, not pursued)
 

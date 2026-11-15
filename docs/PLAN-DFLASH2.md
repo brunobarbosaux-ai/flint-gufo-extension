@@ -28,9 +28,11 @@ expert reads), and global-layer KV is re-read per row. We build anyway, with a
 bounded win, because the remaining cost is implementation and the risk is now
 known.
 
-**Kill criterion:** if M1 (drafter parity) has not converged in 3 working days,
-stop and close the track. Everything before M1 is a prerequisite that stands on
-its own merits.
+**Kill criterion:** M1a (adoption probe) must load `Flint-DFlash2-BF16.gguf`
+and emit draft tokens inside half a day, and M1b must match the oracle on 20/20
+fixed positions, first on BF16 and then on Q6_K. If both checkpoints are not met
+inside 3 working days, stop the drafter and ship the prompt-lookup fallback
+(§3.7). Everything before M1a is a prerequisite that stands on its own merits.
 
 ## 2. Current state
 
@@ -54,9 +56,14 @@ Done and committed:
   reversed order, 3 tail dependence), `FLINT_PROFILE`, `FLINT_NO_GRAPH`,
   `FLINT_DEBUG_ATTN`.
 
-Not built — the entire deliverable:
+Not built — the rest of the deliverable:
 
-- drafter GGUF loader and forward pass
+- **drafter forward pass: vendored, not written.** `src/models/qwen/hip/dflash/`
+  is already generic over the drafter GGUF — `QwenDFlashConfig`
+  (`src/models/qwen/dflash_weights.hpp:17`) reads `target_layer_ids`,
+  `block_size`, `mask_token_id`, conv kernel/group, selector rank/top-k, SWA and
+  layer count from the file — and its loader dequantizes Q6_K
+  (`dflash/model.cpp:70`). The work is a config mapping and an adoption test.
 - draft backend, target adapter and the speculative cycle
 - target hidden-state capture in the engine
 - any integration with the decode loop
@@ -148,6 +155,17 @@ sampling possible. Worth proposing upstream, but the design here does not depend
 on it and nothing is throwaway if it lands: the drafter, the adapter and the
 cycle all stay; only the `runner.cpp` glue would be rewired.
 
+### 3.7 If the drafter does not converge
+
+The cycle, the target adapter, the hidden capture and the runner integration are
+drafter-agnostic — the drafter is one implementation of `Propose`. If M1 fails
+its checkpoints, the same code ships with a **prompt-lookup drafter**: an n-gram
+match over the accepted prefix that proposes the tokens which followed the last
+occurrence of the current suffix. No model, no extra memory, ~100 lines, and it
+keeps every part of the investment already committed. Acceptance is lower on
+open-ended text and higher on rewrite/edit traffic, and the same adaptive
+controller prices it.
+
 ## 4. Reference assets
 
 | asset | path | use |
@@ -157,6 +175,7 @@ cycle all stay; only the `runner.cpp` glue would be rewired.
 | layer capture | `src/models/qwen/hip/arena.cpp` `SetTargetLayerCapture`, `kMaxTargetLayerTaps` | how taps are wired |
 | llama.cpp | `/tmp/opencode/llamacpp-ref/speculative.cpp`; upstream `src/models/dflash.cpp`, `dflash2.cpp` | lattice, target layers, `p_min` |
 | drafter | `/home/bruno/AI/GGUF/mtp/Flint-DFlash2-Q6_K.gguf` | 81 tensors (32 F32, 49 Q6_K), 5 blocks, hidden 2048, block 8, SWA 2048, fc 2048->10240, no token embedding, `target_layers=[6,16,27,37,47]` |
+| generic drafter | `src/models/qwen/dflash_weights.hpp:17` (`QwenDFlashConfig`, file-driven), `src/models/qwen/hip/dflash/model.cpp:70` (Q6_K dequant) | the drafter is config-driven: vendor it, do not rewrite it |
 | oracle | `/home/bruno/AI/llama/llama-b11804-rocm/` | acceptance/parity reference |
 
 Layer-id mapping trap: llama.cpp lists the taps as layer **inputs**
@@ -184,15 +203,16 @@ New files, all under the extension's `src/` (vendored code namespaced
 
 | file | contents | ~LOC |
 | :-- | :-- | --: |
-| `src/drafter/model.{hpp,cpp}` | `dflash` GGUF load, 81 tensors, F32 promotion | 400 |
-| `src/drafter/forward.{hpp,cpp}` | encoder, 5 blocks (dynamic grouped conv, non-causal SWA 2048, gated MLP), selector lattice | 900 |
+| `src/drafter/model.{hpp,cpp}` | **vendored** `dflash` loader: 81 tensors, Q6_K dequant, F32 promotion, plus the config mapping | ~450 vendored + 150 written |
+| `src/drafter/forward.{hpp,cpp}` | **vendored**: encoder, 5 blocks (dynamic grouped conv, non-causal SWA 2048, gated MLP), selector lattice | ~950 vendored |
 | `src/drafter/backend.{hpp,cpp}` | internal drafter: context priming from the five taps, KV ring, `Propose(prefix, pos, max)`, `AcceptFeedback`; no `IDraftBackend` | 250 |
 | `src/spec/target_adapter.{hpp,cpp}` | internal adapter over `gpu::Session`: prompt append, batched verify, row logits, hidden rows, rewind; no `ISpeculativeTargetExecutor` | 200 |
 | `src/spec/cycle.{hpp,cpp}` | draft -> `AppendAll` -> lazy row acceptance -> `Rewind`; adaptive length from measured per-row cost; stats | 450 |
 | engine changes | hidden capture ring (~80 MB at 2048 rows x 5 taps x 2048 F32) | 150 |
 
 Memory: drafter Q6_K 336 MB + feature ring 80 MB + draft KV ring 40 MB, against
-a 112 GiB unified heap.
+a 112 GiB unified heap. Written code is ~1,050 LOC; ~1,400 LOC are vendored from
+the in-tree Qwen DFlash2 stack and carry `THIRD_PARTY_NOTICES.md` attribution.
 
 ## 6. Milestones
 
@@ -204,15 +224,25 @@ a 112 GiB unified heap.
   identical across widths.
 - Files: `src/gpu/engine.{hpp,cpp}`.
 
-### M1 — Drafter loader + forward, parity against llama.cpp (2-3 d)  **[kills or confirms the track]**
-- Load the GGUF; run the encoder + 5 blocks + lattice on a fixed
-  (token, 5-tap) sequence.
-- Parity harness, cheapest level first:
-  1. greedy acceptance on the 12-prompt set within ±3 points of 51.1%;
-  2. draft tokens **identical** to the oracle's on 20 fixed positions (add a
-     `--dump-drafts` build of the oracle if needed).
-- Acceptance: level 2 passes on all 20 positions.
-- Failure action: if not converged in 3 days, stop per the kill criterion.
+### M1a — Adoption probe (0.5 d)  **[first thing built]**
+- `tools/drafter_probe.cpp`: vendor `dflash/model.cpp` and the forward behind a
+  ~50-line config shim standing in for the Qwen target (49 layers, hidden 2048,
+  nothing else). Load `Flint-DFlash2-BF16.gguf`, feed one hand-built 5 x 2048 tap
+  vector, print draft ids and lattice scores for a fixed prompt.
+- Acceptance: the file loads and emits plausible draft tokens. If it does not,
+  the reason is known by end of day and the estimate is re-scoped before any
+  cycle work starts.
+
+### M1b — Parity against the oracle (2 d, boxed)  **[kills or confirms the track]**
+- Instrument the oracle to dump the encoder output, block-0 output and lattice
+  scores for one fixed prompt, then compare stage by stage. End-to-end comparison
+  only says "wrong"; intermediates say where.
+- Level 1: BF16 drafter, 20 fixed positions, draft ids **identical**.
+- Level 2: Q6_K drafter, 20/20 identical — this isolates quantization order from
+  math, which is the most likely false alarm.
+- Level 3: greedy acceptance on the 12-prompt set within ±3 points of 51.1%.
+- Acceptance: levels 1 and 2 pass. Not met within 3 working days of M1a ->
+  prompt-lookup fallback (§3.7).
 
 ### M2 — Target adapter (1-1.5 d)
 - Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row
@@ -265,13 +295,14 @@ a 112 GiB unified heap.
 - Ship with speculation **opt-in** (`FLINT_SPEC=dflash`) until the sampled-mode
   numbers are known-good in the field; document the seed-reproducibility caveat.
 
-**Total: 10-14 working days**, of which M1 is the only real technical unknown.
+**Total: ~10-12 working days** (~1,050 LOC written, ~1,400 vendored). M1 is the
+only real technical unknown, and its first checkpoint is half a day away.
 
 ## 7. Risks
 
 | risk | impact | mitigation |
 | :-- | :-- | :-- |
-| Drafter forward mismatches the oracle (lattice, dynamic conv, SWA masking) | track dies | M1 parity gate before any integration; llama.cpp source is the spec; 3-day box |
+| Drafter forward mismatches the oracle (lattice, dynamic conv, SWA masking) | track stalls | M1a adoption probe first, half a day; M1b compares encoder / block-0 / lattice intermediates instead of end to end; BF16 before Q6_K so quant order is not mistaken for a bug; 3-day box with a defined fallback (§3.7) |
 | Sampler state or RNG order disturbed by lazy acceptance | wrong distribution for every non-greedy user | null-drafter gate (byte-identical, any seed), one `Sample` per token by construction, `PreviewFirstToken` must not cycle |
 | Row logits drift from single-token decode | silent, subtle, content-dependent | M2 asserts bit-identity from inside the adapter; re-run `FLINT_CHECK_ROWS` after any engine change |
 | Adaptive policy over-drafts at temperature and depth | slower than plain | price per-row cost; `min_draft_tokens` floor; M4 requires temp-1.0 never slower |
@@ -281,8 +312,9 @@ a 112 GiB unified heap.
 
 ## 8. Out of scope
 
-- Reaching 2x; expert-grouped verify; prompt-lookup drafting (separate track,
-  shares the cycle); batched speculation across concurrent requests; int4
-  attention/`lm_head` requant (independent engine track with better ROI);
-  distribution-exact rejection sampling (needs the transformed target
-  distribution, see §3.4).
+- Reaching 2x; expert-grouped verify; batched speculation across concurrent
+  requests; int4 attention/`lm_head` requant (independent engine track with
+  better ROI); distribution-exact rejection sampling (needs the transformed
+  target distribution, see §3.4).
+- Prompt-lookup drafting is not a separate track any more: it is the fallback
+  drafter for a failed M1 (§3.7) and reuses the whole cycle.

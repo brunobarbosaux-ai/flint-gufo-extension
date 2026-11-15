@@ -24,7 +24,7 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | verify cost, width 8 | 2.21 / 2.48 / 3.16 / 4.25 at 0 / 8k / 32k / 131k |
 | acceptance (oracle, `p_min=0.5`) | 51.1% — code 50.0, JSON 62.8, prose 41.9 |
 | drafter quant | Q6_K (336 MB) |
-| drafter code | **none** — loader, forward, adapters and loop are all unbuilt |
+| drafter code | **none in the extension.** The forward is vendored-ready in-tree: `QwenDFlashConfig` is file-driven and the loader handles Q6_K, so M1a is an adoption probe, not a rewrite |
 
 Three findings from Steps 0-2 changed the shape of the work and are worth
 keeping in view:

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 
 namespace gufo::models::flint::gpu::rocm {
@@ -412,7 +413,12 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
 // the GQA group; the block stages K/V tiles in LDS once for all of them. In the
 // score pass a lane owns a key (full dot product from LDS), in the PV pass a
 // lane owns four output dimensions.
-constexpr int kGqaTile = 64;
+// 32-key blocks: the same granularity as the score sub-blocks below, so the
+// global-layer split partition can be a pure function of the block index
+// (block b belongs to split b % splits) instead of the row's position. That
+// makes the partition identical for every row of a verify batch and for
+// single-token decode, which is what keeps the rows bit-identical.
+constexpr int kGqaTile = 32;
 constexpr int kGqaKPad = 130;  // halves per K row in LDS: odd word stride
 
 __global__ void AttentionSliceKernel(const float* q, const __half* k_cache,
@@ -436,9 +442,24 @@ __global__ void AttentionSliceKernel(const float* q, const __half* k_cache,
   const float scale = rsqrtf(static_cast<float>(d));
   const std::uint32_t first =
       (window > 0 && pos >= window) ? pos - window + 1 : 0;
-  const std::uint32_t chunk = (pos + 1 - first + splits - 1) / splits;
-  const std::uint32_t k0 = first + split * chunk;
-  const std::uint32_t k1 = min(pos + 1, k0 + chunk);
+  // Global layers partition the key range by block index, not by this row's
+  // position, so every row of a verify batch sees identical split boundaries.
+  // That is what lets the multi-row kernel stage each K/V block once for all
+  // rows and still return bit-identical logits; a windowed layer keeps its own
+  // per-row window, whose KV volume is bounded anyway.
+  // A windowed layer cuts its own window into `splits` slices; a global layer
+  // takes every splits-th 32-key block, a partition that does not depend on
+  // the position or on how many rows the pass carries.
+  const std::uint32_t chunk = window > 0
+                                  ? (pos + 1 - first + splits - 1) / splits
+                                  : 0;
+  const std::uint32_t k0 = window > 0 ? first + split * chunk : 0;
+  const std::uint32_t total = window > 0 ? min(pos + 1, k0 + chunk) : pos + 1;
+  const std::uint32_t nblocks = (total + kGqaTile - 1) / kGqaTile;
+  std::uint32_t tile = window > 0 ? k0 : split * kGqaTile;
+  const std::uint32_t tile_step = window > 0 ? kGqaTile : kGqaTile * splits;
+  const std::uint32_t tile_limit =
+      window > 0 ? total : nblocks * kGqaTile;
 
   for (std::uint32_t i = threadIdx.x; i < group * d; i += blockDim.x) {
     q_s[i] =
@@ -448,9 +469,9 @@ __global__ void AttentionSliceKernel(const float* q, const __half* k_cache,
   float m = kNegInf;
   float l = 0.0F;
   float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-  for (std::uint32_t tile = k0; tile < k1; tile += kGqaTile) {
+  for (; tile < tile_limit; tile += tile_step) {
     const std::uint32_t cnt =
-        min(static_cast<std::uint32_t>(kGqaTile), k1 - tile);
+        min(static_cast<std::uint32_t>(kGqaTile), total - tile);
     __syncthreads();
     for (std::uint32_t i = threadIdx.x; i < cnt * (d / 8); i += blockDim.x) {
       const std::uint32_t key = i / (d / 8);
@@ -517,6 +538,174 @@ __global__ void AttentionSliceKernel(const float* q, const __half* k_cache,
     dst[d] = m;
     dst[d + 1] = l;
   }
+}
+
+// Multi-row global attention: one block per (kv head, key split) stages each
+// K/V tile once for all ROWS verify rows, instead of once per row. Rows share
+// the block-index split partition, and each row masks
+// the keys past its own position, so a row accumulates exactly the key
+// sequence the single-row kernel would give it.
+template <int ROWS>
+__global__ void AttentionSliceRowsKernel(const float* q, const __half* k_cache,
+                                         const __half* v_cache, float* partial,
+                                         const std::uint32_t* start_pos,
+                                         std::uint32_t heads,
+                                         std::uint32_t kv_heads,
+                                         std::uint32_t d,
+                                         std::uint32_t splits,
+                                         std::uint32_t rows_total) {
+  extern __shared__ char smem[];
+  __half* k_s = reinterpret_cast<__half*>(smem);
+  __half* v_s = k_s + kGqaTile * kGqaKPad;
+  float* q_s = reinterpret_cast<float*>(v_s + kGqaTile * 128);
+
+  const std::uint32_t group = heads / kv_heads;
+  const std::uint32_t kv_head = blockIdx.x;
+  const std::uint32_t split = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x % 32;
+  const std::uint32_t wave = threadIdx.x / 32;
+  const std::uint32_t head = kv_head * group + wave;
+  const std::uint32_t row0 = blockIdx.z * ROWS;
+  const std::uint32_t base = *start_pos + row0;
+  const std::size_t row = static_cast<std::size_t>(kv_heads) * d;
+  const float scale = rsqrtf(static_cast<float>(d));
+  const std::uint32_t total = *start_pos + rows_total;
+  const std::uint32_t nblocks = (total + kGqaTile - 1) / kGqaTile;
+  const std::uint32_t tile_step = kGqaTile * splits;
+  const std::uint32_t tile_limit = nblocks * kGqaTile;
+
+  for (std::uint32_t i = threadIdx.x; i < ROWS * group * d; i += blockDim.x) {
+    const std::uint32_t r = i / (group * d);
+    if (row0 + r >= rows_total)
+      continue;
+    q_s[i] = q[static_cast<std::size_t>((row0 + r) * heads + kv_head * group) *
+                   d +
+               (i % (group * d))];
+  }
+
+  float m[ROWS];
+  float l[ROWS];
+  float acc[ROWS][4];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r) {
+    m[r] = kNegInf;
+    l[r] = 0.0F;
+    acc[r][0] = 0.0F;
+    acc[r][1] = 0.0F;
+    acc[r][2] = 0.0F;
+    acc[r][3] = 0.0F;
+  }
+
+  for (std::uint32_t tile = split * kGqaTile; tile < tile_limit;
+       tile += tile_step) {
+    const std::uint32_t cnt =
+        min(static_cast<std::uint32_t>(kGqaTile), total - tile);
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < cnt * (d / 8); i += blockDim.x) {
+      const std::uint32_t key = i / (d / 8);
+      const std::uint32_t c = i % (d / 8);
+      const std::size_t src = (tile + key) * row + kv_head * d + c * 8;
+      const uint4 kv = *reinterpret_cast<const uint4*>(k_cache + src);
+      const uint4 vv = *reinterpret_cast<const uint4*>(v_cache + src);
+      unsigned* kd = reinterpret_cast<unsigned*>(k_s + key * kGqaKPad + c * 8);
+      kd[0] = kv.x;
+      kd[1] = kv.y;
+      kd[2] = kv.z;
+      kd[3] = kv.w;
+      *reinterpret_cast<uint4*>(v_s + key * 128 + c * 8) = vv;
+    }
+    __syncthreads();
+    // Rows below r_lo cannot see any key of this tile: they are left untouched.
+    const std::uint32_t r_lo = tile > base ? min(tile - base, ROWS) : 0;
+    for (std::uint32_t sub = 0; sub < cnt; sub += 32) {
+      const std::uint32_t key = sub + lane;
+      const bool live = key < cnt;
+      const std::uint32_t live_keys = min(32U, cnt - sub);
+      for (std::uint32_t r = r_lo; r < ROWS; ++r) {
+        const bool vis = live && (tile + key) <= base + r;
+        float s = kNegInf;
+        if (vis) {
+          const unsigned* kr =
+              reinterpret_cast<const unsigned*>(k_s + key * kGqaKPad);
+          const float* qr = q_s + (r * group + wave) * d;
+          float dot = 0.0F;
+          for (std::uint32_t i = 0; i < d / 2; ++i) {
+            const unsigned w = kr[i];
+            dot += qr[2 * i] * __half2float(__ushort_as_half(w & 0xffffU));
+            dot += qr[2 * i + 1] * __half2float(__ushort_as_half(w >> 16));
+          }
+          s = dot * scale;
+        }
+        float tile_max = s;
+        for (int off = 16; off > 0; off >>= 1)
+          tile_max = fmaxf(tile_max, __shfl_xor(tile_max, off, 32));
+        const float m_new = fmaxf(m[r], tile_max);
+        const float p = vis ? expf(s - m_new) : 0.0F;
+        float psum = p;
+        for (int off = 16; off > 0; off >>= 1)
+          psum += __shfl_xor(psum, off, 32);
+        const float alpha = expf(m[r] - m_new);
+        l[r] = l[r] * alpha + psum;
+        for (int j = 0; j < 4; ++j)
+          acc[r][j] *= alpha;
+        for (std::uint32_t j = 0; j < live_keys; ++j) {
+          const float pj = __shfl(p, j, 32);
+          const __half* vr = v_s + (sub + j) * 128 + lane * 4;
+          acc[r][0] += pj * __half2float(vr[0]);
+          acc[r][1] += pj * __half2float(vr[1]);
+          acc[r][2] += pj * __half2float(vr[2]);
+          acc[r][3] += pj * __half2float(vr[3]);
+        }
+        m[r] = m_new;
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r) {
+    if (row0 + r >= rows_total)
+      break;
+    float* dst =
+        partial +
+        ((static_cast<std::size_t>((row0 + r) * heads + head) * splits) +
+         split) *
+            (d + 2);
+    for (int j = 0; j < 4; ++j)
+      dst[lane * 4 + j] = acc[r][j];
+    if (lane == 0) {
+      dst[d] = m[r];
+      dst[d + 1] = l[r];
+    }
+  }
+}
+
+template <int ROWS>
+static void launch_attn_rows(const float* q, const __half* k_cache,
+                             const __half* v_cache, float* partial,
+                             const std::uint32_t* start_pos,
+                             std::uint32_t heads, std::uint32_t kv_heads,
+                             std::uint32_t d, std::uint32_t splits,
+                             std::uint32_t rows_total, std::size_t smem,
+                             hipStream_t stream) {
+  static const bool ready = []() {
+    (void)hipFuncSetAttribute(
+        reinterpret_cast<const void*>(AttentionSliceRowsKernel<ROWS>),
+        hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+    hipFuncAttributes attr{};
+    if (hipFuncGetAttributes(
+            &attr, reinterpret_cast<const void*>(
+                       AttentionSliceRowsKernel<ROWS>)) == hipSuccess) {
+      std::fprintf(stderr,
+                   "[flint] attn rows<%d>: %d regs, %zuB local, maxthreads %d\n",
+                   ROWS, attr.numRegs, attr.localSizeBytes, attr.maxThreadsPerBlock);
+    }
+    return true;
+  }();
+  (void)ready;
+  const std::uint32_t groups = (rows_total + ROWS - 1) / ROWS;
+  AttentionSliceRowsKernel<ROWS>
+      <<<dim3(kv_heads, splits, groups), (heads / kv_heads) * 32, smem,
+         stream>>>(q, k_cache, v_cache, partial, start_pos, heads, kv_heads, d,
+                   splits, rows_total);
 }
 
 __global__ void AttentionMergeKernel(const float* partial, const float* sinks,
@@ -1426,10 +1615,25 @@ void AttentionSplit(const float* q, const __half* k_cache,
                     std::uint32_t kv_heads, std::uint32_t head_dim,
                     std::uint32_t window, std::uint32_t splits,
                     hipStream_t stream) {
-  AttentionSliceKernel<<<dim3(kv_heads, splits, n_tokens),
-                         (heads / kv_heads) * 32, 0, stream>>>(
-      q, k_cache, v_cache, partial, start_pos, heads, kv_heads, head_dim,
-      window, splits);
+  const std::uint32_t group = heads / kv_heads;
+  if (window == 0 && n_tokens > 1 && head_dim == 128) {
+    // Two rows per block: the K/V tile is shared by both, while the block's
+    // shared memory stays small enough for two blocks per CU, which the
+    // compute-bound score pass needs more than the extra traffic saving.
+    constexpr std::uint32_t kRowsPerBlock = 2;
+    constexpr std::size_t smem = std::size_t{kGqaTile} * (kGqaKPad + 128) *
+                                     sizeof(__half) +
+                                 std::size_t{kRowsPerBlock} * 8 * 128 *
+                                     sizeof(float);
+    launch_attn_rows<kRowsPerBlock>(q, k_cache, v_cache, partial, start_pos,
+                                    heads, kv_heads, head_dim, splits, n_tokens,
+                                    smem, stream);
+  } else {
+    AttentionSliceKernel<<<dim3(kv_heads, splits, n_tokens), group * 32, 0,
+                           stream>>>(
+        q, k_cache, v_cache, partial, start_pos, heads, kv_heads, head_dim,
+        window, splits);
+  }
   AttentionMergeKernel<<<dim3(heads, n_tokens), kAttnBlock, 0, stream>>>(
       partial, sinks, out, static_cast<unsigned char*>(out_q8), heads, head_dim,
       splits);

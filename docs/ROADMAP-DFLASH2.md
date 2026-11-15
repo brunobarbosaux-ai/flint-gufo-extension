@@ -126,7 +126,85 @@ directly, with the extension still untouched.
 - [ ] If the bench confirms ~2.6x: close issue #1 with this data, keep Phase 0
       wins, stop.
 
-## Phase 2 — Drafter loading and forward in the extension  **[on hold — gated on the verify bench]**
+## SDK contract — what the host already owns (gufo 0.32.0, inspected 2026-11-14)
+
+Read from the runtime image (`/lib/gufo/sdk`). This is the single biggest
+scope correction since the roadmap was written: gufo core already contains the
+draft/verify loop, adaptive draft length and lossless rejection sampling. The
+extension does **not** build a speculative decoder; it implements two adapters
+plus one model.
+
+- `gufo/ext/text.hpp`: `TextSpeculativeBackend{kDisabled, kDFlash, kDSpark,
+  kMtp}`, `TextSpeculativeConfig{draft_model_path, max_draft_tokens = 7,
+  min_draft_tokens = 1, dflash_policy: fixed|adaptive}`, stats
+  `draft_rounds / draft_tokens / draft_accepted_tokens`.
+- `src/core/speculative/speculative_verifier.hpp`: `SpeculativeOptions`
+  (`target_acceptance_rate = 0.70`, `enable_adaptive_draft_length`,
+  `use_batched_verification`), `VerifySampledToken` (rejection sampling),
+  `SpeculativeStats`.
+- `ISpeculativeTargetExecutor` — the **target adapter** we implement over the
+  engine: `ForwardPromptBatch`, `ForwardPromptSuffix`, `ForwardToken`,
+  `SaveState`/`RestoreState`, `FinishVerification`, `SetPromptHiddenCapture(
+  enabled, target_layer_ids)`, `GetPromptHiddenStates`, `CopyLastHidden`,
+  `CopyLastLogits`, `CopyVerificationLogits(row)`,
+  `ForwardVerificationChunk(candidates, start_pos, capture_hidden,
+  capture_logits)` (default loops `ForwardToken`; override to batch).
+- `IDraftBackend` — the **drafter adapter** we implement: `Name`,
+  `RequiresTargetHiddenStates`, `TargetHiddenLayerIds`, `PrimeTargetContext`,
+  `AppendTargetContext`, `UpdateTargetHidden`, `AcceptFeedback`,
+  `Propose`/`ProposeSampled`/`ProposeBatch`, and snapshot hooks
+  (`SnapshotPayloadBytes`, `SerializePersistent`).
+
+Mapping to the extension:
+
+| SDK method | Extension primitive |
+|---|---|
+| `ForwardToken`, `ForwardPromptSuffix` | `Session::Append` |
+| `ForwardVerificationChunk` | `Session::AppendAll` (batched rows) |
+| `SaveState` / `RestoreState` | `Session::Rewind` / re-append |
+| `CopyVerificationLogits(row)` | `Session::Logits(row)` |
+| `SetPromptHiddenCapture` / `GetPromptHiddenStates` | new: per-layer residual capture |
+| `PrimeTargetContext` / `AppendTargetContext` | drafter KV injection |
+
+Two contract details that fail silently if missed: the SDK asks for zero-based
+layer **outputs**, while llama.cpp's `dflash.target_layers = [6, 16, 27, 37,
+47]` are layer **inputs** (i.e. outputs `[5, 15, 26, 36, 46]`), and the drafter
+attention is SWA-2048, so only the last ~2048 feature rows need to exist
+(`~80 MB`), not the whole prompt.
+
+## Step 0 — Verify-cost bench  **[current work]**
+
+The gate number: an 8-row verify pass must cost **<= 2.0** single-token decode
+steps for code/JSON to reach 2x. The oracle measured 2.6x, so this decides
+whether Steps 1-5 happen at all.
+
+- [ ] `FLINT_BENCH_VERIFY` in `RunFlintBench`: for each width `1..N`, prefill
+      to depth, warm the width's step graph, then time `R` rounds of
+      `AppendAll(w)` + `Rewind`, reporting `ms/step` and `ms/step / ms(1)`.
+- [ ] Raise `Session::kMaxVerifyRows` from 5 to 8 (graphs, logits buffer and
+      host staging all scale from the constant; verify nothing assumes 5).
+- [ ] Run at depth 0, 8192 and 131072 on the runtime image; also at 32768.
+- [ ] Decision: ratio <= 2.0 -> proceed to Step 1. Ratio >= 2.3 -> stop, close
+      with the study as the deliverable.
+- [ ] In parallel (10 min, oracle): `--spec-type ngram-simple` and `ngram-mod`
+      on the same 12-prompt set. If n-gram drafting beats DFlash2 on code, it
+      ships through the same verify machinery with zero drafter code and is
+      the better first release.
+
+## Implementation plan (if Step 0 passes)
+
+| # | Step | Effort | Notes |
+|---|---|---|---|
+| 1 | Target adapter | 2-3 days | `ISpeculativeTargetExecutor` over `Append`/`AppendAll`/`Rewind`; per-layer residual capture; off-by-one validation vs llama.cpp |
+| 2 | Drafter module | 1-2 weeks | `dflash` loader (81 tensors, BF16->F32 at load), encoder, 5 blocks, dynamic conv, non-causal SWA attention, selector lattice; differential test vs llama.cpp `dflash2_lattice` |
+| 3 | Wire `IDraftBackend` + provider defaults | 2-4 days | `RequiresTargetHiddenStates`, layer ids `{5,15,26,36,46}`, `PrimeTargetContext` / `AcceptFeedback`, policy `adaptive` |
+| 4 | Gates | 3-5 days | GX lossless greedy, G8, per-quant drafter, depth curve, no-regression with speculation off |
+| 5 | Release | 1-2 days | v0.3.0, `QUALITY.md` evidence, registry PR, llama-swap entry |
+
+Memory envelope: drafter weights 1.6 GB (F32) + feature rows 80 MB + drafter
+KV ring 40 MB — negligible against the 112 GiB heap.
+
+## Phase 2 — Drafter module  **[on hold — gated on Step 0]**
 
 **Corrected by the llama.cpp reference (2026-11-14).** The drafter is an
 EAGLE-style model with its own KV cache, not a standalone block model. What the
@@ -158,23 +236,21 @@ extension would actually need:
 - [ ] Gate: drafter-only agreement check against the drafter's own reference
       (per-quant paranoia; Q6 lesson).
 
-## Phase 3 — Draft/verify loop  **[on hold; scaffolding exists]**
+## Phase 3 — Draft/verify loop  **[core-owned, not extension work]**
 
-**Updated 2026-11-14:** the multi-row verification scaffolding already
-exists in the extension — `Session::AppendAll`, `Logits(row)`, `Rewind`,
-`kMaxVerifyRows = 5` — shipped with the fork lineage. llama.cpp clarifies the
-loop's shape:
+**Updated 2026-11-14:** this phase largely disappears. gufo core owns the loop,
+adaptive length, prefix acceptance and rejection sampling (see the SDK section).
+The extension supplies rows and logits; `kMaxVerifyRows` is the only engine
+constraint to revisit. What remains is wiring and measurement:
 
-- Draft length is capped at `block_size - 1 = 7` (8 with
-  `sample_from_anchor`), not 8 — the selector only scores positions 1..7.
+- Draft length is capped at `block_size - 1 = 7`, not 8 — the selector only
+  scores positions 1..7.
 - Verification is a single batched forward of `[anchor + drafts]` followed by a
-  prefix-acceptance walk on logits, `Rewind` to the accepted prefix; per-token
-  acceptance and `mean len` are the two numbers to log.
+  prefix-acceptance walk, `Rewind` to the accepted prefix; `draft_tokens` and
+  `draft_accepted_tokens` come from core stats.
 - `p_min` truncation (0.5 was the best point here) trades mean length for
   verify width: it lifted JSON 1.32x -> 1.54x and prose 1.03x -> 1.07x while
   costing code 1.35x -> 1.30x.
-- [ ] Verify rows beyond 5 if the 8-token block is kept whole (raise
-      `kMaxVerifyRows` or cap draft length at 5).
 - [x] Multi-row logits (`AppendAll` / `Logits(row)`) — present.
 - [ ] Prompt-lookup drafting (moved here from Phase 0): the same
       append/verify/rewind machinery; the fork implements it in its CLI
@@ -233,13 +309,15 @@ loop's shape:
 - Its prompt-lookup loop lives in the CLI driver, not in serve — the
   reference to read when implementing ours.
 
-## Effort shape (revised 2026-11-14, after the study)
+## Effort shape (revised 2026-11-14, after the SDK read)
 
 Phase 0: done (validation only). Phase 1: **done** — and it decided the
-project: 1.31x mean, 1.54x best, verify ratio 2.3-2.7x. Phase 2/3 are on hold
-behind one cheap bench (8-row `AppendAll` cost on our own kernels). If that
-bench lands at ~2.6x, the track closes with the study as the deliverable and
-nothing was sunk into the drafter module. Phase 4: a day.
+project: 1.31x mean, 1.54x best, verify ratio 2.3-2.7x. Phase 2: one drafter
+module (~1-2 weeks), not a new engine. Phase 3: **core-owned**, so the old
+"real engineering" week is gone; what is left is two adapters and gates.
+Total if Step 0 passes: **~3-4 weeks**, dominated by the drafter module.
+If Step 0 fails, cost so far is the bench plus the study, and nothing else
+starts.
 
 Reference value kept from the study: `src/models/dflash.cpp` +
 `dflash2.cpp` + `common/speculative.cpp` in llama.cpp are a complete, working

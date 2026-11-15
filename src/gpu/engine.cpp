@@ -224,6 +224,54 @@ struct ModelState {
   std::unique_ptr<DeviceModel> device;
 };
 
+// Length of the ring that holds the keys of a sliding-window layer, or 0 when
+// the layer keeps every position. A ring must hold the window plus the rows of
+// one launch (a prefill tile): the launch writes its rows before attention
+// reads, and the earliest query still needs the `window` keys that precede it.
+std::uint32_t RingLength(const Config& c, std::uint32_t tile,
+                         std::uint32_t capacity) {
+  if (c.sliding_window == 0)
+    return 0;
+  const std::uint64_t need = std::uint64_t{c.sliding_window} + tile;
+  const std::uint64_t rounded = (need + 63) / 64 * 64;
+  return rounded < capacity ? static_cast<std::uint32_t>(rounded) : 0;
+}
+
+// Cache positions of layer `il` that a snapshot at `position` keeps: all of
+// them for a global layer, only the last `sliding_window` for a window layer,
+// which never reads further back.
+std::uint32_t SnapshotPositions(const Config& c, std::uint32_t il,
+                                std::uint32_t position) {
+  return c.IsSwa(il) && c.sliding_window != 0
+             ? std::min(position, c.sliding_window)
+             : position;
+}
+
+// Copies `count` positions starting at `first` between one layer's cache and a
+// host buffer, in position order. A ring cache wraps: the copy is split where
+// the ring does.
+bool CopyRows(__half* cache, std::uint32_t ring, std::size_t kv_row,
+              std::uint32_t first, std::uint32_t count, std::uint8_t* host,
+              bool to_host) {
+  std::uint32_t done = 0;
+  while (done < count) {
+    const std::uint32_t position = first + done;
+    const std::uint32_t row = ring != 0 ? position % ring : position;
+    const std::uint32_t run =
+        std::min<std::uint32_t>(count - done, ring != 0 ? ring - row : count);
+    const std::size_t bytes = std::size_t{run} * kv_row * sizeof(__half);
+    __half* device = cache + std::size_t{row} * kv_row;
+    std::uint8_t* at = host + std::size_t{done} * kv_row * sizeof(__half);
+    const hipError_t status =
+        to_host ? hipMemcpy(at, device, bytes, hipMemcpyDeviceToHost)
+                : hipMemcpy(device, at, bytes, hipMemcpyHostToDevice);
+    if (status != hipSuccess)
+      return false;
+    done += run;
+  }
+  return true;
+}
+
 struct Session::Impl {
   std::shared_ptr<ModelState> model;
   hipStream_t stream{nullptr};
@@ -267,6 +315,12 @@ struct Session::Impl {
   std::function<void(std::uint32_t, std::uint32_t)> row_write_hook;
 
   std::vector<DeviceBuffer<__half>> k_cache, v_cache;
+  /// Rows of each layer's cache when it is a sliding-window ring, else 0 (the
+  /// layer holds every position up to `capacity`).
+  std::vector<std::uint32_t> ring;
+  std::uint32_t ring_len{0};
+  /// Set when a rewind went further back than a ring still holds the keys for.
+  bool ring_broken{false};
   /// Opt-in block-sparse attention on the global layers (FLINT_SPARSE_ATTN):
   /// pooled key bounds per 64-key block, and the number of older blocks kept.
   std::vector<DeviceBuffer<__half>> kmm;
@@ -497,10 +551,15 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
   const std::size_t slots = static_cast<std::size_t>(tile) * c.expert_used;
   k_cache.resize(c.num_layers);
   v_cache.resize(c.num_layers);
+  ring_len = RingLength(c, tile, capacity);
+  ring.assign(c.num_layers, 0);
   bool ok = true;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-    ok = ok && k_cache[il].Allocate(kv_row * capacity) &&
-         v_cache[il].Allocate(kv_row * capacity);
+    if (c.IsSwa(il))
+      ring[il] = ring_len;
+    const std::size_t rows = ring[il] != 0 ? ring[il] : capacity;
+    ok = ok && k_cache[il].Allocate(kv_row * rows) &&
+         v_cache[il].Allocate(kv_row * rows);
   }
   if (const char* e = std::getenv("FLINT_SPARSE_ATTN");
       e != nullptr && e[0] != '0') {
@@ -1133,7 +1192,8 @@ bool Session::Impl::AttnCore(std::uint32_t il, std::uint32_t n, bool prune,
                    static_cast<const float*>(L.attn_k_norm.data), q.get(),
                    k_cache[il].get(), v_cache[il].get(), n, c.num_heads,
                    c.num_kv, c.head_dim, cpos, c.rope_base, c.rms_eps,
-                   c.HasRope(il), stream, vec ? nullptr : q_half.get());
+                   c.HasRope(il), stream, vec ? nullptr : q_half.get(),
+                   ring[il]);
   const auto chunk_start = static_cast<std::uint32_t>(position);
   if (sparse && !vec && !c.IsSwa(il)) {
     rocm::PoolKeyBlocks(k_cache[il].get(), kmm[il].get(), cpos, chunk_start, n,
@@ -1151,7 +1211,8 @@ bool Session::Impl::AttnCore(std::uint32_t il, std::uint32_t n, bool prune,
                          static_cast<const float*>(L.attn_sinks.data),
                          attn.get(), q8_out ? q8_b : nullptr, attn_part.get(),
                          n, cpos, c.num_heads, c.num_kv, c.head_dim, window,
-                         window > 0 ? kSwaSplits : kGlobalSplits, stream);
+                         window > 0 ? kSwaSplits : kGlobalSplits, stream,
+                         ring[il]);
     ao.q = q8_out ? q8_b : nullptr;
     ao_q8 = q8_out;
   } else {
@@ -1183,7 +1244,7 @@ bool Session::Impl::AttnCore(std::uint32_t il, std::uint32_t n, bool prune,
             : !rocm::AttentionWmma(aq, k_cache[il].get(), v_cache[il].get(),
                                    static_cast<const float*>(L.attn_sinks.data),
                                    attn.get(), an, apos, c.num_heads, c.num_kv,
-                                   c.head_dim, window, stream)) {
+                                   c.head_dim, window, stream, ring[il])) {
       return Fail(error_msg, "Flint: unsupported attention geometry");
     }
   }
@@ -1293,6 +1354,11 @@ bool Session::Impl::Enqueue(std::uint32_t n, bool all_rows,
 
 bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
                             std::string* error_msg) {
+  if (ring_broken) {
+    return Fail(error_msg,
+                "Flint: the session was rewound further than its sliding-window "
+                "cache keeps; restore a snapshot or reset it");
+  }
   const auto n = static_cast<std::uint32_t>(input.size());
   std::copy(input.begin(), input.end(), h_tokens);
   h_pos[0] = position;
@@ -1400,8 +1466,18 @@ void Session::SetRowWriteHook(
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {
-  if (position < impl_->position)
-    impl_->position = position;
+  if (position >= impl_->position)
+    return;
+  // A ring holds the last `ring_len` positions: a query at `position` needs the
+  // `sliding_window` keys before it, so a rewind of more than the slack between
+  // the two has lost keys that the next append would read.
+  if (impl_->ring_len != 0) {
+    const std::uint32_t slack =
+        impl_->ring_len - impl_->model->config.sliding_window + 1;
+    if (impl_->position - position > slack)
+      impl_->ring_broken = true;
+  }
+  impl_->position = position;
 }
 
 bool Session::SetHiddenCapture(std::span<const std::uint32_t> layer_output_ids,
@@ -1508,6 +1584,17 @@ std::uint32_t Session::Capacity() const noexcept {
 namespace {
 constexpr std::uint32_t kSnapshotMagic = 0x544e4c46;  // "FLNT"
 constexpr std::size_t kSnapshotHeaderBytes = 32;
+
+// Bytes of a snapshot at `tokens` positions: header, the K and V rows each
+// layer keeps (SnapshotPositions), and the last logits.
+std::size_t SnapshotByteCount(const Config& c, std::uint32_t tokens) {
+  const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
+  std::size_t positions = 0;
+  for (std::uint32_t il = 0; il < c.num_layers; ++il)
+    positions += SnapshotPositions(c, il, tokens);
+  return kSnapshotHeaderBytes + positions * 2 * kv_row * sizeof(__half) +
+         std::size_t{c.vocab_size} * sizeof(float);
+}
 }  // namespace
 
 TiedWeights Model::Tied() const noexcept {
@@ -1519,11 +1606,7 @@ TiedWeights Model::Tied() const noexcept {
 }
 
 std::size_t Model::SnapshotBytes(std::uint32_t tokens) const noexcept {
-  const Config& c = state_->config;
-  const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
-  return kSnapshotHeaderBytes +
-         std::size_t{c.num_layers} * 2 * tokens * kv_row * sizeof(__half) +
-         std::size_t{c.vocab_size} * sizeof(float);
+  return SnapshotByteCount(state_->config, tokens);
 }
 
 std::size_t Model::SessionBytes(std::uint32_t max_context) const noexcept {
@@ -1541,17 +1624,24 @@ std::size_t Model::SessionBytes(std::uint32_t max_context) const noexcept {
   // Each KV buffer is one hipMalloc. The HIP allocator hands out 2 MiB-granule
   // device blocks (measured with hipMemGetInfo: a 1 MiB request costs 2 MiB, a
   // 2 MiB request costs 2 MiB), so each buffer is charged its rounded-up size.
+  // A sliding-window layer keeps a ring, not every position.
   constexpr std::size_t kDeviceGranule = std::size_t{2} << 20;
-  const std::size_t kv_buffer = std::size_t{max_context} * kv_row * sizeof(__half);
-  const std::size_t kv_rounded =
-      (kv_buffer + kDeviceGranule - 1) / kDeviceGranule * kDeviceGranule;
-  return std::size_t{c.num_layers} * 2 * kv_rounded +
-         SessionScratchBytes(c, tile) + kMmqScratchArenaBytes +
+  const std::uint32_t ring_len = RingLength(c, tile, max_context);
+  std::size_t kv_total = 0;
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    const std::size_t positions =
+        c.IsSwa(il) && ring_len != 0 ? ring_len : max_context;
+    const std::size_t buffer = positions * kv_row * sizeof(__half);
+    kv_total += 2 * ((buffer + kDeviceGranule - 1) / kDeviceGranule *
+                     kDeviceGranule);
+  }
+  return kv_total + SessionScratchBytes(c, tile) + kMmqScratchArenaBytes +
          kSessionGraphBytes;
 }
 
 void Session::Reset() noexcept {
   impl_->position = 0;
+  impl_->ring_broken = false;
 }
 
 std::size_t Session::AllocatedBytes() const noexcept {
@@ -1567,20 +1657,13 @@ std::size_t Session::AllocatedBytes() const noexcept {
 }
 
 std::size_t Session::SnapshotBytes() const noexcept {
-  const Config& c = impl_->model->config;
-  const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
-  return kSnapshotHeaderBytes +
-         std::size_t{c.num_layers} * 2 * impl_->position * kv_row *
-             sizeof(__half) +
-         std::size_t{c.vocab_size} * sizeof(float);
+  return SnapshotByteCount(impl_->model->config, impl_->position);
 }
 
 bool Session::SaveSnapshot(std::span<std::uint8_t> out,
                            std::string* error_msg) const {
   const Config& c = impl_->model->config;
   const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
-  const std::size_t layer_bytes =
-      std::size_t{impl_->position} * kv_row * sizeof(__half);
   if (out.size() != SnapshotBytes())
     return Fail(error_msg, "Flint: snapshot buffer has the wrong size");
   if (hipStreamSynchronize(impl_->stream) != hipSuccess)
@@ -1596,9 +1679,13 @@ bool Session::SaveSnapshot(std::span<std::uint8_t> out,
   std::memcpy(out.data(), header, sizeof(header));
   std::uint8_t* at = out.data() + kSnapshotHeaderBytes;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    // The last `kept` positions, in position order, whatever the cache layout.
+    const std::uint32_t kept = SnapshotPositions(c, il, impl_->position);
+    const std::uint32_t first = impl_->position - kept;
+    const std::size_t layer_bytes = std::size_t{kept} * kv_row * sizeof(__half);
     for (const auto* cache : {&impl_->k_cache[il], &impl_->v_cache[il]}) {
-      if (layer_bytes != 0 && hipMemcpy(at, cache->get(), layer_bytes,
-                                        hipMemcpyDeviceToHost) != hipSuccess) {
+      if (!CopyRows(const_cast<__half*>(cache->get()), impl_->ring[il], kv_row,
+                    first, kept, at, true)) {
         return Fail(error_msg, "Flint: snapshot copy failed");
       }
       at += layer_bytes;
@@ -1624,20 +1711,20 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
       position > impl_->capacity) {
     return Fail(error_msg, "Flint: snapshot does not match this session");
   }
-  const std::size_t layer_bytes =
-      std::size_t{position} * kv_row * sizeof(__half);
-  const std::size_t expected = kSnapshotHeaderBytes +
-                               std::size_t{c.num_layers} * 2 * layer_bytes +
-                               std::size_t{c.vocab_size} * sizeof(float);
-  if (payload.size() != expected)
+  if (payload.size() != SnapshotByteCount(c, position))
     return Fail(error_msg, "Flint: snapshot payload has the wrong size");
   if (hipStreamSynchronize(impl_->stream) != hipSuccess)
     return Fail(error_msg, "Flint: device synchronization failed");
   const std::uint8_t* at = payload.data() + kSnapshotHeaderBytes;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    const std::uint32_t kept = SnapshotPositions(c, il, position);
+    const std::uint32_t first = position - kept;
+    const std::size_t layer_bytes = std::size_t{kept} * kv_row * sizeof(__half);
     for (auto* cache : {&impl_->k_cache[il], &impl_->v_cache[il]}) {
-      if (hipMemcpy(cache->get(), at, layer_bytes, hipMemcpyHostToDevice) !=
-          hipSuccess) {
+      // A window layer gets its last positions back at their cache rows; the
+      // earlier ones are never read.
+      if (!CopyRows(cache->get(), impl_->ring[il], kv_row, first, kept,
+                    const_cast<std::uint8_t*>(at), false)) {
         return Fail(error_msg, "Flint: snapshot restore copy failed");
       }
       at += layer_bytes;
@@ -1703,6 +1790,7 @@ bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
     std::memset(impl_->h_logits, 0, std::size_t{c.vocab_size} * sizeof(float));
     impl_->logit_rows = 1;
     impl_->position = 0;
+    impl_->ring_broken = false;
     return true;
   }
   // The block-sparse key bounds are derived from the keys: rebuild them.
@@ -1724,6 +1812,7 @@ bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
   }
   impl_->logit_rows = 1;
   impl_->position = position;
+  impl_->ring_broken = false;
   return true;
 }
 

@@ -244,6 +244,14 @@ __global__ void MoeCombineNormQuantKernel(
   }
 }
 
+// Cache row of position `pos`. `ring` is 0 for a cache that holds every
+// position (row = position), or the length of a sliding-window ring, which
+// keeps the most recent `ring` positions at row = position % ring.
+__device__ __forceinline__ std::size_t KvRow(std::uint32_t pos,
+                                             std::uint32_t ring) {
+  return ring != 0 ? pos % ring : pos;
+}
+
 // One block per (head, token); head < heads are query heads, then kv_heads key
 // heads, then kv_heads value heads. Thread d owns dimension d.
 __global__ void QkvPrepareKernel(QkvSources src, const float* q_gamma,
@@ -252,7 +260,8 @@ __global__ void QkvPrepareKernel(QkvSources src, const float* q_gamma,
                                  std::uint32_t heads, std::uint32_t kv_heads,
                                  std::uint32_t d,
                                  const std::uint32_t* start_pos, float base,
-                                 float eps, bool rope, __half* q_half) {
+                                 float eps, bool rope, __half* q_half,
+                                 std::uint32_t ring) {
   __shared__ float scratch[kAttnBlock / 32];
   __shared__ float partner[kAttnBlock];
   const std::uint32_t h = blockIdx.x;
@@ -300,9 +309,11 @@ __global__ void QkvPrepareKernel(QkvSources src, const float* q_gamma,
       q_out[(static_cast<std::size_t>(t) * heads + h) * d + i] = val;
     }
   } else if (is_k) {
-    k_cache[pos * kv_row + (h - heads) * d + i] = __float2half(val);
+    k_cache[KvRow(pos, ring) * kv_row + (h - heads) * d + i] =
+        __float2half(val);
   } else {
-    v_cache[pos * kv_row + (h - heads - kv_heads) * d + i] = __float2half(val);
+    v_cache[KvRow(pos, ring) * kv_row + (h - heads - kv_heads) * d + i] =
+        __float2half(val);
   }
 }
 
@@ -346,7 +357,8 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
                                 const __half* v_cache, const float* sinks,
                                 float* out, const std::uint32_t* start_pos,
                                 std::uint32_t heads, std::uint32_t kv_heads,
-                                std::uint32_t d, std::uint32_t window) {
+                                std::uint32_t d, std::uint32_t window,
+                                std::uint32_t ring) {
   __shared__ float q_s[kAttnBlock];
   __shared__ float p_s[kAttnBlock];
   __shared__ float red[kAttnBlock];
@@ -369,7 +381,7 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
     const std::uint32_t key = tile + tid;
     float s = kNegInf;
     if (key <= pos) {
-      const __half* kr = k_cache + key * row + kv_head * d;
+      const __half* kr = k_cache + KvRow(key, ring) * row + kv_head * d;
       float dot = 0.0F;
       for (std::uint32_t i = 0; i < d; ++i) {
         dot += q_s[i] * __half2float(kr[i]);
@@ -400,8 +412,9 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
     const std::uint32_t count =
         min(static_cast<std::uint32_t>(kAttnBlock), pos + 1 - tile);
     for (std::uint32_t j = 0; j < count; ++j) {
-      acc +=
-          p_s[j] * __half2float(v_cache[(tile + j) * row + kv_head * d + tid]);
+      acc += p_s[j] * __half2float(
+                          v_cache[KvRow(tile + j, ring) * row + kv_head * d +
+                                  tid]);
     }
     m = m_new;
     __syncthreads();
@@ -428,7 +441,8 @@ __global__ void AttentionSliceKernel(const float* q, const __half* k_cache,
                                      std::uint32_t heads,
                                      std::uint32_t kv_heads, std::uint32_t d,
                                      std::uint32_t window,
-                                     std::uint32_t splits) {
+                                     std::uint32_t splits,
+                                     std::uint32_t ring) {
   __shared__ __half k_s[kGqaTile * kGqaKPad];
   __shared__ __half v_s[kGqaTile * 128];
   __shared__ float q_s[8 * 128];
@@ -477,7 +491,8 @@ __global__ void AttentionSliceKernel(const float* q, const __half* k_cache,
     for (std::uint32_t i = threadIdx.x; i < cnt * (d / 8); i += blockDim.x) {
       const std::uint32_t key = i / (d / 8);
       const std::uint32_t c = i % (d / 8);
-      const std::size_t src = (tile + key) * row + kv_head * d + c * 8;
+      const std::size_t src =
+          KvRow(tile + key, ring) * row + kv_head * d + c * 8;
       const uint4 kv = *reinterpret_cast<const uint4*>(k_cache + src);
       const uint4 vv = *reinterpret_cast<const uint4*>(v_cache + src);
       unsigned* kd = reinterpret_cast<unsigned*>(k_s + key * kGqaKPad + c * 8);
@@ -902,7 +917,7 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernel(
     const std::uint32_t* __restrict__ start_pos, std::uint32_t heads,
     std::uint32_t kv_heads, std::uint32_t window,
     const __half* __restrict__ kmm, std::uint32_t nblk,
-    std::uint32_t top_blocks) {
+    std::uint32_t top_blocks, std::uint32_t ring) {
   // K tile and V^T tile; the block scores of the sparse prologue reuse them.
   constexpr int kKBytes = kWmmaKeys * kWmmaKStride * 2;
   constexpr int kVBytes = kWmmaHeadDim * kWmmaVtStride * 2;
@@ -1139,7 +1154,7 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernel(
       vpre[u] = make_uint4(0, 0, 0, 0);
       if (kt + key <= pos_max) {
         const std::size_t src =
-            (kt + key) * kv_row + kv_head * kWmmaHeadDim + c * 8;
+            KvRow(kt + key, ring) * kv_row + kv_head * kWmmaHeadDim + c * 8;
         kpre[u] = *reinterpret_cast<const uint4*>(k_cache + src);
         vpre[u] = *reinterpret_cast<const uint4*>(v_cache + src);
       }
@@ -1582,10 +1597,10 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const float* sinks, float* out, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t head_dim,
-               std::uint32_t window, hipStream_t stream) {
+               std::uint32_t window, hipStream_t stream, std::uint32_t ring) {
   AttentionKernel<<<dim3(heads, n_tokens), kAttnBlock, 0, stream>>>(
       q, k_cache, v_cache, sinks, out, start_pos, heads, kv_heads, head_dim,
-      window);
+      window, ring);
 }
 
 bool AttentionWmma(const __half* q, const __half* k_cache,
@@ -1593,14 +1608,14 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
                    std::uint32_t n_tokens, const std::uint32_t* start_pos,
                    std::uint32_t heads, std::uint32_t kv_heads,
                    std::uint32_t head_dim, std::uint32_t window,
-                   hipStream_t stream) {
+                   hipStream_t stream, std::uint32_t ring) {
   if (head_dim != kWmmaHeadDim || heads != kv_heads * kWmmaGroup)
     return false;
   AttentionWmmaKernel<false>
       <<<dim3(kv_heads, (n_tokens + kWmmaTokens - 1) / kWmmaTokens),
          kWmmaThreads, 0, stream>>>(q, k_cache, v_cache, sinks, out, n_tokens,
                                     start_pos, heads, kv_heads, window, nullptr,
-                                    0, 0);
+                                    0, 0, ring);
   return true;
 }
 
@@ -1618,7 +1633,7 @@ bool AttentionWmmaSparse(const __half* q, const __half* k_cache,
       <<<dim3(kv_heads, (n_tokens + kWmmaTokens - 1) / kWmmaTokens),
          kWmmaThreads, 0, stream>>>(q, k_cache, v_cache, sinks, out, n_tokens,
                                     start_pos, heads, kv_heads, 0, kmm, nblk,
-                                    top_blocks);
+                                    top_blocks, 0);
   return true;
 }
 
@@ -1639,7 +1654,7 @@ void AttentionSplit(const float* q, const __half* k_cache,
                     const std::uint32_t* start_pos, std::uint32_t heads,
                     std::uint32_t kv_heads, std::uint32_t head_dim,
                     std::uint32_t window, std::uint32_t splits,
-                    hipStream_t stream) {
+                    hipStream_t stream, std::uint32_t ring) {
   const std::uint32_t group = heads / kv_heads;
   if (window == 0 && n_tokens > 1 && head_dim == 128) {
     // Two rows per block: the K/V tile is shared by both, while the block's
@@ -1657,7 +1672,7 @@ void AttentionSplit(const float* q, const __half* k_cache,
     AttentionSliceKernel<<<dim3(kv_heads, splits, n_tokens), group * 32, 0,
                            stream>>>(
         q, k_cache, v_cache, partial, start_pos, heads, kv_heads, head_dim,
-        window, splits);
+        window, splits, ring);
   }
   AttentionMergeKernel<<<dim3(heads, n_tokens), kAttnBlock, 0, stream>>>(
       partial, sinks, out, static_cast<unsigned char*>(out_q8), heads, head_dim,
@@ -1692,11 +1707,12 @@ void QkvPrepare(const QkvSources& src, const float* q_gamma,
                 __half* v_cache, std::uint32_t n_tokens, std::uint32_t heads,
                 std::uint32_t kv_heads, std::uint32_t head_dim,
                 const std::uint32_t* start_pos, float base, float eps,
-                bool rope, hipStream_t stream, __half* q_half) {
+                bool rope, hipStream_t stream, __half* q_half,
+                std::uint32_t ring) {
   QkvPrepareKernel<<<dim3(heads + 2 * kv_heads, n_tokens), head_dim, 0,
                      stream>>>(src, q_gamma, k_gamma, q_out, k_cache, v_cache,
                                heads, kv_heads, head_dim, start_pos, base, eps,
-                               rope, q_half);
+                               rope, q_half, ring);
 }
 
 void SigmoidTopK(const float* logits, std::int32_t* ids, float* weights,

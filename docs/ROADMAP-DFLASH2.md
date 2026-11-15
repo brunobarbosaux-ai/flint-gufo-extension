@@ -302,6 +302,56 @@ one row, ~140 ms of which is the same global KV re-read eight times (26.3 GB at
 - [ ] Re-run the quant sweep against a fixed token stream once acceptance is
       measured on our engine rather than llama.cpp's (see Step 1.5 note).
 
+## Step 2 — Multi-row attention  **[DONE 2026-11-15 — shipped]**
+
+`AttentionSliceKernel` launched one block per (kv head, key split, token), so a
+width-8 verify staged the same K/V eight times. The replacement keeps one block
+per (kv head, key split) and stages each 32-key block once for a pair of rows.
+
+The constraint that shaped it is Step 0.5: the rows must stay bit-identical to
+single-token decode. That rules out any partition derived from the row's
+position, because then row 0 of a verify batch would see different split
+boundaries than the same token decoded alone. The kernel therefore partitions
+by key-block index — split `s` owns blocks `b % splits == s` — which depends on
+neither the position nor the batch width, and `kGqaTile` went 64 -> 32 so both
+kernels use the same block granularity as the 32-key score sub-blocks (the
+per-key arithmetic is unchanged, which the bit-identical result confirms).
+
+Result, interleaved A/B of the two binaries:
+
+| width 8 | previous | now | delta |
+| --: | --: | --: | --: |
+| depth 0 | 31.29 ms | 31.21 ms | ~0 |
+| 8k | 41.59 ms | 39.35 ms | -5% |
+| 32k | 76.79 ms | 62.84 ms | -18% |
+| 131k | 192.19 ms | 153.23 ms | -20% |
+| ratio @131k | 4.97 | 4.25 | |
+
+Plain decode improves too, because the same kernel serves width 1: 38.65 ->
+36.04 ms at 131072 (-7%). Depth 0 is unchanged. `FLINT_CHECK_ROWS` stays
+256/256 bit-identical at all four depths.
+
+Two rows per block, not eight: the score pass is compute-bound, not read-bound.
+Eight rows per block (48 KB of LDS) held one block per CU and measured *slower*
+than the previous build; two rows per block (24.5 KB) allows two blocks per CU
+and wins. The traffic saving is real but secondary to occupancy.
+
+**What this did not do.** The projected speculative speedup is roughly where it
+was — 1.52x / 1.39x / 1.20x / 0.98x at 0 / 8k / 32k / 131k — because the same
+change also made plain decode cheaper. It is an engine win, not a speculation
+win; the gate is still missed at every depth.
+
+**Measurement lesson.** The first read of this experiment said "net slower" and
+was wrong: the paired runs were ~40 minutes apart and the machine had drifted
+~8% between them. Every comparison in this document from here on is an
+interleaved A/B of two saved binaries, and the drift is why absolute tok/s in
+different sections are not comparable.
+
+Next lever is score-pass throughput: the dot product is scalar (two
+half-to-float conversions plus two FMAs per key per lane). Vectorising it
+(`__half2` / DPP) would speed up plain long-context decode and verify alike,
+and it is the only remaining way to move the 32k+ numbers materially.
+
 ## Step 1.5 — Why cross-quant acceptance numbers are not comparable
 
 llama.cpp greedy output is not batch-invariant: with speculation off, `-ub 512`,

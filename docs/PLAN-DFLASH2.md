@@ -232,14 +232,42 @@ the in-tree Qwen DFlash2 stack and carry `THIRD_PARTY_NOTICES.md` attribution.
 - Files: `src/gpu/engine.{hpp,cpp}`, `src/gpu/kernels/kernels.{hpp,hip.cpp}`,
   `drivers.cpp` (`FLINT_CHECK_HIDDEN`).
 
-### M1a — Adoption probe (0.5 d)  **[first thing built]**
-- `tools/drafter_probe.cpp`: vendor `dflash/model.cpp` and the forward behind a
-  ~50-line config shim standing in for the Qwen target (49 layers, hidden 2048,
-  nothing else). Load `Flint-DFlash2-BF16.gguf`, feed one hand-built 5 x 2048 tap
-  vector, print draft ids and lattice scores for a fixed prompt.
-- Acceptance: the file loads and emits plausible draft tokens. If it does not,
-  the reason is known by end of day and the estimate is re-scoped before any
-  cycle work starts.
+### M1a — Adoption probe (0.5 d)  **[checkpoint 1 done]**
+- `tools/drafter_probe.cpp` (target `flint_drafter_probe`, host tier, no GPU):
+  opens the drafter through `gufo/ext/gguf_reader.hpp`, re-derives the whole
+  loader contract — every metadata key, the diffusion topology rules, the tap
+  convention, and the 81-tensor inventory with shapes — and exits non-zero on
+  any mismatch.
+- **Checkpoint 1 (artifact contract): passed on Q6_K, BF16, Q4_K_M and Q8_0.**
+  Confirmed from the file itself: hidden 2048, intermediate 6144, heads 32 /
+  kv 8 / head_dim 128, 5 blocks, block 8, conv kernel 2 / group 16, selector
+  rank 256 / top-k 16, SWA 2048, context 262144, mask token 150019, vocabulary
+  150144 (inferred from the selector, since the drafter has no head), taps
+  `[6,16,27,37,47]` -> outputs `[5,15,26,36,46]`. 81 tensors: 32 vectors +
+  49 matrices, 315.3 MiB of storage; byte-identical inventory in all four
+  quants.
+
+Two findings the probe produced that change the vendoring, not the plan:
+
+1. **The export carries no rotary-dimension metadata** (`dflash.rope.*` is
+   absent for all five quants). The in-tree loader *requires* it; llama.cpp
+   falls back to `head_dim`. The vendored loader must adopt the fallback, or
+   every Flint drafter is rejected before the first tensor is read.
+2. **Q5_K_M is unusable as-is**: it stores Q5_K, which the in-tree
+   `IsSupportedMatrixType` does not accept (F32/BF16/Q8_0/Q4_K/Q6_K only).
+   Either drop Q5_K_M from the candidate set or add Q5_K, which the extension's
+   MMQ tier already handles for MoE.
+
+Checkpoint 2 is the forward itself, and the probe shows it is a **vendoring
+job with four units**, not a 50-line shim:
+
+| unit | size | notes |
+| :-- | --: | :-- |
+| `src/families/qwen/kernels/dflash_kernels.{hpp,hip}` | 1,232 L | self-contained: dynamic grouped conv, non-causal attention, selector, SiLU-mul, draft-table logits, BF16->Q8_0 |
+| `dflash_weights.{hpp,cpp}` | ~400 L | needs shims for `QwenTensorRef` / `QwenLayerWeights` / `ModelConfig`; add the rotary fallback and Q5_K |
+| forward + block workspace | ~600-700 L | `ForwardBlockBatch` / `BlockWorkspace` are methods of the executor; extract, do not copy the class |
+| target embedding + head | ~40 L | the drafter borrows the target's `token_embd` and `output`; the engine exposes neither today |
+| generic `Launch*` helpers | — | RMSNorm / RoPE / GEMM / embedding / residual-add: map onto the extension's vendored kernels instead of vendoring a second set |
 
 ### M1b — Parity against the oracle (2 d, boxed)  **[kills or confirms the track]**
 - Instrument the oracle to dump the encoder output, block-0 output and lattice
@@ -251,6 +279,10 @@ the in-tree Qwen DFlash2 stack and carry `THIRD_PARTY_NOTICES.md` attribution.
 - Level 3: greedy acceptance on the 12-prompt set within ±3 points of 51.1%.
 - Acceptance: levels 1 and 2 pass. Not met within 3 working days of M1a ->
   prompt-lookup fallback (§3.7).
+- Start with the four vendoring units above, in that order: kernels first (they
+  compile and unit-test without weights), then the loader with the rotary
+  fallback, then the extracted forward, then the engine's tied-weight
+  accessors.
 
 ### M2 — Target adapter (1-1.5 d)
 - Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row

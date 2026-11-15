@@ -138,6 +138,27 @@ if(TARGET gufo_flint_text)
 endif()
 
 # ---------------------------------------------------------------------------
+# Drafter probe: validates a DFlash2 drafter GGUF against the loader contract
+# (metadata, topology, tensor inventory) through the public reader. Host tier,
+# no GPU context, so it runs wherever the artifact is.
+# ---------------------------------------------------------------------------
+gufo_extension_target(
+  NAME flint_drafter_probe
+  SOURCES
+    tools/drafter_probe.cpp
+  LINK_LIBRARIES
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+)
+
+if(TARGET flint_drafter_probe)
+  target_include_directories(flint_drafter_probe PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
 gufo_extension_target(

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/sampling.hpp>
 #include <gufo/ext/text.hpp>
@@ -319,6 +320,71 @@ int RunFlintBench(const ext::TextBenchOptions& opt,
           std::cout << "| Flint | tg" << n << " | " << depth << " | " << r
                     << " | " << generated / dt << " | " << dt << " |\n";
         }
+      }
+    }
+
+    // Verify-width bench (FLINT_BENCH_VERIFY=1): times AppendAll at every
+    // width the engine supports, rewinding the cache between steps so each
+    // step verifies the same positions. ms/step at width w over width 1 is the
+    // speculative verify cost: a draft of w-1 tokens pays that ratio to yield
+    // the accepted tokens of a single verify step. Ratios above the accepted
+    // length per step mean speculation loses.
+    if (const char* env = std::getenv("FLINT_BENCH_VERIFY");
+        env != nullptr && env[0] != '\0' && env[0] != '0') {
+      constexpr std::size_t kSteps = 64;
+      // Varied rows, so the router spreads over experts the way real drafts
+      // do: the bench seed cycle repeats one short pattern at every position.
+      const auto pool = loaded.tokenizer->Encode(
+          "Flint is a mixture-of-experts decoder: 49 layers, hidden 2048, 32 "
+          "query heads and 4 KV heads of 128, 256 experts with 6 routed. "
+          "Sliding-window attention of 513 covers 35 layers and the leading "
+          "two layers are dense. The drafter reads five layer residuals and "
+          "drafts an eight-token block in one forward pass. ");
+      if (pool.empty())
+        Fail("Flint verify bench text produced no tokens");
+
+      std::cout << "\n| width | depth | ms/step | vs w1 | rows/s |\n"
+                   "| --: | --: | --: | --: | --: |\n";
+      for (const auto depth : opt.n_depths) {
+        session->Reset();
+        if (depth)
+          append_all(fill(depth));
+        const auto pos0 = session->Position();
+
+        const std::uint32_t widths = FlintSession::kMaxVerifyRows;
+        std::vector<double> ms(widths + 1, 0.0);
+        for (std::uint32_t w = 1; w <= widths; ++w) {
+          const auto rows = [&](std::size_t step) {
+            std::vector<std::int32_t> ids(w);
+            for (std::uint32_t i = 0; i < w; ++i)
+              ids[i] = static_cast<std::int32_t>(
+                  pool[(step * 13 + i * 7 + depth) % pool.size()]);
+            return ids;
+          };
+          // The first call of a width runs eagerly and the second captures
+          // its step graph, so both stay out of the timed loop.
+          for (std::size_t k = 0; k < 2; ++k) {
+            if (!session->AppendAll(rows(k), &error))
+              Fail("Flint verify bench warmup failed: " + error);
+            session->Rewind(pos0);
+          }
+          double best = 0.0;
+          const std::size_t reps = std::max<std::size_t>(1, opt.repetitions);
+          for (std::size_t r = 0; r < reps; ++r) {
+            const auto start = Clock::now();
+            for (std::size_t k = 0; k < kSteps; ++k) {
+              if (!session->AppendAll(rows(k), &error))
+                Fail("Flint verify bench failed: " + error);
+              session->Rewind(pos0);
+            }
+            const double per_step = Seconds(start) / kSteps;
+            best = best == 0.0 ? per_step : std::min(best, per_step);
+          }
+          ms[w] = best * 1000.0;
+        }
+        for (std::uint32_t w = 1; w <= widths; ++w)
+          std::cout << "| " << w << " | " << depth << " | " << ms[w] << " | "
+                    << ms[w] / ms[1] << " | " << w / (ms[w] / 1000.0) << " |\n";
       }
     }
     return 0;

@@ -172,26 +172,68 @@ layer **outputs**, while llama.cpp's `dflash.target_layers = [6, 16, 27, 37,
 attention is SWA-2048, so only the last ~2048 feature rows need to exist
 (`~80 MB`), not the whole prompt.
 
-## Step 0 — Verify-cost bench  **[current work]**
+## Step 0 — Verify-cost bench  **[DONE — gate FAILED: 2.55x at depth 0, 5.13x at 131k]**
 
-The gate number: an 8-row verify pass must cost **<= 2.0** single-token decode
-steps for code/JSON to reach 2x. The oracle measured 2.6x, so this decides
-whether Steps 1-5 happen at all.
+Built at gufo 0.32.0 (`gpu-test`, `RelWithDebInfo`, gfx1151, BUILD_TESTING=OFF,
+`GUFO_EXTENSIONS=flint`) with `Session::kMaxVerifyRows` raised 5 -> 8 to match
+the engine's `kVecBatch = 8` batched path. `FLINT_BENCH_VERIFY=1` times
+`AppendAll` at every width after a prefill, rewinding between steps, on varied
+real text (not the bench seed cycle).
 
-- [ ] `FLINT_BENCH_VERIFY` in `RunFlintBench`: for each width `1..N`, prefill
-      to depth, warm the width's step graph, then time `R` rounds of
-      `AppendAll(w)` + `Rewind`, reporting `ms/step` and `ms/step / ms(1)`.
-- [ ] Raise `Session::kMaxVerifyRows` from 5 to 8 (graphs, logits buffer and
-      host staging all scale from the constant; verify nothing assumes 5).
-- [ ] Run at depth 0, 8192 and 131072 on the runtime image; also at 32768.
-- [ ] Decision: ratio <= 2.0 -> proceed to Step 1. Ratio >= 2.3 -> stop, close
-      with the study as the deliverable.
-- [ ] In parallel (10 min, oracle): `--spec-type ngram-simple` and `ngram-mod`
-      on the same 12-prompt set. If n-gram drafting beats DFlash2 on code, it
-      ships through the same verify machinery with zero drafter code and is
-      the better first release.
+| width | ms/step @0 | vs w1 | ms/step @8k | vs w1 | @32k | vs w1 | @131k | vs w1 |
+| --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| 1 | 13.98 | 1.00 | 16.09 | 1.00 | 20.61 | 1.00 | 38.69 | 1.00 |
+| 4 | 21.34 | 1.53 | 26.66 | 1.66 | 42.48 | 2.06 | 101.06 | 2.61 |
+| 5 | 25.14 | 1.80 | 31.51 | 1.96 | 51.14 | 2.48 | 123.09 | 3.18 |
+| 6 | 31.48 | 2.25 | 38.75 | 2.41 | 62.12 | 3.01 | 149.96 | 3.88 |
+| 7 | 33.50 | 2.40 | 41.84 | 2.60 | 68.85 | 3.34 | 171.34 | 4.43 |
+| 8 | 35.58 | 2.55 | 45.14 | 2.81 | 76.79 | 3.73 | 198.33 | **5.13** |
 
-## Implementation plan (if Step 0 passes)
+Width-1 confirms the shipped depth curve (71.6 t/s at 0, 25.8 t/s at 131k),
+so the bench is measuring the production decode path.
+
+**Verdict: the gate fails at every depth.** Projected speedup =
+`mean_len / ratio`, with mean len from the Phase 1 study (code 4.23, JSON 4.61,
+prose 3.16):
+
+| depth | 2x needs mean len | code | JSON | prose |
+| --: | --: | --: | --: | --: |
+| 0 | >= 5.10 | 1.66x | 1.81x | 1.24x |
+| 8k | >= 5.62 | 1.51x | 1.64x | 1.12x |
+| 32k | >= 7.46 | 1.13x | 1.24x | 0.85x |
+| 131k | >= 10.3 | 0.82x | 0.90x | 0.62x |
+
+Best measured mean len is 4.61 (JSON), and those are upper bounds: acceptance
+itself also degrades with depth. Past ~16k the verify pass costs more than the
+tokens it returns, which is disqualifying for a model whose selling point is
+262k context.
+
+**Structural cause, and the only real fix.** Each verify row re-reads the KV
+cache independently, so the cost grows linearly with width *and* depth: MoE
+expert reads put a ~2.5x floor at depth 0, and global-layer attention adds the
+rest (2.55 -> 5.13 between 0 and 131k). No drafting scheme escapes this —
+`ngram`/prompt-lookup drafts even wider blocks and hits the same wall harder.
+The fix is a multi-row attention kernel that reads each KV block once for all
+rows (and expert-grouped verify), which is an engine project, not a drafter
+project, and it is the prerequisite for *any* speculation on this engine.
+
+- [x] `FLINT_BENCH_VERIFY` bench in `RunFlintBench`.
+- [x] `kMaxVerifyRows` 5 -> 8.
+- [x] Depth sweep 0 / 8k / 32k / 131k.
+- [x] Decision: ratio > 2.3 at every depth -> **stop the DFlash2 track**.
+- [ ] File the multi-row attention idea as its own work item (it also makes
+      prompt-lookup drafting viable, and it is measurable with this bench).
+- [ ] Note: hipGraph capture is unavailable in this environment
+      (`hipEventSynchronize ... capturing stream`), so all widths ran on the
+      eager step path — the same path the shipped 69.5 t/s figure uses.
+- [ ] Oracle n-gram probe skipped as moot: n-gram drafts are 48-64 tokens wide,
+      where the ratio is far worse than 2.5x.
+
+## Implementation plan (recorded, not pursued)
+
+**Step 0 did not pass (2026-11-14).** The table stays as the cost model: it
+applies unchanged if a multi-row attention kernel ever brings the ratio under
+2.0, which is the precondition for starting Step 1.
 
 | # | Step | Effort | Notes |
 |---|---|---|---|
@@ -309,18 +351,19 @@ constraint to revisit. What remains is wiring and measurement:
 - Its prompt-lookup loop lives in the CLI driver, not in serve — the
   reference to read when implementing ours.
 
-## Effort shape (revised 2026-11-14, after the SDK read)
+## Effort shape (revised 2026-11-14, after Step 0)
 
-Phase 0: done (validation only). Phase 1: **done** — and it decided the
-project: 1.31x mean, 1.54x best, verify ratio 2.3-2.7x. Phase 2: one drafter
-module (~1-2 weeks), not a new engine. Phase 3: **core-owned**, so the old
-"real engineering" week is gone; what is left is two adapters and gates.
-Total if Step 0 passes: **~3-4 weeks**, dominated by the drafter module.
-If Step 0 fails, cost so far is the bench plus the study, and nothing else
-starts.
+Phase 0: done (validation only). Phase 1: **done** — 1.31x mean, 1.54x best,
+verify ratio 2.3-2.7x on the oracle. Step 0: **done** — on our own kernels the
+verify ratio is 2.55x at depth 0 and 5.13x at 131k, so the DFlash2 track stops
+here; no drafter module was written. What would still move the number is a
+multi-row attention kernel (share each KV read across verify rows), which is
+worth doing on its own merits because it gates every form of speculation,
+including prompt lookup.
 
 Reference value kept from the study: `src/models/dflash.cpp` +
 `dflash2.cpp` + `common/speculative.cpp` in llama.cpp are a complete, working
 implementation of exactly this drafter against a Flint target, including the
 `target_layers` contract and the host-side selector walk. Reviving the track
-later does not start from a blank page.
+later does not start from a blank page, and `FLINT_BENCH_VERIFY=1` re-measures
+the gate in one run.

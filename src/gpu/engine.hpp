@@ -33,7 +33,9 @@ public:
   /// row i is the distribution after tokens[i]. Used to verify drafts.
   [[nodiscard]] bool AppendAll(std::span<const std::int32_t> tokens,
                                std::string* error_msg);
-  static constexpr std::uint32_t kMaxVerifyRows = 5;
+  /// Widths 1..8 use the engine's vectorised path (kVecBatch = 8); DFlash2
+  /// drafts 7 tokens, so the verify width is at most 8 rows.
+  static constexpr std::uint32_t kMaxVerifyRows = 8;
 
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;

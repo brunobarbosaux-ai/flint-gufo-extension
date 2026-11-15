@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 namespace gufo::models::flint::gpu::rocm {
@@ -691,7 +692,8 @@ static void launch_attn_rows(const float* q, const __half* k_cache,
         reinterpret_cast<const void*>(AttentionSliceRowsKernel<ROWS>),
         hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
     hipFuncAttributes attr{};
-    if (hipFuncGetAttributes(
+    if (std::getenv("FLINT_DEBUG_ATTN") != nullptr &&
+        hipFuncGetAttributes(
             &attr, reinterpret_cast<const void*>(
                        AttentionSliceRowsKernel<ROWS>)) == hipSuccess) {
       std::fprintf(stderr,

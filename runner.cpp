@@ -916,9 +916,12 @@ private:
     // keeps the last HiddenRingRows of them; the drafter attends to its window
     // only, so earlier rows are skipped rather than injected.
     const std::uint32_t first = static_cast<std::uint32_t>(flint.position());
+    // A row stays available while row + ring > position, so a ring of N rows
+    // serves N - 1 of the rows a pass just wrote.
+    const std::uint32_t usable = session.HiddenRingRows() - 1;
     std::uint32_t skip = 0;
-    if (rows > session.HiddenRingRows())
-      skip = static_cast<std::uint32_t>(rows) - session.HiddenRingRows();
+    if (rows > usable)
+      skip = static_cast<std::uint32_t>(rows) - usable;
     std::string error;
     bool ok = draft->ContextLength() == first;
     if (!ok) {

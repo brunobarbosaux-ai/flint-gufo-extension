@@ -1822,6 +1822,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     Fail(error_msg, "failed to upload Flint weights: " + err);
     return nullptr;
   }
+  // The weights are on the device: drop the GGUF mapping. Kept alive it pins
+  // ~16 GB of mapped file pages that the kernel cannot reclaim cheaply, which
+  // starves the GPU allocations of the next sessions on a unified-memory node.
+  impl->reader.reset();
   model->state_ = std::move(impl);
   return model;
 }

@@ -51,6 +51,13 @@
 //     acceptance, mean_len and per_row_accepted. With --stream the continuation
 //     is the oracle's ids, not the target's argmax, and stream_divergence
 //     reports how often the target's argmax disagrees with it.
+//   flint_drafter_parity TARGET.gguf DRAFT.gguf --positions 64,128,... --out DIR
+//     Multi-position dump (M1c E1). One prompt of at least 4600 tokens (the
+//     fixture's chat prompts and two raw files, see SweepPromptIds) is
+//     prefilled once in chunks of at most 1024 rows. Each listed position gets
+//     DIR/pos-N/ with the same files as --out, traced at --temperature, and
+//     DIR/greedy.json maps each position to its greedy proposals. --text and
+//     --position are ignored in this mode.
 
 #include <hip/hip_runtime.h>
 
@@ -125,6 +132,8 @@ struct Options {
   std::string report_path;
   /// Forced continuation: the oracle's generated ids (--prompts-ids only).
   std::string stream_path;
+  /// Non-empty switches to the multi-position sweep (M1c E1). Ascending.
+  std::vector<std::uint32_t> positions;
 };
 
 [[nodiscard]] std::uint32_t ParseUint(const char* value, const char* flag) {
@@ -141,6 +150,23 @@ struct Options {
     Fail(std::string(flag) + " needs a non-negative integer, got '" + text +
          "'");
   return parsed;
+}
+
+/// `--positions 64,128,...`: strictly ascending, so the sweep can prefill
+/// forward and stop at each one.
+[[nodiscard]] std::vector<std::uint32_t> ParsePositions(const std::string& text) {
+  std::vector<std::uint32_t> positions;
+  std::istringstream in(text);
+  std::string item;
+  while (std::getline(in, item, ','))
+    positions.push_back(ParseUint(item.c_str(), "--positions"));
+  if (positions.empty())
+    Fail("--positions needs at least one position");
+  for (std::size_t i = 0; i < positions.size(); ++i) {
+    if (positions[i] == 0 || (i > 0 && positions[i] <= positions[i - 1]))
+      Fail("--positions must be positive and strictly ascending");
+  }
+  return positions;
 }
 
 [[nodiscard]] Options ParseArgs(int argc, char** argv) {
@@ -188,6 +214,8 @@ struct Options {
       options.report_path = next("--report");
     } else if (arg == "--stream") {
       options.stream_path = next("--stream");
+    } else if (arg == "--positions") {
+      options.positions = ParsePositions(next("--positions"));
     } else if (arg.size() > 1 && arg.front() == '-') {
       Fail("unknown option '" + std::string(arg) +
            "'; usage: flint_drafter_parity TARGET.gguf DRAFT.gguf --out DIR");
@@ -221,6 +249,11 @@ struct Options {
     Fail("--temperature must not be negative");
   if (options.accept_tokens != 0 && options.temperature != 0.0F)
     Fail("--accept measures greedy acceptance; use --temperature 0");
+  if (!options.positions.empty() &&
+      (options.out.empty() || options.accept_tokens != 0 ||
+       !options.prompts_ids.empty() || !options.dump_path.empty()))
+    Fail("--positions needs --out and cannot be combined with --accept, "
+         "--prompts-ids or --dump-prompts");
   return options;
 }
 
@@ -467,13 +500,16 @@ LoadTokenizer(const std::string& path) {
   return ids;
 }
 
-/// `count * taps * hidden` floats, row-major by position and then by tap in the
-/// order `taps` is given -- the layout `fc.weight` expects.
+/// Rows `first .. first+count` as `count * taps * hidden` floats, row-major by
+/// position and then by tap in the order `taps` is given -- the layout
+/// `fc.weight` expects. The ring only holds the last kHiddenRingRows rows, so
+/// the caller copies a row out before the prefill pushes it past the ring.
 [[nodiscard]] std::vector<float> CaptureFeatures(
     flint::Session& session, const std::vector<std::uint32_t>& taps,
-    std::uint32_t count, std::uint32_t hidden) {
+    std::uint32_t first, std::uint32_t count, std::uint32_t hidden) {
   std::vector<float> features(std::size_t{count} * taps.size() * hidden);
-  for (std::uint32_t row = 0; row < count; ++row) {
+  for (std::uint32_t offset = 0; offset < count; ++offset) {
+    const std::uint32_t row = first + offset;
     for (std::size_t tap = 0; tap < taps.size(); ++tap) {
       if (!session.HasHidden(row))
         Fail("captured residual for row " + std::to_string(row) +
@@ -481,8 +517,8 @@ LoadTokenizer(const std::string& path) {
       const auto captured = session.CapturedHidden(row, tap);
       if (captured.size() != hidden)
         Fail("captured residual has the wrong width");
-      std::memcpy(features.data() + (std::size_t{row} * taps.size() + tap) *
-                                        hidden,
+      std::memcpy(features.data() +
+                      (std::size_t{offset} * taps.size() + tap) * hidden,
                   captured.data(), hidden * sizeof(float));
     }
   }
@@ -497,6 +533,23 @@ LoadTokenizer(const std::string& path) {
   for (std::size_t i = 0; i < values.size(); ++i)
     out << (i == 0 ? "" : ", ") << values[i];
   return out.str();
+}
+
+/// For strings written inside a JSON literal (the prompt source can name a
+/// user-supplied path).
+[[nodiscard]] std::string JsonEscape(const std::string& text) {
+  std::string out;
+  for (const char c : text) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      out += ' ';
+    } else {
+      out += c;
+    }
+  }
+  return out;
 }
 
 [[nodiscard]] std::string Float(float value) {
@@ -532,13 +585,20 @@ LoadTokenizer(const std::string& path) {
       << "  \"attention_bias\": false,\n"
       << "  \"attention_dropout\": 0.0,\n"
       << "  \"is_causal\": false,\n"
-      // Every draft block is non-causal over its own block and unmasked over
-      // the injected context, so no layer may be a sliding-attention layer:
-      // the harness derives the SDPA mask from this list.
+      // The GGUF's `dflash.attention.sliding_window_pattern` is all ones, and
+      // the extension's attention kernel applies `sliding_window` to every
+      // layer. The harness derives its SDPA mask from this list, so it has to
+      // say `sliding_attention` for every layer too. Writing `full_attention`
+      // here made the reference unwindowed past 2048 rows (M1c suspect #1).
+      // `Qwen3Config` only honours `sliding_window` when `use_sliding_window`
+      // is true (otherwise it is None and attention is unwindowed), so both
+      // must be written at the top level for the harness to apply the window.
       << "  \"layer_types\": [";
   for (std::uint32_t i = 0; i < config.num_layers; ++i)
-    out << (i == 0 ? "" : ", ") << "\"full_attention\"";
+    out << (i == 0 ? "" : ", ") << "\"sliding_attention\"";
   out << "],\n"
+      << "  \"use_sliding_window\": true,\n"
+      << "  \"sliding_window\": " << config.sliding_window << ",\n"
       << "  \"dflash_config\": {\n"
       << "    \"target_layer_ids\": [" << Join(config.target_layer_ids) << "],\n"
       << "    \"num_target_layers\": " << target_layers << ",\n"
@@ -557,20 +617,29 @@ LoadTokenizer(const std::string& path) {
 /// The per-run facts the harness cannot derive from the config: the block it
 /// must rebuild, the draw that produced each proposal, and the head's storage
 /// type so it can refuse a repacked head.
-[[nodiscard]] std::string TraceJson(const Options& options,
+/// What one traced block was run on. `prompt_source` says where the prompt
+/// came from; the single-position mode uses the text it was given.
+struct BlockSpec {
+  std::uint32_t position{0};
+  std::uint32_t anchor{0};
+  std::uint32_t draft_count{0};
+  float temperature{0.0F};
+  std::string prompt_source;
+};
+
+[[nodiscard]] std::string TraceJson(const BlockSpec& spec,
                                     const dflash::DflashConfig& config,
                                     const std::vector<std::uint32_t>& pools,
-                                    std::uint32_t anchor,
-                                    std::uint32_t draft_count,
                                     const dflash::DflashDraft& draft,
                                     core::GgmlType head_type) {
   std::ostringstream out;
   out << "{\n"
       << "  \"target_layer_ids\": [" << Join(config.target_layer_ids) << "],\n"
-      << "  \"anchor\": " << anchor << ",\n"
-      << "  \"position\": " << options.position << ",\n"
-      << "  \"draft_count\": " << draft_count << ",\n"
-      << "  \"temperature\": " << Float(options.temperature) << ",\n"
+      << "  \"anchor\": " << spec.anchor << ",\n"
+      << "  \"position\": " << spec.position << ",\n"
+      << "  \"draft_count\": " << spec.draft_count << ",\n"
+      << "  \"temperature\": " << Float(spec.temperature) << ",\n"
+      << "  \"prompt_source\": \"" << JsonEscape(spec.prompt_source) << "\",\n"
       << "  \"block_size\": " << config.block_size << ",\n"
       << "  \"mask_token_id\": " << config.mask_token_id << ",\n"
       << "  \"sliding_window\": " << config.sliding_window << ",\n"
@@ -630,6 +699,73 @@ LoadTokenizer(const std::string& path) {
       draws[row] = static_cast<float>(below);
   }
   return draws;
+}
+
+// ---------------------------------------------------------------------------
+// One traced block, shared by --out and --positions.
+// ---------------------------------------------------------------------------
+/// Rebuilds the drafter context from `features` (rows 0..position-1), drafts
+/// one traced block and writes every trace file for it into `trace`. Returns
+/// the proposals. Two passes when sampling: the first finds the block, the
+/// second redraws it with uniforms that agree with the returned distribution.
+[[nodiscard]] dflash::DflashDraft TraceBlock(
+    dflash::DflashForward& forward, const dflash::DflashConfig& config,
+    std::uint32_t num_layers, core::GgmlType head_type, const TraceDir& trace,
+    const BlockSpec& spec, std::span<const float> features,
+    const std::vector<std::uint32_t>& prompt_ids) {
+  std::string error;
+  const auto hook = [&](std::string_view name, const float* data,
+                        std::size_t count) { trace.Write(name, data, count); };
+
+  // A block is a pure function of the injected context, so the second pass
+  // returns the same proposals.
+  forward.ResetContext();
+  if (!forward.AppendContext(features, 0, spec.position, &error, hook))
+    Fail("context injection: " + error);
+
+  dflash::DflashDraft draft;
+  std::vector<float> uniforms(spec.draft_count, 0.5F);
+  if (spec.temperature > 0.0F) {
+    if (!forward.Run(spec.anchor, spec.position, spec.draft_count,
+                     spec.temperature, uniforms, {}, &draft, &error))
+      Fail("draft block: " + error);
+    uniforms = DrawsFromProbabilities(draft, config.selector_top_k);
+    draft = {};
+    if (!forward.Run(spec.anchor, spec.position, spec.draft_count,
+                     spec.temperature, uniforms, hook, &draft, &error))
+      Fail("draft block: " + error);
+  } else {
+    if (!forward.Run(spec.anchor, spec.position, spec.draft_count, 0.0F, {},
+                     hook, &draft, &error))
+      Fail("draft block: " + error);
+  }
+  if (draft.tokens.size() != spec.draft_count)
+    Fail("draft block returned the wrong proposal count");
+
+  trace.Write("target_features", features.data(), features.size());
+
+  if (spec.temperature > 0.0F) {
+    trace.Write("probabilities", draft.candidate_probabilities.data(),
+                draft.candidate_probabilities.size());
+    trace.Write("uniforms", uniforms.data(), uniforms.size());
+    std::vector<float> selected(spec.draft_count, 0.0F);
+    for (std::uint32_t row = 0; row < spec.draft_count; ++row) {
+      for (std::uint32_t index = 0; index < config.selector_top_k; ++index) {
+        if (draft.candidate_ids[row * config.selector_top_k + index] ==
+            draft.tokens[row]) {
+          selected[row] =
+              draft.candidate_probabilities[row * config.selector_top_k +
+                                            index];
+        }
+      }
+    }
+    trace.Write("selected_probabilities", selected.data(), selected.size());
+  }
+
+  trace.WriteJson("trace.json", TraceJson(spec, config, prompt_ids, draft,
+                                          head_type));
+  trace.WriteJson("config.json", ConfigJson(config, num_layers));
+  return draft;
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1265,198 @@ struct PromptRecord {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-position dump (M1c E1).
+// ---------------------------------------------------------------------------
+/// The sweep needs at least this many prompt tokens, so that every listed
+/// position (up to 4500) lies inside one real prompt and not a repeat of a
+/// short one.
+constexpr std::size_t kSweepMinTokens = 4600;
+
+struct SweepPrompt {
+  std::vector<std::uint32_t> ids;
+  std::string source;
+};
+
+/// The fixture the sweep reads. `__FILE__` is absolute in the build, so the
+/// path does not depend on the directory the tool runs from.
+[[nodiscard]] std::filesystem::path SweepPromptsPath() {
+  return std::filesystem::path(__FILE__).parent_path() / "fixtures" / "accept" /
+         "prompts.jsonl";
+}
+
+/// The 12 chat prompts (through the chat template), then the raw files they
+/// name at their pinned revision, all in file order. If that is shorter than
+/// `min_tokens`, the whole sequence repeats. A repeat is fine here: the sweep
+/// checks drafter parity, not acceptance, and `source` records the repeat.
+[[nodiscard]] SweepPrompt SweepPromptIds(const Tokenizer& tokenizer,
+                                         const std::filesystem::path& prompts,
+                                         std::size_t min_tokens) {
+  const std::string prompts_path = prompts.string();
+  const auto root = RepoRoot(prompts_path);
+  std::ifstream input(prompts, std::ios::binary);
+  if (!input)
+    Fail("cannot read " + prompts_path);
+
+  std::vector<std::uint32_t> segment;
+  std::size_t chat_count = 0;
+  std::size_t raw_count = 0;
+  std::string raw_rev;
+  std::string line;
+  std::size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.find_first_not_of(" \t\r") == std::string::npos)
+      continue;
+    const std::string where =
+        prompts_path + ":" + std::to_string(line_number) + ": ";
+    gufo::json::Value spec;
+    try {
+      spec = gufo::json::parse(line);
+    } catch (const std::exception& error) {
+      Fail(where + error.what());
+    }
+    const std::string kind = spec.member_str("kind");
+    if (kind == "chat") {
+      const std::string text = spec.member_str("text");
+      if (text.empty())
+        Fail(where + "chat prompt needs text");
+      const auto ids = EncodeChat(tokenizer, text);
+      segment.insert(segment.end(), ids.begin(), ids.end());
+      ++chat_count;
+    } else if (kind == "raw") {
+      // The whole file, not the prefill: the sweep needs real text, and the
+      // raw files are the only long content the fixture has.
+      const std::string file = spec.member_str("file");
+      const std::string rev = spec.member_str("git_rev");
+      if (file.empty() || rev.empty())
+        Fail(where + "raw prompt needs file and git_rev");
+      gufo::vendor::qwen::tokenization::TokenizerOptions raw_options;
+      raw_options.parse_special_tokens = false;
+      const auto ids = tokenizer.Encode(GitShow(root, rev, file), raw_options);
+      segment.insert(segment.end(), ids.begin(), ids.end());
+      raw_rev = rev;
+      ++raw_count;
+    }
+  }
+  if (segment.empty())
+    Fail("no chat or raw prompts in " + prompts_path);
+
+  SweepPrompt result;
+  std::size_t repeats = 0;
+  while (result.ids.size() < min_tokens) {
+    result.ids.insert(result.ids.end(), segment.begin(), segment.end());
+    ++repeats;
+  }
+  result.source = "prompts.jsonl: " + std::to_string(chat_count) +
+                  " chat prompts (enable_thinking=false, special tokens "
+                  "parsed) + " +
+                  std::to_string(raw_count) +
+                  " raw files at " + raw_rev +
+                  " (no special tokens), concatenated " +
+                  std::to_string(repeats) + "x; " +
+                  std::to_string(result.ids.size()) + " tokens";
+  return result;
+}
+
+/// Prefills once, copying each captured row to the host, and writes one traced
+/// block per listed position plus the greedy proposals.
+[[nodiscard]] int DumpPositions(const Options& options, const Target& target,
+                                const dflash::DflashWeights& weights,
+                                const std::vector<std::uint32_t>& taps,
+                                std::uint32_t draft_count) {
+  const dflash::DflashConfig& draft_config = weights.config;
+  const model::Config& config = target.model->config();
+  const std::uint32_t hidden = config.hidden_size;
+  const std::uint32_t largest = options.positions.back();
+
+  const SweepPrompt prompt = SweepPromptIds(*target.tokenizer,
+                                            SweepPromptsPath(), kSweepMinTokens);
+  if (prompt.ids.size() < largest)
+    Fail("sweep prompt has " + std::to_string(prompt.ids.size()) +
+         " tokens, fewer than the largest position " + std::to_string(largest));
+  std::cout << "# DFlash2 multi-position dump\n\n"
+            << "prompt: " << prompt.source << "\n"
+            << "positions: " << options.positions.size() << ", largest "
+            << largest << "\n\n";
+
+  // The session only prefills to the largest position, plus one block and
+  // slack. The drafter reads the same number of context rows.
+  const auto context = largest + draft_config.block_size + 16U;
+  std::string error;
+  auto session = target.model->CreateSession(context, &error);
+  if (session == nullptr)
+    Fail("target session: " + error);
+  if (!session->SetHiddenCapture(taps, &error))
+    Fail("hidden capture: " + error);
+  auto forward = CreateDrafter(target, weights, options.head, context);
+  const flint::TiedWeights tied = target.model->Tied();
+
+  // The ring keeps only kHiddenRingRows rows, so each chunk's captured rows go
+  // to the host right after its Append. `host` then holds rows 0..prefilled-1
+  // in the layout `fc.weight` expects, for any position.
+  constexpr std::uint32_t kPrefillChunk = 1024;
+  std::vector<float> host;
+  host.reserve(std::size_t{largest} * taps.size() * hidden);
+  std::uint32_t prefilled = 0;
+
+  const TraceDir root(options.out);
+  std::ostringstream greedy;
+  greedy << "{\n";
+  for (std::size_t index = 0; index < options.positions.size(); ++index) {
+    const std::uint32_t position = options.positions[index];
+    while (prefilled < position) {
+      const std::uint32_t count =
+          std::min(kPrefillChunk, position - prefilled);
+      std::vector<std::int32_t> chunk(count);
+      for (std::uint32_t i = 0; i < count; ++i)
+        chunk[i] = static_cast<std::int32_t>(prompt.ids[prefilled + i]);
+      if (!session->Append(chunk, &error))
+        Fail("prompt prefill: " + error);
+      if (session->Position() != prefilled + count)
+        Fail("prompt prefill stopped short of the requested position");
+      const auto rows =
+          CaptureFeatures(*session, taps, prefilled, count, hidden);
+      host.insert(host.end(), rows.begin(), rows.end());
+      prefilled += count;
+    }
+
+    // Anchor at this position: the target's own next token, as in --out.
+    const std::uint32_t anchor = Argmax(session->Logits());
+    const std::span<const float> features(
+        host.data(), std::size_t{position} * taps.size() * hidden);
+    const std::vector<std::uint32_t> prompt_ids(
+        prompt.ids.begin(), prompt.ids.begin() + position);
+
+    const TraceDir dir(options.out + "/pos-" + std::to_string(position));
+    const BlockSpec spec{.position = position,
+                         .anchor = anchor,
+                         .draft_count = draft_count,
+                         .temperature = options.temperature,
+                         .prompt_source = prompt.source};
+    const dflash::DflashDraft traced = TraceBlock(
+        *forward, draft_config, config.num_layers, tied.output_type, dir, spec,
+        features, prompt_ids);
+
+    // Untraced greedy run on the same context. TraceBlock left the context
+    // injected for this position, so only the block is redone.
+    dflash::DflashDraft greedy_draft;
+    if (!forward->Run(anchor, position, draft_count, 0.0F, {}, {},
+                      &greedy_draft, &error))
+      Fail("greedy block: " + error);
+    greedy << (index == 0 ? "" : ",\n") << "  \"" << position << "\": ["
+           << Join(greedy_draft.tokens) << "]";
+
+    std::cout << "pos-" << position << "\tanchor " << anchor << "\tstages "
+              << dir.stages() << "\tproposed " << Join(traced.tokens) << "\n";
+  }
+  greedy << "\n}\n";
+  root.WriteJson("greedy.json", greedy.str());
+  std::cout << "wrote " << options.positions.size() << " positions to "
+            << options.out << "\n";
+  return 0;
+}
+
 [[nodiscard]] int Run(const Options& options) {
   if (!options.dump_path.empty())
     return DumpPrompts(options);
@@ -1155,6 +1483,8 @@ struct PromptRecord {
                draft_config.block_size - 1U);
   if (!options.prompts_ids.empty())
     return MeasurePromptIds(options, target, *weights, taps, draft_count);
+  if (!options.positions.empty())
+    return DumpPositions(options, target, *weights, taps, draft_count);
 
   std::cout << "# DFlash2 drafter parity\n\n| quantity | value |\n| :-- | --: |\n"
             << "| target | " << options.target << " |\n"
@@ -1201,78 +1531,25 @@ struct PromptRecord {
     Fail("prompt prefill stopped short of the requested position");
 
   const auto features =
-      CaptureFeatures(*session, taps, options.position, config.hidden_size);
+      CaptureFeatures(*session, taps, 0, options.position, config.hidden_size);
 
   // Anchor: what the target itself would emit next. The block is then a
   // proposal *from* that token, which is the shape of a real cycle.
   const std::uint32_t anchor = Argmax(session->Logits());
-
-  const flint::TiedWeights tied = target.model->Tied();
-  TraceDir trace(options.out);
-  const auto hook = [&](std::string_view name, const float* data,
-                        std::size_t count) { trace.Write(name, data, count); };
-
-  if (!forward->AppendContext(features, 0, options.position, &error, hook))
-    Fail("context injection: " + error);
-
-  // Two passes: the first finds the block, the second redraws it with uniforms
-  // that agree with the returned distribution. A block is a pure function of
-  // the injected context, so the second pass returns the same proposals.
-  dflash::DflashDraft draft;
-  std::vector<float> uniforms(draft_count, 0.5F);
-  if (!forward->Run(anchor, options.position, draft_count, options.temperature,
-                    uniforms, {}, &draft, &error)) {
-    Fail("draft block: " + error);
-  }
-  if (options.temperature > 0.0F) {
-    uniforms = DrawsFromProbabilities(draft, draft_config.selector_top_k);
-    draft = {};
-    if (!forward->Run(anchor, options.position, draft_count,
-                      options.temperature, uniforms, hook, &draft, &error)) {
-      Fail("draft block: " + error);
-    }
-  } else {
-    draft = {};
-    if (!forward->Run(anchor, options.position, draft_count, 0.0F, {},
-                      hook, &draft, &error)) {
-      Fail("draft block: " + error);
-    }
-  }
-  if (draft.tokens.size() != draft_count)
-    Fail("draft block returned the wrong proposal count");
-
-  trace.Write("target_features", features.data(),
-              static_cast<std::size_t>(options.position) * taps.size() *
-                  config.hidden_size);
-
-  if (options.temperature > 0.0F) {
-    trace.Write("probabilities", draft.candidate_probabilities.data(),
-                draft.candidate_probabilities.size());
-    trace.Write("uniforms", uniforms.data(), uniforms.size());
-    std::vector<float> selected(draft_count, 0.0F);
-    for (std::uint32_t row = 0; row < draft_count; ++row) {
-      for (std::uint32_t index = 0; index < draft_config.selector_top_k;
-           ++index) {
-        if (draft.candidate_ids[row * draft_config.selector_top_k + index] ==
-            draft.tokens[row]) {
-          selected[row] =
-              draft.candidate_probabilities[row * draft_config.selector_top_k +
-                                            index];
-        }
-      }
-    }
-    trace.Write("selected_probabilities", selected.data(), selected.size());
-  }
-
   std::vector<std::uint32_t> prompt_ids(prompt.size());
   for (std::size_t i = 0; i < prompt.size(); ++i)
     prompt_ids[i] = static_cast<std::uint32_t>(prompt[i]);
-  trace.WriteJson(
-      "trace.json",
-      TraceJson(options, draft_config, prompt_ids, anchor, draft_count, draft,
-                tied.output_type));
-  trace.WriteJson("config.json",
-                  ConfigJson(draft_config, config.num_layers));
+
+  const flint::TiedWeights tied = target.model->Tied();
+  TraceDir trace(options.out);
+  const BlockSpec spec{.position = options.position,
+                       .anchor = anchor,
+                       .draft_count = draft_count,
+                       .temperature = options.temperature,
+                       .prompt_source = "--text"};
+  const dflash::DflashDraft draft =
+      TraceBlock(*forward, draft_config, config.num_layers, tied.output_type,
+                 trace, spec, features, prompt_ids);
 
   std::cout << "| stage | file |\n| :-- | :-- |\n"
             << "| trace stages | " << trace.stages() << " |\n"

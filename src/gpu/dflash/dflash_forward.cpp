@@ -625,7 +625,9 @@ bool DflashForward::AppendContext(std::span<const float> features,
   // surviving rows keep their absolute positions and batch boundaries.
   const auto expired = count > s.history_capacity ? count - s.history_capacity
                                                   : std::uint32_t{0};
-  const auto first_chunk = (expired / chunk_rows) * chunk_rows;
+  // A traced run must fill the whole context tensor the harness compares, so it
+  // cannot skip the rows the ring would overwrite; an untraced run can.
+  const auto first_chunk = trace ? std::uint32_t{0} : (expired / chunk_rows) * chunk_rows;
   for (std::uint32_t offset = first_chunk; offset < count;) {
     const auto batch = std::min(chunk_rows, count - offset);
     const auto* source = features.data() + std::size_t{offset} * row;

@@ -236,6 +236,20 @@ if(TARGET flint_tool_template_test)
 endif()
 
 gufo_extension_target(
+  NAME flint_continuation_layout_test
+  SOURCES
+    tests/continuation_layout_test.cpp
+  LINK_LIBRARIES
+    gufo_flint
+    gufo_ext_runtime
+)
+
+if(TARGET flint_continuation_layout_test)
+  add_test(NAME flint.continuation_layout COMMAND flint_continuation_layout_test)
+  set_tests_properties(flint.continuation_layout PROPERTIES LABELS "flint;cpu")
+endif()
+
+gufo_extension_target(
   NAME flint_tool_scan_test
   SOURCES
     tests/tool_scan_test.cpp

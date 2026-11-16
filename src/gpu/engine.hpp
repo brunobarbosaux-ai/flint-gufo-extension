@@ -103,6 +103,21 @@ public:
   [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
                                      std::string* error_msg);
 
+  /// Row-wise access to the KV caches, for a continuation cache that holds
+  /// rows instead of one blob. Row `r` of a layer is position `r` (absolute);
+  /// a window layer's ring maps it. `host` holds (end - first) rows of
+  /// RowBytes() each. Copying out needs the rows to still be in the ring.
+  [[nodiscard]] std::size_t RowBytes() const noexcept;
+  [[nodiscard]] bool TransferRows(std::uint32_t layer, bool value,
+                                  std::uint32_t first, std::uint32_t end,
+                                  std::span<std::uint8_t> host, bool to_host,
+                                  std::string* error_msg);
+  /// After the rows of a restore are in place: makes `position` the live
+  /// position and `logits` (vocab_size floats) the last logits.
+  [[nodiscard]] bool SetState(std::uint32_t position,
+                              std::span<const float> logits,
+                              std::string* error_msg);
+
 private:
   friend class Model;
   Session();

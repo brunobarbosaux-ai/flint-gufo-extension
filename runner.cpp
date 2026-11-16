@@ -55,8 +55,8 @@ std::vector<std::uint8_t> FlintCompatibilityIdentity(
            << "context_tokens=" << max_context << '\n'
            << "chat_template=flint-glm-compiled-v1\n"
            << "state_abi=" << kFlintStateAbi << '\n'
-           << "payload_layout=flint-rocm-session-snapshot-v"
-           << FlintSession::kSnapshotPayloadVersion << '\n';
+           << "payload_layout=flint-rocm-row-components-v"
+           << ContinuationLayout::kLayoutVersion << '\n';
   const auto canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -71,8 +71,8 @@ std::vector<std::uint8_t> ComponentIdentity(const FlintModel* model,
            << "model_instance=" << model << '\n'
            << "context_tokens=" << max_context << '\n'
            << "state_abi=" << kFlintStateAbi << '\n'
-           << "payload_layout=flint-rocm-session-snapshot-v"
-           << FlintSession::kSnapshotPayloadVersion << '\n';
+           << "payload_layout=flint-rocm-row-components-v"
+           << ContinuationLayout::kLayoutVersion << '\n';
   const auto canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -258,6 +258,36 @@ public:
         Log("event=snapshot_selftest result=FAIL step=save reason=" + error);
         return;
       }
+      // Row path (docs/CACHE-ROWS.md): the same state captured as K and V rows
+      // (only the rows a restore retains) plus the logits, before the session
+      // moves on.
+      const ContinuationLayout layout(model_->config(), kCapacity);
+      struct RowCapture {
+        const ContinuationLayout::Component* component;
+        std::uint32_t first;
+        std::vector<std::uint8_t> bytes;
+      };
+      std::vector<RowCapture> rows;
+      bool rows_captured = true;
+      for (const auto& component : layout.components()) {
+        if (!cache::HasRows(component.descriptor.kind))
+          continue;
+        const auto first = static_cast<std::uint32_t>(
+            layout.FirstRetainedRow(component, kPrefix));
+        RowCapture row{&component, first,
+                       std::vector<std::uint8_t>((kPrefix - first) *
+                                                 layout.row_bytes())};
+        rows_captured =
+            rows_captured &&
+            session->TransferRows(
+                component.layer,
+                component.part == ContinuationLayout::Part::kValue, first,
+                kPrefix, row.bytes, true, &error);
+        rows.push_back(std::move(row));
+      }
+      if (!rows_captured)
+        Log("event=snapshot_selftest result=FAIL step=row_capture reason=" +
+            error);
       Tail original;
       if (!run_tail(*session, &original)) {
         Log("event=snapshot_selftest result=FAIL step=continue reason=" + error);
@@ -278,6 +308,34 @@ public:
         Log(std::string("event=snapshot_selftest result=") +
             (ok ? "pass" : "FAIL") +
             " target=" + (use_fresh ? "fresh_session" : "same_session") +
+            " position=" + std::to_string(target.Position()) +
+            (ok ? "" : " reason=" + error));
+      }
+      // The same continuation restored from rows instead of the blob.
+      for (const bool use_fresh : {false, true}) {
+        FlintSession& target = use_fresh ? *fresh : *session;
+        Tail restored;
+        bool ok = rows_captured;
+        for (const auto& row : rows) {
+          ok = ok && target.TransferRows(
+                         row.component->layer,
+                         row.component->part ==
+                             ContinuationLayout::Part::kValue,
+                         row.first, kPrefix,
+                         {const_cast<std::uint8_t*>(row.bytes.data()),
+                          row.bytes.size()},
+                         false, &error);
+        }
+        ok = ok && target.SetState(kPrefix, at_snapshot, &error) &&
+             target.Position() == kPrefix &&
+             same(copy(target.Logits()), at_snapshot) &&
+             run_tail(target, &restored) &&
+             same(restored.after_block, original.after_block) &&
+             same(restored.after_steps, original.after_steps);
+        all_ok = all_ok && ok;
+        Log(std::string("event=snapshot_selftest result=") +
+            (ok ? "pass" : "FAIL") + " path=rows target=" +
+            (use_fresh ? "fresh_session" : "same_session") +
             " position=" + std::to_string(target.Position()) +
             (ok ? "" : " reason=" + error));
       }

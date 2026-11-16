@@ -9,6 +9,7 @@
 #include <span>
 #include <vector>
 
+#include "continuation_layout.hpp"
 #include "src/gpu/engine.hpp"
 
 namespace gufo::models::flint {
@@ -16,17 +17,14 @@ namespace gufo::models::flint {
 using FlintModel = gpu::Model;
 using FlintSession = gpu::Session;
 
-// Prefix-continuation adapter for the Flint ROCm session.
+// Prefix-continuation adapter for the Flint ROCm session (docs/CACHE-ROWS.md).
 //
-// Flint's continuation state is a single opaque device snapshot: the KV rows of
-// every layer plus the last logits, saved and restored as one blob
-// (Session::SaveSnapshot / RestoreSnapshot). Unlike per-layer KV models there
-// are no independently addressable append rows here, so the whole continuation
-// is modelled as one private-state component. A Flint snapshot's byte count
-// tracks the live KV position, so the component is sized to the model's maximum
-// possible snapshot and each payload records its own live length in a header.
-// Prefix caching then works by copying that blob between the slot's session and
-// cache-owned host pages.
+// The continuation is the K and V rows of every layer (append rows for a global
+// layer, window rows for a sliding-window layer, 256 rows per chunk) plus the
+// last logits as private state. The cache therefore holds checkpoints sized by
+// what they keep, shares chunks between checkpoints, and can restore from any
+// earlier checkpoint boundary. Row transfers copy between the session's device
+// caches (a ring for window layers) and cache-owned host pages.
 class FlintContinuationAdapter final : public cache::Adapter {
 public:
   FlintContinuationAdapter(std::shared_ptr<FlintModel> model,
@@ -80,13 +78,11 @@ public:
 private:
   class State;
   State& As(cache::Slot&) const;
-  void RequireComponent(cache::ComponentId) const;
 
   std::shared_ptr<FlintModel> model_;
   std::uint32_t context_;
   cache::Identity identity_;
-  std::size_t snapshot_bytes_{0};
-  std::vector<cache::ComponentDescriptor> descriptors_;
+  ContinuationLayout layout_;
 };
 
 }  // namespace gufo::models::flint

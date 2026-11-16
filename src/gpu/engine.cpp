@@ -413,6 +413,7 @@ struct Session::Impl {
   };
 
   bool Init(std::uint32_t max_context, std::string* error_msg);
+  bool FinishRestore(std::uint32_t position, std::string* error_msg);
   void SetBank() {
     cx = x.get();
     cxn = xn.get();
@@ -1573,6 +1574,33 @@ bool Session::SaveSnapshot(std::span<std::uint8_t> out,
   return true;
 }
 
+// What a restored state needs besides the rows and the logits: the position,
+// and the block-sparse key bounds, which derive from the keys.
+bool Session::Impl::FinishRestore(std::uint32_t position,
+                                  std::string* error_msg) {
+  Session::Impl& s = *this;
+  const Config& c = s.model->config;
+  s.logit_rows = 1;
+  s.position = position;
+  s.ring_broken = false;
+  if (s.sparse) {
+    s.h_pos[0] = 0;
+    if (hipMemcpy(s.pos.get(), s.h_pos, sizeof(std::uint32_t),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      return Fail(error_msg, "Flint: position upload failed");
+    }
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (c.IsSwa(il))
+        continue;
+      rocm::PoolKeyBlocks(s.k_cache[il].get(), s.kmm[il].get(), s.pos.get(), 0,
+                          position, c.num_kv, s.sparse_nblk, s.stream);
+    }
+    if (hipStreamSynchronize(s.stream) != hipSuccess)
+      return Fail(error_msg, "Flint: key bound rebuild failed");
+  }
+  return true;
+}
+
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
   const Config& c = impl_->model->config;
@@ -1609,25 +1637,54 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     }
   }
   std::memcpy(impl_->h_logits, at, std::size_t{c.vocab_size} * sizeof(float));
-  impl_->logit_rows = 1;
-  impl_->position = position;
-  impl_->ring_broken = false;
-  // The block-sparse key bounds are derived from the keys: rebuild them.
-  if (impl_->sparse) {
-    impl_->h_pos[0] = 0;
-    if (hipMemcpy(impl_->pos.get(), impl_->h_pos, sizeof(std::uint32_t),
-                  hipMemcpyHostToDevice) != hipSuccess) {
-      return Fail(error_msg, "Flint: position upload failed");
-    }
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      if (c.IsSwa(il))
-        continue;
-      rocm::PoolKeyBlocks(impl_->k_cache[il].get(), impl_->kmm[il].get(),
-                          impl_->pos.get(), 0, position, c.num_kv,
-                          impl_->sparse_nblk, impl_->stream);
-    }
-    if (hipStreamSynchronize(impl_->stream) != hipSuccess)
-      return Fail(error_msg, "Flint: key bound rebuild failed");
+  return impl_->FinishRestore(position, error_msg);
+}
+
+bool Session::SetState(std::uint32_t position, std::span<const float> logits,
+                       std::string* error_msg) {
+  const Config& c = impl_->model->config;
+  if (position == 0 || position > impl_->capacity)
+    return Fail(error_msg, "Flint: state position is out of range");
+  if (logits.size() != c.vocab_size)
+    return Fail(error_msg, "Flint: state logits have the wrong size");
+  if (hipStreamSynchronize(impl_->stream) != hipSuccess)
+    return Fail(error_msg, "Flint: device synchronization failed");
+  std::memcpy(impl_->h_logits, logits.data(),
+              std::size_t{c.vocab_size} * sizeof(float));
+  return impl_->FinishRestore(position, error_msg);
+}
+
+std::size_t Session::RowBytes() const noexcept {
+  const Config& c = impl_->model->config;
+  return std::size_t{c.num_kv} * c.head_dim * sizeof(__half);
+}
+
+bool Session::TransferRows(std::uint32_t layer, bool value, std::uint32_t first,
+                           std::uint32_t end, std::span<std::uint8_t> host,
+                           bool to_host, std::string* error_msg) {
+  const Config& c = impl_->model->config;
+  if (layer >= c.num_layers || first > end || end > impl_->capacity)
+    return Fail(error_msg, "Flint: row range is out of range");
+  const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
+  if (host.size() != std::size_t{end - first} * kv_row * sizeof(__half))
+    return Fail(error_msg, "Flint: row buffer has the wrong size");
+  if (first == end)
+    return true;
+  const std::uint32_t ring = impl_->ring[layer];
+  // Rows leave the ring as the position moves on: a copy out may only read the
+  // last `ring` positions. A copy in writes at any position (it is the restore
+  // that sets the position afterwards).
+  if (to_host && ring != 0 &&
+      (end > impl_->position || impl_->position - first > ring))
+    return Fail(error_msg, "Flint: rows are no longer in the window ring");
+  if (to_host && ring == 0 && end > impl_->position)
+    return Fail(error_msg, "Flint: rows are past the position");
+  if (hipStreamSynchronize(impl_->stream) != hipSuccess)
+    return Fail(error_msg, "Flint: device synchronization failed");
+  auto& cache = value ? impl_->v_cache[layer] : impl_->k_cache[layer];
+  if (!CopyRows(cache.get(), ring, kv_row, first, end - first, host.data(),
+                to_host)) {
+    return Fail(error_msg, "Flint: row copy failed");
   }
   return true;
 }

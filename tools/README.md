@@ -34,6 +34,22 @@ time. Overrides: `GUFO_BIN`, `FORK_BIN`, `MODEL_Q4`, `MODEL_Q6`, `PORT`,
 | `tokenizer_probe.cpp` / `template_probe.cpp` | G1/G2 C++ probes: encode the corpus / render the fixtures through strycast's tokenizer and `models::flint::RenderPrompt`, compare against the golden. Built with `-DGUFO_BUILD_TOOLS=ON` as `flint_tokenizer_probe` / `flint_template_probe`. |
 | `oracle_server.sh` | Pinned llama.cpp b11804 oracle on `:8098`. Modes `cpu` (no GPU — enough for tokenize/template goldens and G4 prompt building), `gpu`, `cpu-q4`, `gpu-q4`. Set `MODEL`/`MODEL_Q4` for the artifact. |
 
+## Drafter gate
+
+```sh
+tools/drafter_gate.sh parity   # Level 1 + 2: upstream parity sweep, BF16 and Q6_K
+tools/drafter_gate.sh accept   # Level 3: acceptance vs the oracle at p0 / p0.5
+tools/drafter_gate.sh full     # both
+```
+
+Writes `summary.md` and `summary.json` to `$RESULTS_DIR` (default
+`/tmp/opencode/drafter-gate`), with one line per level that ran. The exit code
+is non-zero if any level fails. Overrides: `BUILD_DIR`, `TARGET`, `DRAFT_BF16`,
+`DRAFT_Q6K`, `ORACLE_BIN_DIR`, `UPSTREAM_DIR`, `HARNESS`, `RESULTS_DIR`,
+`SKIP_ORACLE=1` (reuse cached oracle JSONL), `PYTHON`. It enforces one model on
+the GPU at a time: it kills any `llama-server` before each extension run, and
+the oracle runs before the extension tools, never concurrently.
+
 ## G1 / G2
 
 ```sh

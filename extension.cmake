@@ -13,6 +13,7 @@ gufo_extension_target(
     src/runtime/config.cpp
     src/chat_template.cpp
     src/reference.cpp
+    src/gpu/dflash/dflash_weights.cpp
     probe.cpp
     extension.cpp
   LINK_LIBRARIES

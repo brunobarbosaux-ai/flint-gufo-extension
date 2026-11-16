@@ -264,7 +264,7 @@ job with four units**, not a 50-line shim:
 | unit | size | state |
 | :-- | --: | :-- |
 | `src/families/qwen/kernels/dflash_kernels.{hpp,hip}` | 1,232 L | **done** — `src/gpu/dflash/`, compiles and passes `flint.dflash_ops` without weights |
-| `dflash_weights.{hpp,cpp}` | ~400 L | needs shims for `QwenTensorRef` / `QwenLayerWeights` / `ModelConfig`; add the rotary fallback and Q5_K |
+| `dflash_weights.{hpp,cpp}` | ~400 L | **done** — `src/gpu/dflash/`, host tier, rotary fallback + Q5_K |
 | forward + block workspace | ~600-700 L | `ForwardBlockBatch` / `BlockWorkspace` are methods of the executor; extract, do not copy the class |
 | target embedding + head | ~40 L | the drafter borrows the target's `token_embd` and `output`; the engine exposes neither today |
 | generic `Launch*` helpers | — | RMSNorm / RoPE / GEMM / embedding / residual-add: map onto the extension's vendored kernels instead of vendoring a second set |
@@ -297,6 +297,28 @@ job with four units**, not a 50-line shim:
   and a host-compiled `hip_bfloat16` is a bare 16-bit field with no
   conversions — the test owns the BF16 conversion rather than depending on
   which header branch is active.
+
+### M1b unit 2 — loader vendored  **[done]**
+- `src/gpu/dflash/dflash_weights.{hpp,cpp}` (host tier, no GPU): the in-tree
+  validation logic — every metadata key, the topology rules, the tap
+  convention, the tensor inventory, the per-tensor element count and the
+  "fits its mapped storage" check — with two intentional differences:
+  - **Rotary fallback.** No `dflash.rope.*` key exists in any export, so the
+    rotary width falls back to `head_dim` (llama.cpp's rule) and
+    `rotary_from_head_dim` records that it did. The in-tree loader requires the
+    metadata and would reject every Flint drafter.
+  - **Q5_K accepted.** The draft GEMM tier reads F32/BF16/Q8_0/Q4_K/Q6_K as
+    stored; every other type is host-dequantized to BF16 at upload. Q5_K is
+    therefore *loadable* rather than rejected, at the cost of device memory —
+    which is why Q6_K stays the shipped artifact (336 MB vs ~640 MB packed).
+- Gate: `flint_drafter_probe FILES --loader` runs the probe's independent parse
+  and the vendored loader over the same file and diffs them — geometry, taps,
+  vocabulary, and all 81 roles with their element counts and storage classes.
+  **Agrees on Q6_K, BF16, Q4_K_M, Q8_0 and Q5_K_M.** Q5_K_M now also passes the
+  probe's own contract check, since Q5_K is a supported matrix type.
+- The diff earned its keep immediately: it caught a storage-class bug in the
+  probe's own inventory check (a vector role compared with the matrix
+  predicate, which accepts F32, so the check was inverted).
 
 ### M1b — Parity against the oracle (2 d, boxed)  **[kills or confirms the track]**
 - Instrument the oracle to dump the encoder output, block-0 output and lattice

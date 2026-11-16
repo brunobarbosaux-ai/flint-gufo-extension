@@ -7,8 +7,14 @@
 // question -- does the extension's own surface see everything a vendored
 // loader needs -- without a GPU, a target model or a line of forward code.
 //
-// Usage: flint_drafter_probe DRAFTER.gguf [--tensors]
+// Usage: flint_drafter_probe DRAFTER.gguf [--tensors] [--loader]
 //   exit 0 when the artifact satisfies the contract, 1 otherwise.
+//
+// --loader additionally runs the vendored loader on the same file and diffs its
+// view against this probe's independent parse: same geometry, same taps, same
+// tensor inventory with the same element counts and storage classes. The probe
+// deliberately re-derives the contract instead of calling the loader, so the two
+// disagreeing is a finding in either one.
 
 #include <gufo/ext/gguf_reader.hpp>
 
@@ -20,14 +26,20 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <map>
 #include <utility>
 #include <vector>
+
+#include "src/gpu/dflash/dflash_weights.hpp"
 
 namespace gufo::models::flint {
 namespace {
 
 using core::GgufReader;
 using core::GgmlType;
+
+/// The vendored drafter loader, for the `--loader` differential check.
+namespace dflash = gpu::dflash;
 
 struct Spec {
   // Transformer geometry (dflash.*).
@@ -231,8 +243,12 @@ bool IsVectorType(GgmlType type) {
 }
 
 bool IsMatrixType(GgmlType type) {
+  // Q5_K is not native to the draft GEMM tier, but the loader accepts it and the
+  // upload path host-dequantizes it to BF16, so an artifact that stores it is
+  // loadable -- just larger in device memory than Q6_K.
   return IsVectorType(type) || type == GgmlType::kQ8_0 ||
-         type == GgmlType::kQ4_K || type == GgmlType::kQ6_K;
+         type == GgmlType::kQ4_K || type == GgmlType::kQ5_K ||
+         type == GgmlType::kQ6_K;
 }
 
 std::vector<Expected> Inventory(const Spec& spec) {
@@ -354,15 +370,143 @@ void PrintTensors(const GgufReader& reader) {
   }
 }
 
+/// Role name -> tensor, for the diff against this probe's inventory.
+std::map<std::string, const dflash::DflashTensor*> Roles(
+    const dflash::DflashWeights& weights) {
+  std::map<std::string, const dflash::DflashTensor*> roles{
+      {"selector_predecessor.weight", &weights.selector_predecessor},
+      {"selector_successor.weight", &weights.selector_successor},
+      {"selector_hidden.weight", &weights.selector_hidden},
+      {"fc.weight", &weights.fc_projection},
+      {"enc.output_norm.weight", &weights.fc_norm},
+      {"output_norm.weight", &weights.output_norm},
+  };
+  for (std::size_t i = 0; i < weights.layers.size(); ++i) {
+    const std::string prefix = "blk." + std::to_string(i) + ".";
+    const auto& layer = weights.layers[i];
+    roles[prefix + "attn_norm.weight"] = &layer.attn_norm;
+    roles[prefix + "attn_q.weight"] = &layer.attn_q;
+    roles[prefix + "attn_k.weight"] = &layer.attn_k;
+    roles[prefix + "attn_v.weight"] = &layer.attn_v;
+    roles[prefix + "attn_output.weight"] = &layer.attn_output;
+    roles[prefix + "attn_q_norm.weight"] = &layer.attn_q_norm;
+    roles[prefix + "attn_k_norm.weight"] = &layer.attn_k_norm;
+    roles[prefix + "ffn_norm.weight"] = &layer.ffn_norm;
+    roles[prefix + "ffn_gate.weight"] = &layer.ffn_gate;
+    roles[prefix + "ffn_up.weight"] = &layer.ffn_up;
+    roles[prefix + "ffn_down.weight"] = &layer.ffn_down;
+    roles[prefix + "attn_conv_base"] = &layer.attn_conv_base;
+    roles[prefix + "attn_conv_proj.weight"] = &layer.attn_conv_projection;
+    roles[prefix + "ffn_conv_base"] = &layer.ffn_conv_base;
+    roles[prefix + "ffn_conv_proj.weight"] = &layer.ffn_conv_projection;
+  }
+  return roles;
+}
+
+/// Compares the vendored loader's view of the file with the probe's own.
+bool CheckLoader(const GgufReader& reader, const Spec& spec, Report* report) {
+  std::string error;
+  const auto weights = dflash::DflashWeights::LoadFromGguf(reader, &error);
+  if (!weights.has_value()) {
+    report->problems.push_back("loader rejected the file: " + error);
+    return false;
+  }
+  const auto& config = weights->config;
+
+  const auto compare = [&](auto got, auto want, const char* label) {
+    if (got != want)
+      report->problems.push_back(std::string("loader ") + label + ": " +
+                                 std::to_string(got) + ", probe says " +
+                                 std::to_string(want));
+  };
+  compare(config.hidden_size, spec.hidden, "hidden");
+  compare(config.intermediate_size, spec.intermediate, "intermediate");
+  compare(config.num_attention_heads, spec.heads, "heads");
+  compare(config.num_key_value_heads, spec.kv_heads, "kv heads");
+  compare(config.head_dim, spec.head_dim, "head dim");
+  compare(config.rotary_dim, spec.rotary_dim, "rotary dim");
+  compare(config.context_length, spec.context_length, "context length");
+  compare(config.num_layers, spec.blocks, "blocks");
+  compare(config.vocab_size, spec.vocab, "vocabulary");
+  compare(config.block_size, spec.block_size, "block size");
+  compare(config.mask_token_id, spec.mask_token, "mask token");
+  compare(config.conv_kernel_size, spec.conv_kernel, "conv kernel");
+  compare(config.conv_group_size, spec.conv_group, "conv group");
+  compare(config.selector_rank, spec.selector_rank, "selector rank");
+  compare(config.selector_top_k, spec.selector_top_k, "selector top-k");
+  compare(config.sliding_window, spec.sliding_window, "sliding window");
+  compare(config.rotary_from_head_dim, !spec.rotary_explicit,
+          "rotary fallback flag");
+  if (config.target_layer_ids != spec.taps)
+    report->problems.push_back("loader taps differ from the probe's");
+  if (static_cast<float>(config.rope_theta) != spec.rope_theta)
+    report->problems.push_back("loader rope theta differs");
+
+  // Inventory: every tensor the probe expects must be bound to a role with the
+  // same element count and the same storage class, and nothing else may be.
+  const auto roles = Roles(*weights);
+  const auto expected = Inventory(spec);
+  std::size_t bound = 0;
+  for (const auto& want : expected) {
+    const auto role = roles.find(want.name);
+    if (role == roles.end()) {
+      report->problems.push_back("loader has no role for " + want.name);
+      continue;
+    }
+    ++bound;
+    const auto& tensor = *role->second;
+    if (tensor.num_elements != want.elements) {
+      report->problems.push_back(
+          "loader " + want.name + " has " +
+          std::to_string(tensor.num_elements) + " elements, probe expects " +
+          std::to_string(want.elements));
+    }
+    const bool ok = want.matrix ? IsMatrixType(tensor.type)
+                                : IsVectorType(tensor.type);
+    if (!ok) {
+      report->problems.push_back("loader " + want.name +
+                                 " has unexpected storage class " +
+                                 std::string(core::ToString(tensor.type)));
+    }
+    if (tensor.empty() || !tensor.FitsAvailableStorage()) {
+      report->problems.push_back("loader " + want.name +
+                                 " is empty or overruns its mapping");
+    }
+  }
+  if (bound != expected.size())
+    report->problems.push_back("loader bound " + std::to_string(bound) +
+                               " of " + std::to_string(expected.size()) +
+                               " expected tensors");
+  const std::size_t role_count = roles.size();
+  if (role_count != expected.size())
+    report->problems.push_back("loader has " + std::to_string(role_count) +
+                               " roles, probe expects " +
+                               std::to_string(expected.size()));
+  return true;
+}
+
 }  // namespace
 
 int RunDrafterProbe(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: flint_drafter_probe DRAFTER.gguf [--tensors]\n");
+                 "usage: flint_drafter_probe DRAFTER.gguf [--tensors] "
+                 "[--loader]\n");
     return 2;
   }
-  const bool list_tensors = argc > 2 && std::strcmp(argv[2], "--tensors") == 0;
+  bool list_tensors = false;
+  bool use_loader = false;
+  for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--tensors") == 0) {
+      list_tensors = true;
+    } else if (std::strcmp(argv[i], "--loader") == 0) {
+      use_loader = true;
+    } else {
+      std::fprintf(stderr, "flint_drafter_probe: unknown option %s\n",
+                   argv[i]);
+      return 2;
+    }
+  }
 
   std::string error;
   const auto reader = GgufReader::OpenFile(argv[1], &error);
@@ -408,8 +552,13 @@ int RunDrafterProbe(int argc, char** argv) {
 
   Report report;
   CheckInventory(*reader, spec, &report);
+  const bool loader_ran = use_loader && CheckLoader(*reader, spec, &report);
   std::printf("\n| check | result |\n| :-- | :-- |\n");
   std::printf("| tensors checked | %zu |\n", report.checked);
+  if (use_loader)
+    std::printf("| vendored loader | %s |\n",
+                loader_ran && report.problems.empty() ? "agrees"
+                                                      : "differs or rejected");
   std::printf("| problems | %zu |\n", report.problems.size());
   if (!report.problems.empty()) {
     std::printf("\n");

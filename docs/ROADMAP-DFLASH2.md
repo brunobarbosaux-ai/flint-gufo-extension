@@ -26,6 +26,7 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | hidden capture (engine) | **done** — 5 taps x 2048 rows, rows bit-identical to single-token decode at widths 1-8, 0.3-1.7% of a decode step (`FLINT_CHECK_HIDDEN`) |
 | drafter artifact contract | **verified** — 81 tensors / 315.3 MiB, taps `[6,16,27,37,47]`→`[5,15,26,36,46]`, identical inventory in Q6_K/BF16/Q4_K_M/Q8_0 (`flint_drafter_probe`); the export has **no rotary metadata** (fall back to head_dim) and Q5_K_M stores Q5_K, which the loader rejects |
 | drafter quant | Q6_K (336 MB) |
+| drafter loader (extension) | **done** — `src/gpu/dflash/dflash_weights.cpp`, rotary-dim fallback and Q5_K support; probe and loader agree on all five quants (`--loader`) |
 | drafter kernels (extension) | **done** — `src/gpu/dflash`, vendored verbatim (namespace + includes only), `flint.dflash_ops` covers conv/SiLU-mul/attention/selector/gather/BF16->Q8_0 against host references |
 | drafter code | **none in the extension.** The forward is vendored-ready in-tree: `QwenDFlashConfig` is file-driven and the loader handles Q6_K, so M1a is an adoption probe, not a rewrite |
 

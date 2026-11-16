@@ -26,7 +26,7 @@ implementation depends on.
 | `hip/vendor/qwen/` | Gufo `src/families/qwen/` and `src/core/` | Qwen tokenizer, chat template, control tokens and reasoning helpers. |
 | `hip/vendor/qwen_kernels/` | Gufo `src/families/qwen/kernels/`, `src/families/qwen/hip_common/`, `src/core/hip/` | Wave64 W8A8 GEMM launcher and its private header closure. |
 | `hip/vendor/qwen38/` | Gufo `src/models/qwen38_flash_next/` | MTP sampling and RoPE scaling headers used by the vendored kernels. |
-| `src/gpu/dflash/` | Gufo `src/families/qwen/kernels/` | DFlash2 draft kernels: dynamic grouped conv, non-causal attention, candidate selector, draft-table logits. Verbatim apart from the namespace and the include retargeting. |
+| `src/gpu/dflash/` | Gufo `src/families/qwen/kernels/`, `src/models/qwen/dflash_weights.*` | DFlash2 draft kernels and weights loader. The kernels are verbatim apart from the namespace and the include retargeting; the loader differs in the rotary-dimension fallback and Q5_K acceptance, both documented in the file header. |
 | `hip/vendor/vision/` | Gufo `src/models/qwen/vision/` | RoPE helper required by the vendored kernels' include closure. |
 | `hip/vendor/quant/` | Gufo `src/core/quant/` | Quantized block layouts, dequant/dot tables and IQ grids. |
 | `tests/gguf_test_shim.hpp` | `gufo-org/lfm3-gufo-extension` `tests/gguf_test_shim.hpp` | Header-only `GgufReader` implementation used by tests, following the LFM3 extension pattern. |

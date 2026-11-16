@@ -28,7 +28,18 @@ PLAN-DFLASH2.md §3.1 says there is "no extension-facing speculative hook". The 
 - **Hidden ring.** `AppendContext` requires contiguous appends from `injected_context_len`, and the target's ring holds only the last `kHiddenRingRows` (2048) rows. When speculation is on, the runner caps its prefill chunk at `kHiddenRingRows` and calls `cycle.SyncContext(position)` after each chunk (as `RunAcceptance` does). Speculation is **not** disabled for long prompts.
 - **Cancellation.** `PrepareCancellation` -> `cycle.Abort()`; `Invalidate()` -> `cycle.Abort()` + `cycle.Reset()`.
 
+## M3 speed-gate root cause (debugger, confirmed)
+
+The ON path's multi-second stalls are HIP sync/allocation stalls, not speculation logic. Two triggers, both amplified because the harness held **two full 25 GB target models at once**:
+
+1. **Graph re-capture per request.** `Session::SetHiddenCapture` (`src/gpu/engine.cpp:1292`) called `Impl::InvalidateGraphs()` unconditionally, and `TargetAdapter::Create` (`src/spec/target_adapter.cpp:34`) calls it from `BindComponentState` (`runner.cpp:355`) on every request with the same tap set. Each re-capture costs 4-5 s on this APU.
+2. **mmq scratch pool growth.** `qfn_stack_pool::reserve` (`hip/vendor/rocm/mmq/flint_ggml_stubs.hip.cpp:128`) does `hipDeviceSynchronize()` + `hipFree` + `AllocateDevice`; under memory pressure this is attributed to `exp_gate_up` (4844 ms ON vs 21 ms OFF).
+3. **Harness doubled memory.** `tools/spec_gate.cpp` constructed `Harness off` and `Harness on` up front (lines 273-274, 291-292, 321-322); each loads its own 25 GB model, so both stayed resident and the ON model's `hipMalloc`/`hipMemcpy` upload stalled (3.4-6.4 s per tensor).
+
+**Fix:** (primary) serialize OFF/ON harness lifetimes in `tools/spec_gate.cpp`; (secondary) guard `InvalidateGraphs()` + ring realloc behind a tap-set change in `Session::SetHiddenCapture`. Do NOT touch the capture block, the pool reserve, or the cycle/verify logic.
+
 ## Log
 
 - M2 delegated, verified (`flint.target_adapter` passes), committed `50d9189`.
 - M3 delegated; first pass produced `src/spec/cycle.{hpp,cpp}` (compiles), then stopped on three design blockers. Decisions above sent; runner glue + gate tool in progress.
+- M3 correctness gates pass (GX 12/12, null 108/108 byte-identical); speed gate failed (0.13-0.14). Coder reported STUCK; debugger root-caused it to harness memory pressure + unconditional graph invalidation (above). Fix delegated.

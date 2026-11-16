@@ -261,13 +261,42 @@ Two findings the probe produced that change the vendoring, not the plan:
 Checkpoint 2 is the forward itself, and the probe shows it is a **vendoring
 job with four units**, not a 50-line shim:
 
-| unit | size | notes |
+| unit | size | state |
 | :-- | --: | :-- |
-| `src/families/qwen/kernels/dflash_kernels.{hpp,hip}` | 1,232 L | self-contained: dynamic grouped conv, non-causal attention, selector, SiLU-mul, draft-table logits, BF16->Q8_0 |
+| `src/families/qwen/kernels/dflash_kernels.{hpp,hip}` | 1,232 L | **done** — `src/gpu/dflash/`, compiles and passes `flint.dflash_ops` without weights |
 | `dflash_weights.{hpp,cpp}` | ~400 L | needs shims for `QwenTensorRef` / `QwenLayerWeights` / `ModelConfig`; add the rotary fallback and Q5_K |
 | forward + block workspace | ~600-700 L | `ForwardBlockBatch` / `BlockWorkspace` are methods of the executor; extract, do not copy the class |
 | target embedding + head | ~40 L | the drafter borrows the target's `token_embd` and `output`; the engine exposes neither today |
 | generic `Launch*` helpers | — | RMSNorm / RoPE / GEMM / embedding / residual-add: map onto the extension's vendored kernels instead of vendoring a second set |
+
+### M1b unit 1 — draft kernels vendored  **[done]**
+- `src/gpu/dflash/dflash_kernels.{hpp,hip.cpp}` are the in-tree files with
+  **only three edits**: the include guard, the namespace
+  (`gufo::hip::kernels` -> `gufo::models::flint::gpu::dflash`) and the include of
+  `gufo/ext/sampling.hpp` in place of `src/core/sampling.hpp`. Every kernel body
+  is byte-identical, so a stage-by-stage parity failure is a parity failure and
+  not a re-derivation. The Q8_0 block layout comes from the `quant_ops.hpp` the
+  extension already vendors (byte-identical to the in-tree one), imported with
+  two `using` declarations because the enclosing-namespace lookup that served
+  the in-tree file no longer applies.
+- Compiled into `gufo_flint_hip` on the same tier as Flint's own kernels (-O3,
+  no fast-math), not the fast-math GEMM tier.
+- Gate: `flint.dflash_ops` (`tests/dflash_ops_test.cpp`), every launcher against
+  a host reference on hand-checkable shapes — grouped dynamic conv for both
+  attention and FFN sides, SiLU-mul, BF16->Q8_0 against a host quantizer
+  (exact scale and every quantized byte), and the non-causal attention
+  dispatcher compared to both a host reference and its scalar/wave routes
+  (including a head dim that is not a multiple of four, where the wave route is
+  invalid and the dispatcher must fall back). The selector is checked on the
+  greedy path with vocabulary-wide transition codebooks and a fixture whose
+  winner is *not* the logits argmax, so a kernel that ignored the codebooks
+  fails.
+- Two things the test surfaced that a weights-based test would have hidden:
+  the wave attention route reads each key row as `float4` and is only valid for
+  a head dim that is a multiple of four (the dispatcher already gates on it),
+  and a host-compiled `hip_bfloat16` is a bare 16-bit field with no
+  conversions — the test owns the BF16 conversion rather than depending on
+  which header branch is active.
 
 ### M1b — Parity against the oracle (2 d, boxed)  **[kills or confirms the track]**
 - Instrument the oracle to dump the encoder output, block-0 output and lattice

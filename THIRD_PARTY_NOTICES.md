@@ -26,6 +26,7 @@ implementation depends on.
 | `hip/vendor/qwen/` | Gufo `src/families/qwen/` and `src/core/` | Qwen tokenizer, chat template, control tokens and reasoning helpers. |
 | `hip/vendor/qwen_kernels/` | Gufo `src/families/qwen/kernels/`, `src/families/qwen/hip_common/`, `src/core/hip/` | Wave64 W8A8 GEMM launcher and its private header closure. |
 | `hip/vendor/qwen38/` | Gufo `src/models/qwen38_flash_next/` | MTP sampling and RoPE scaling headers used by the vendored kernels. |
+| `src/gpu/dflash/` | Gufo `src/families/qwen/kernels/` | DFlash2 draft kernels: dynamic grouped conv, non-causal attention, candidate selector, draft-table logits. Verbatim apart from the namespace and the include retargeting. |
 | `hip/vendor/vision/` | Gufo `src/models/qwen/vision/` | RoPE helper required by the vendored kernels' include closure. |
 | `hip/vendor/quant/` | Gufo `src/core/quant/` | Quantized block layouts, dequant/dot tables and IQ grids. |
 | `tests/gguf_test_shim.hpp` | `gufo-org/lfm3-gufo-extension` `tests/gguf_test_shim.hpp` | Header-only `GgufReader` implementation used by tests, following the LFM3 extension pattern. |
@@ -42,13 +43,14 @@ keeps its implementation but lives under extension-owned namespaces:
 | `gufo::vendor::qwen38_flash_next` | `gufo::models::qwen38_flash_next` |
 | `gufo::vendor::qwen::tokenization` | `gufo::tokenization` |
 | `gufo::vendor::qwen::vision` | `gufo::models::qwen::vision` |
+| `gufo::models::flint::gpu::dflash` | `gufo::hip::kernels` (DFlash2 draft kernels only) |
 | `gufo::vendor::quant` | `gufo::quant` |
 | `flint_mmq`, `flint_ggml_stubs` (files `flint_mmq*.h`, `flint_ggml_stubs.*`) | `qfn_mmq`, `qfn_ggml_stubs` |
 
 When rebasing onto a newer Gufo revision, refresh these directories from the
 upstream paths, re-apply the include retargeting to `<gufo/ext/...>` public
 headers and to the vendor-local paths, re-apply the namespace mapping above,
-and re-run `flint.ops`.
+and re-run `flint.ops` and `flint.dflash_ops`.
 
 ## Upstream license
 

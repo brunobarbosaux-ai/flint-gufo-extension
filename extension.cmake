@@ -58,6 +58,10 @@ if(TARGET gufo_flint_hip)
   gufo_extension_hip_sources(gufo_flint_hip
     SOURCES
       src/gpu/kernels/kernels.hip.cpp
+      # DFlash-2 draft kernels, vendored verbatim from the in-tree Qwen family.
+      # Same tier as Flint's own kernels: -O3, no fast-math, so the arithmetic
+      # the parity harness compares is the arithmetic the oracle runs.
+      src/gpu/dflash/dflash_kernels.hip.cpp
   )
   # The vendored Qwen GEMM tier mirrors the in-tree qwen38_flash_next tiers:
   # its HIP targets compile with fast-math, and the mmq tier adds
@@ -203,6 +207,28 @@ gufo_extension_target(
 if(TARGET flint_ops_test)
   add_test(NAME flint.ops COMMAND flint_ops_test)
   set_tests_properties(flint.ops PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+endif()
+
+# The vendored DFlash2 draft kernels: every launcher against a host reference on
+# shapes small enough to reason about. No weights, no target model, so this is
+# the gate the vendoring itself has to pass.
+gufo_extension_target(
+  NAME flint_dflash_ops_test
+  SOURCES
+    tests/dflash_ops_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_dflash_ops_test)
+  # The vendored header, like its in-tree source, is gated on the backend
+  # macro its real consumer defines.
+  target_compile_definitions(flint_dflash_ops_test PRIVATE ENGINE_ENABLE_HIP=1)
+  add_test(NAME flint.dflash_ops COMMAND flint_dflash_ops_test)
+  set_tests_properties(flint.dflash_ops PROPERTIES LABELS "flint;hip;gpu;gfx1151")
 endif()
 
 # Source extensions own installation of their additional data and notices.

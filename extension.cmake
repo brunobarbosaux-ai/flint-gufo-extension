@@ -12,6 +12,8 @@ gufo_extension_target(
   SOURCES
     src/runtime/config.cpp
     src/chat_template.cpp
+    src/tool_dialect.cpp
+    src/tool_dialect_register.cpp
     src/reference.cpp
     src/gpu/dflash/dflash_weights.cpp
     probe.cpp
@@ -216,6 +218,35 @@ gufo_extension_target(
 if(TARGET flint_probe_test)
   add_test(NAME flint.probe COMMAND flint_probe_test)
   set_tests_properties(flint.probe PROPERTIES LABELS "flint;cpu")
+endif()
+
+gufo_extension_target(
+  NAME flint_tool_template_test
+  SOURCES
+    tests/tool_template_test.cpp
+  LINK_LIBRARIES
+    gufo_flint
+    gufo_ext_runtime
+)
+
+if(TARGET flint_tool_template_test)
+  add_test(NAME flint.tool_template COMMAND flint_tool_template_test
+    "${GUFO_EXTENSION_BUILD_ROOT}/tests/golden/template_cases.json")
+  set_tests_properties(flint.tool_template PROPERTIES LABELS "flint;cpu")
+endif()
+
+gufo_extension_target(
+  NAME flint_tool_scan_test
+  SOURCES
+    tests/tool_scan_test.cpp
+  LINK_LIBRARIES
+    gufo_flint
+    gufo_ext_runtime
+)
+
+if(TARGET flint_tool_scan_test)
+  add_test(NAME flint.tool_scan COMMAND flint_tool_scan_test)
+  set_tests_properties(flint.tool_scan PROPERTIES LABELS "flint;cpu")
 endif()
 
 gufo_extension_target(

@@ -27,6 +27,7 @@
 #include "src/chat_template.hpp"
 #include "src/gpu/engine.hpp"
 #include "src/runtime/config.hpp"
+#include "src/tool_dialect.hpp"
 
 namespace gufo::models::flint {
 namespace {
@@ -330,25 +331,47 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ext::ChatRequest& request) const override {
-    if (!request.tools.empty() &&
-        request.tool_choice != ext::ChatRequest::ToolChoice::kNone) {
-      throw std::invalid_argument("Flint does not support tools yet");
-    }
+    // tool_choice none leaves the declared tools out of the prompt, so the
+    // model does not try to call them.
+    const bool with_tools =
+        !request.tools.empty() &&
+        request.tool_choice != ext::ChatRequest::ToolChoice::kNone;
     std::vector<ChatMessage> messages;
     messages.reserve(request.messages.size());
     for (const auto& message : request.messages) {
       if (!message.images.empty())
         throw std::invalid_argument("Flint does not support image input");
-      messages.push_back({FlintRoleName(message.role),
-                          message.content + message.framing_suffix,
-                          message.thought});
+      ChatMessage rendered{FlintRoleName(message.role),
+                           message.content + message.framing_suffix,
+                           message.thought};
+      for (const auto& call : message.tool_calls) {
+        ::gufo::models::flint::ToolCall rendered_call;
+        rendered_call.name = call.name;
+        for (const auto& argument : call.arguments)
+          rendered_call.arguments.push_back(
+              {argument.name, argument.value, argument.is_string});
+        rendered.tool_calls.push_back(std::move(rendered_call));
+      }
+      messages.push_back(std::move(rendered));
     }
+    std::vector<::gufo::models::flint::ChatTool> tools;
+    std::vector<std::pair<std::string, std::string>> schemas;
+    if (with_tools) {
+      for (const auto& tool : request.tools) {
+        tools.push_back({tool.definition_json, tool.name, tool.description,
+                         tool.parameters_json});
+        schemas.emplace_back(tool.name, tool.parameters_json);
+      }
+    }
+    // The parser reads the model's calls without the request: it learns which
+    // parameters are strings from the tools of the prompts rendered here.
+    RememberToolSchemas(schemas);
     gufo::vendor::qwen::tokenization::TokenizerOptions options;
     options.parse_special_tokens = true;
     // Qualified: the inherited TextModelRunner::RenderPrompt member would hide
     // the namespace-scope overload under unqualified lookup.
-    return tokenizer_->Encode(::gufo::models::flint::RenderPrompt(messages),
-                              options);
+    return tokenizer_->Encode(
+        ::gufo::models::flint::RenderPrompt(messages, tools), options);
   }
 
   [[nodiscard]] std::string Decode(
@@ -423,6 +446,12 @@ public:
   [[nodiscard]] std::size_t CheckpointPosition(
       const ext::TextRunnerState& state) const override {
     return RequireFlintState(state).position();
+  }
+
+  // Flint writes its calls in the GLM markup, read by the dialect that
+  // provider registration adds (src/tool_dialect.cpp).
+  [[nodiscard]] std::string ToolDialectId() const override {
+    return std::string(kToolDialectId);
   }
 
   [[nodiscard]] ext::ReasoningTags ReasoningBudgetTags() const override {

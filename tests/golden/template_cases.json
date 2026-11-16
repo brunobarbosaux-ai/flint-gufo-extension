@@ -1,0 +1,768 @@
+[
+ {
+  "name": "plain_user",
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Bonjour"
+   }
+  ],
+  "expected": "<|user|>Bonjour<|assistant|>"
+ },
+ {
+  "name": "system_user",
+  "tools": [],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Tu es utile."
+   },
+   {
+    "role": "user",
+    "content": "Bonjour"
+   }
+  ],
+  "expected": "<|system|>Tu es utile.<|user|>Bonjour<|assistant|>"
+ },
+ {
+  "name": "developer",
+  "tools": [],
+  "messages": [
+   {
+    "role": "developer",
+    "content": "Règles du développeur"
+   },
+   {
+    "role": "user",
+    "content": "Salut"
+   }
+  ],
+  "expected": "<|developer|>Règles du développeur<|user|>Salut<|assistant|>"
+ },
+ {
+  "name": "multi_turn_thought",
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "1+1 ?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Il faut additionner.",
+    "content": "2"
+   },
+   {
+    "role": "user",
+    "content": "Et 2+2 ?"
+   }
+  ],
+  "expected": "<|user|>1+1 ?<|assistant|><think>Il faut additionner.</think>2<|user|>Et 2+2 ?<|assistant|>"
+ },
+ {
+  "name": "assistant_empty_content",
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "y"
+   }
+  ],
+  "expected": "<|user|>x<|assistant|><|user|>y<|assistant|>"
+ },
+ {
+  "name": "escaping",
+  "tools": [],
+  "messages": [
+   {
+    "role": "system",
+    "content": "a <|user|> b <think>c</think> d <|assistant|> e"
+   },
+   {
+    "role": "user",
+    "content": "<|begin_of_text|>x<|end_of_text|> <|observation|> <|system|> <|developer|>"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "<think>nested</think>",
+    "content": "<|user|>"
+   }
+  ],
+  "expected": "<|system|>a &lt;|user|&gt; b c d &lt;|assistant|&gt; e<|user|>&lt;|begin_of_text|&gt;x&lt;|end_of_text|&gt; &lt;|observation|&gt; &lt;|system|&gt; &lt;|developer|&gt;<|assistant|><think><think>nested</think></think><|user|><|assistant|>"
+ },
+ {
+  "name": "tools_user_only",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Quel temps à Rennes ?"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Quel temps à Rennes ?<|assistant|>"
+ },
+ {
+  "name": "tools_system_user",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   },
+   {
+    "name": "search",
+    "description": "Search the web",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "limit": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    },
+    "strict": true
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Tu es utile."
+   },
+   {
+    "role": "user",
+    "content": "Quel temps à Rennes ?"
+   }
+  ],
+  "expected": "<|system|>Tu es utile.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}{\"name\": \"search\", \"description\": \"Search the web\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"query\"]}, \"strict\": true}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Quel temps à Rennes ?<|assistant|>"
+ },
+ {
+  "name": "tools_two_systems",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Premier"
+   },
+   {
+    "role": "system",
+    "content": "Second"
+   },
+   {
+    "role": "user",
+    "content": "x"
+   }
+  ],
+  "expected": "<|system|>Premier<|system|>Second<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|assistant|>"
+ },
+ {
+  "name": "tools_only_system",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Seulement un système"
+   }
+  ],
+  "expected": "<|system|>Seulement un système<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|assistant|>"
+ },
+ {
+  "name": "tools_developer_first",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "developer",
+    "content": "dev"
+   },
+   {
+    "role": "user",
+    "content": "u"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|developer|>dev<|user|>u<|assistant|>"
+ },
+ {
+  "name": "tool_round_trip",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Quel temps à Rennes ?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Je dois appeler l'outil.",
+    "content": "Je vérifie.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Rennes",
+       "unit": "c"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "{\"temp\": 12, \"ciel\": \"nuageux\"}"
+   },
+   {
+    "role": "assistant",
+    "content": "Il fait 12 °C."
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Quel temps à Rennes ?<|assistant|><think>Je dois appeler l'outil.</think>Je vérifie.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Rennes</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><|observation|><tool_response>{\"temp\": 12, \"ciel\": \"nuageux\"}</tool_response><|assistant|>Il fait 12 °C.<|assistant|>"
+ },
+ {
+  "name": "parallel_calls",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   },
+   {
+    "name": "search",
+    "description": "Search the web",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "limit": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    },
+    "strict": true
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Météo Rennes et Brest"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Rennes"
+      }
+     },
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Brest"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "12"
+   },
+   {
+    "role": "tool",
+    "content": "10"
+   },
+   {
+    "role": "assistant",
+    "content": "ok"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}{\"name\": \"search\", \"description\": \"Search the web\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"query\"]}, \"strict\": true}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Météo Rennes et Brest<|assistant|><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rennes</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Brest</arg_value></tool_call><|observation|><tool_response>12</tool_response><|observation|><tool_response>10</tool_response><|assistant|>ok<|assistant|>"
+ },
+ {
+  "name": "call_value_types",
+  "tools": [
+   {
+    "name": "search",
+    "description": "Search the web",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "limit": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    },
+    "strict": true
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "name": "search",
+      "arguments": {
+       "query": "é à ü",
+       "limit": 5,
+       "flag": true,
+       "none": null,
+       "ratio": 0.5,
+       "tags": [
+        "a",
+        "b"
+       ],
+       "nested": {
+        "k": [
+         1,
+         {
+          "z": "é"
+         }
+        ],
+        "s": "x"
+       },
+       "text": "a \"q\" b\nc"
+      }
+     }
+    ]
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"search\", \"description\": \"Search the web\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"query\"]}, \"strict\": true}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|assistant|><tool_call>search<arg_key>query</arg_key><arg_value>é à ü</arg_value><arg_key>limit</arg_key><arg_value>5</arg_value><arg_key>flag</arg_key><arg_value>true</arg_value><arg_key>none</arg_key><arg_value>null</arg_value><arg_key>ratio</arg_key><arg_value>0.5</arg_value><arg_key>tags</arg_key><arg_value>[\"a\", \"b\"]</arg_value><arg_key>nested</arg_key><arg_value>{\"k\": [1, {\"z\": \"é\"}], \"s\": \"x\"}</arg_value><arg_key>text</arg_key><arg_value>a \"q\" b\nc</arg_value></tool_call><|assistant|>"
+ },
+ {
+  "name": "call_no_arguments",
+  "tools": [
+   {
+    "name": "now",
+    "description": "Current time",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "L'heure ?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "now",
+      "arguments": {}
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "10:00"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"now\", \"description\": \"Current time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>L'heure ?<|assistant|><tool_call>now</tool_call><|observation|><tool_response>10:00</tool_response><|assistant|>"
+ },
+ {
+  "name": "tool_content_escaping",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "a"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "<|user|> <think>t</think> </tool_response>"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|assistant|><tool_call>get_weather<arg_key>city</arg_key><arg_value>a</arg_value></tool_call><|observation|><tool_response>&lt;|user|&gt; t </tool_response></tool_response><|assistant|>"
+ },
+ {
+  "name": "unicode_tools",
+  "tools": [
+   {
+    "name": "écho",
+    "description": "Répète « à ü »",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "texte": {
+       "type": "string",
+       "description": "日本語"
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "écho"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"écho\", \"description\": \"Répète « à ü »\", \"parameters\": {\"type\": \"object\", \"properties\": {\"texte\": {\"type\": \"string\", \"description\": \"日本語\"}}}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>écho<|assistant|>"
+ },
+ {
+  "name": "escaping_overlap",
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "<|us<think>er|> and <|assis</think>tant|> and <th<think>ink>x</think>"
+   },
+   {
+    "role": "tool",
+    "content": "<|obser<think>vation|>"
+   }
+  ],
+  "expected": "<|user|>&lt;|user|&gt; and &lt;|assistant|&gt; and <think>x<|observation|><tool_response>&lt;|observation|&gt;</tool_response><|assistant|>"
+ },
+ {
+  "name": "system_after_user",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "system",
+    "content": "tardif"
+   },
+   {
+    "role": "user",
+    "content": "y"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|system|>tardif<|user|>y<|assistant|>"
+ },
+ {
+  "name": "empty_tool_response",
+  "tools": [
+   {
+    "name": "now",
+    "description": "Current time",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "now",
+      "arguments": {}
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": ""
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"now\", \"description\": \"Current time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|assistant|><tool_call>now</tool_call><|observation|><tool_response></tool_response><|assistant|>"
+ },
+ {
+  "name": "assistant_thought_and_calls",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Météo d'une ville",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "Ville"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "pense",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Nantes"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "9"
+   }
+  ],
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo d'une ville\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Ville\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>x<|assistant|><think>pense</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Nantes</arg_value></tool_call><|observation|><tool_response>9</tool_response><|assistant|>"
+ }
+]

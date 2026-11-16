@@ -8,7 +8,7 @@ Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`
 |---|---|---|---|---|
 | M2 | Target adapter | COMPLETE | 50d9189 | `src/spec/target_adapter.{hpp,cpp}`; `flint.target_adapter` passes (rows bit-identical widths 1..8, features bit-identical, rewind matches a fresh session) |
 | M3 | Cycle + runner integration | COMPLETE | | `src/spec/cycle.{hpp,cpp}`, `FLINT_SPEC=dflash\|off\|null`; GX 12/12 + null 108/108 byte-identical; speedup 0.77/0.69/0.65 at temp 0/0.6/1.0 (see §1 note) |
-| M4 | Draft policy | NOT STARTED | | adaptive length priced by measured per-row cost |
+| M4 | Draft policy | IN PROGRESS | | adaptive + fixed; honour max/min/policy. **Risk:** the temp-1.0 "never slower" gate may be unachievable — see the M4 economics note |
 | M5 | Gates | NOT STARTED | | GX, null drafter, settings honour, quant, depth curve, no regression, cost, memory, concurrency |
 | M6 | Release | NOT STARTED | | QUALITY.md, extension.json 0.3.0, registry PR, llama-swap, issue #1 |
 
@@ -37,6 +37,19 @@ The ON path's multi-second stalls are HIP sync/allocation stalls, not speculatio
 3. **Harness doubled memory.** `tools/spec_gate.cpp` constructed `Harness off` and `Harness on` up front (lines 273-274, 291-292, 321-322); each loads its own 25 GB model, so both stayed resident and the ON model's `hipMalloc`/`hipMemcpy` upload stalled (3.4-6.4 s per tensor).
 
 **Fix:** (primary) serialize OFF/ON harness lifetimes in `tools/spec_gate.cpp`; (secondary) guard `InvalidateGraphs()` + ring realloc behind a tap-set change in `Session::SetHiddenCapture`. Do NOT touch the capture block, the pool reserve, or the cycle/verify logic.
+
+## M4 economics note (why the temp-1.0 gate is at risk)
+
+The measured M3 speedup (0.770 / 0.689 / 0.648 at temp 0 / 0.6 / 1.0) is explained exactly by a per-cycle cost model:
+
+```
+per cycle = drafter forward (0.48 decode) + verify width (k+1) (ratio(k+1) decodes)
+          + one append of the emitted token (1.0 decode)
+```
+
+At temp 0, k=7: 0.48 + 2.21 + 1.0 = 3.69 decodes for 2.89 tokens = 0.78x (measured 0.77). The append is a genuine fixed cost: `Session::Rewind` (`src/gpu/engine.cpp:1287`) only moves **backward**, so the emitted token's row cannot be advanced without a forward pass, and `SpecCycle::End` leaves it uncached for `Advance` to append.
+
+Consequence: the fixed per-cycle cost (drafter + append = 1.48 decodes) exceeds the marginal tokens at every draft length, so **no `k` reaches 1.0x at temperature 1.0** (best ≈ 0.75x). M4's acceptance "never slower than spec-off at temperature 1.0" therefore cannot be met by a draft policy alone. Candidate fixes (NOT yet authorised): (a) let the adaptive controller fall back to plain decode (draft 0) when speculation is unprofitable; (b) remove the per-cycle append (position-only advance / fold it into the next verify) — an engine/cycle change that risks the GX/null gates and the snapshot contract. Escalate to the user before implementing either.
 
 ## Log
 

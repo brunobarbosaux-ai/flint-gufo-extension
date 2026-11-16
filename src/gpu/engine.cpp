@@ -1306,6 +1306,10 @@ bool Session::SetHiddenCapture(std::span<const std::uint32_t> layer_output_ids,
     if (il >= c.num_layers)
       return Fail(error_msg, "Flint: hidden capture layer out of range");
   }
+  // Identical tap sets (the per-request case) keep the captured step graphs
+  // and the hidden ring valid; only a real change forces re-capture.
+  if (layers == impl_->tap_layers)
+    return true;
   // The capture copies live inside the step, so the step graphs change.
   impl_->InvalidateGraphs();
   impl_->tap_layers.clear();

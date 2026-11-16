@@ -40,6 +40,7 @@ gufo_extension_target(
     src/gpu/engine.cpp
     src/gpu/engine_stub.cpp
     src/spec/target_adapter.cpp
+    src/spec/cycle.cpp
     src/tokenizer_support.cpp
     hip/vendor/rocm/blaslt.cpp
     hip/vendor/qwen/tokenizer.cpp
@@ -184,6 +185,30 @@ gufo_extension_target(
 
 if(TARGET flint_drafter_parity)
   target_include_directories(flint_drafter_parity PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+endif()
+
+# ---------------------------------------------------------------------------
+# Speculation gates (M3): drives the runner's text contract with FLINT_SPEC
+# off / dflash / null and checks greedy identity, null-drafter identity and
+# the cycle's tokens per cycle and speedup.
+# ---------------------------------------------------------------------------
+gufo_extension_target(
+  NAME flint_spec_gate
+  SOURCES
+    tools/spec_gate.cpp
+  LINK_LIBRARIES
+    gufo_flint_text
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_spec_gate)
+  target_include_directories(flint_spec_gate PUBLIC
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
   )
 endif()

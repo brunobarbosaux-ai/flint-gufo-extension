@@ -24,6 +24,16 @@ cycle — a different workload, not comparable to a `p_min 0` mean len. The
 sampled column is estimated from distribution overlap and must be **measured**
 in M3, because it is the common case for a generic extension.
 
+**Measured (M3, depth 0, 12 prompts, 192 tokens, `flint_spec_gate --mode speed`):**
+greedy 0.77x, temp 0.6 0.69x, temp 1.0 0.65x (tokens/cycle 2.89 / 2.81 / 2.62,
+accept 0.27 / 0.26 / 0.23). The greedy column above is the §3.4 model
+(`mean_len / verify_ratio` = 3.05 / 2.21 = 1.38x); it is optimistic because it
+ignores the per-cycle cost the model omits — one extra single-token append for
+the emitted token (the verify rows are cached, the emitted token is not) and the
+drafter forward. Measured cycle cost ≈ verify (2.20 decodes) + append (1.0) +
+drafter (0.48) = 3.68 decodes for 2.89 tokens. The depth curve is M5; the
+adaptive policy (M4) is what must recover the high-temperature case.
+
 The 2x gate this project started with is not reachable on this engine, and the
 reasons are measured rather than assumed: verify rows genuinely route to
 different experts (3.8 GB per cycle of the 5.4 GB verify delta at 8k is routed

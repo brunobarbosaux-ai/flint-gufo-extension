@@ -1,27 +1,28 @@
-# M1c Progress — acceptance against the oracle
+# Progress — DFlash2 integration (M2-M6)
 
-Plan: `docs/PLAN-M1C-ACCEPTANCE.md`
+Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`.
 
-## Phase status
+## Milestone status
 
-| Phase | Title | Status | Commit | Notes |
+| Milestone | Title | Status | Commit | Notes |
 |---|---|---|---|---|
-| A | Selector batch regression test | COMPLETE | 5bfc314 | guard-tail shrink experiment confirmed the bug is caught |
-| B | Facts + shared workload + oracle baseline | COMPLETE | fc9eeb3 | B0: only suspect is ConfigJson layer_types (harness-only). Oracle mean len ~3.35 code, not 4.23 |
-| C | Extension on same workload, verdict | COMPLETE | 3d78abb | **Verdict A** (workload, not a bug). Forced-stream mean len within ±0.04 of oracle in every category |
-| D | Input diagnostics (only if verdict B) | SKIPPED (verdict A) | | |
-| E | 20-position parity sweep | COMPLETE | | Level 1 20/20 pass. Level 2 125/140 (89.3%), below the 95% gate: real Q6_K selector-codebook quantisation effect at long context, not near-ties. Two bugs fixed: ConfigJson missing top-level `use_sliding_window`/`sliding_window`; AppendContext `expired` skip left early context-trace rows uninitialized |
-| F | One-command gate script | COMPLETE | 8e2b1df | `tools/drafter_gate.sh parity|accept|full`; `full` -> Level 1 PASS 20/20, Level 2 FAIL 125/140, Level 3 PASS |
-| G | Docs + final report | COMPLETE | | `docs/REPORT-M1C.md`; PLAN/ROADMAP corrected |
+| M2 | Target adapter | COMPLETE | 50d9189 | `src/spec/target_adapter.{hpp,cpp}`; `flint.target_adapter` passes (rows bit-identical widths 1..8, features bit-identical, rewind matches a fresh session) |
+| M3 | Cycle + runner integration | IN PROGRESS | | `src/spec/cycle.{hpp,cpp}`, `FLINT_SPEC=dflash\|off\|null`, GX + null-drafter gates |
+| M4 | Draft policy | NOT STARTED | | adaptive length priced by measured per-row cost |
+| M5 | Gates | NOT STARTED | | GX, null drafter, settings honour, quant, depth curve, no regression, cost, memory, concurrency |
+| M6 | Release | NOT STARTED | | QUALITY.md, extension.json 0.3.0, registry PR, llama-swap, issue #1 |
 
-## Verdict
+## M2 findings (carried into M3)
 
-**A (workload, not a bug).** Forced stream, BF16, vs oracle p0: pooled mean
-len 3.051 vs 3.041 (+0.010); every chat category inside -0.40; pooled
-acceptance 29.31% vs 29.47%. Phase D skipped. Level 1 (BF16 vs upstream)
-20/20; Level 2 (Q6_K vs BF16 greedy) 125/140 (89.3%), below the 95% gate;
-Level 3 (acceptance) passes for both quants. See `docs/REPORT-M1C.md`.
+- `Session::Rewind` does not restore logits; the cycle re-appends the anchor before reading `Logits()`.
+- A multi-token prefill is not bit-identical to single-token decode, so the cycle's exactness argument (§3.3) holds only for rows written by the decode or verify path.
+- `flint.config` / `flint.probe` fail to compile in `tests/gguf_test_shim.hpp` (pre-existing SDK drift, unrelated to M2).
+
+## Design note (deviation from the plan)
+
+PLAN-DFLASH2.md §3.1 says there is "no extension-facing speculative hook". The host does expose `TextRunnerCapabilities.multi_token_decode` + a virtual `DecodeStep` (Qwen3.8-Flash-Next uses it). M3 still follows the plan's `SelectNext`/`Advance` design, because it keeps the sampler's history updated between rows (the `DecodeStep` path would require the runner to manage sampler history itself). To be documented in the plan.
 
 ## Log
 
-- Session start: plan written, uncommitted. No tracking files existed.
+- M2 delegated, verified (`flint.target_adapter` passes), committed `50d9189`.
+- M3 delegated.

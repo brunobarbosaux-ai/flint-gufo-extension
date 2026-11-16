@@ -1,6 +1,6 @@
 # Continuation cache: row components instead of one private blob
 
-Status: design, not implemented. Branch `feat/swa-ring-kv`.
+Status: implemented and validated on cluster (2026-11-16). Branch `feat/swa-ring-kv`.
 
 ## Problem (measured 2026-11-16, 4 sessions x 262144, cache RAM 8 GiB)
 
@@ -94,3 +94,19 @@ stays empty (rows live in device memory).
   layout; the layout is built so that components can be appended.
 - Disk persistence (`persistent_encoding`) is declared true today; keep it
   working or turn it off explicitly if the row layout makes it non-trivial.
+
+## Result (2026-11-16, 4 sessions x 262144, cache RAM 8 GiB, UD-Q4_K_XL)
+
+- `FLINT_SNAPSHOT_SELFTEST=1`: the row path restores bit for bit (same session and
+  fresh session, 9000-token prefix, wrapped ring), next to the blob path.
+- A 9000-token checkpoint is 295 MB (a fixed 7.5 GB before).
+- 37k-token prompt: capture of a continuation 2-4 ms and 15 MB of new chunks
+  (5 s and 7.5 GB before); TTFT 0.12-0.21 s on a continuation or on a prompt that
+  diverges from the last one (20 s cold); restore of 1.1 GB in ~20 ms.
+- Four distinct 29k-token conversations at once: second round all cache hits
+  (restore ~880 MB, capture 55 MB, TTFT 0.6-2.4 s while the four share the GPU).
+- Greedy output is identical cold and on a hit.
+- Host memory: the cache pages are committed on demand, `MemAvailable` 21 GB at
+  rest with an 8 GiB cache (8 GB with the old adapter, which reserved it).
+- Not done: the disk persistence path (`persistent_encoding`) is declared but
+  was not exercised.

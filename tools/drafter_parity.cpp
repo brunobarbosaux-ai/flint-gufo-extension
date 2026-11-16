@@ -42,10 +42,14 @@
 //                           acceptance meaningless, so measure on real content
 //     --target-layer TAP    repeatable; overrides the artifact's taps
 //     --head native|reference  see above (default native)
+//   flint_drafter_parity TARGET.gguf DRAFT.gguf --prompts P.jsonl --dump-prompts OUT.jsonl
+//     Writes the shared acceptance workload as prompt token ids (M1c). Needs
+//     only the tokenizer, so it does not load the target weights.
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,8 +65,10 @@
 #include <vector>
 
 #include <gufo/ext/gguf_reader.hpp>
+#include <gufo/ext/json.hpp>
 
 #include "hip/vendor/qwen/tokenizer.hpp"
+#include "src/chat_template.hpp"
 #include "src/gpu/dflash/dflash_forward.hpp"
 #include "src/gpu/dflash/dflash_weights.hpp"
 #include "src/gpu/engine.hpp"
@@ -100,6 +106,10 @@ struct Options {
   std::vector<std::uint32_t> taps;
   /// Non-zero switches from "dump one block" to "measure acceptance".
   std::uint32_t accept_tokens{0};
+  /// Shared acceptance workload (JSONL), read by --dump-prompts.
+  std::string prompts_path;
+  /// Non-empty switches to "dump prompt token ids" (M1c B2).
+  std::string dump_path;
 };
 
 [[nodiscard]] std::uint32_t ParseUint(const char* value, const char* flag) {
@@ -153,6 +163,10 @@ struct Options {
     } else if (arg == "--target-layer") {
       options.taps.push_back(
           ParseUint(next("--target-layer"), "--target-layer"));
+    } else if (arg == "--prompts") {
+      options.prompts_path = next("--prompts");
+    } else if (arg == "--dump-prompts") {
+      options.dump_path = next("--dump-prompts");
     } else if (arg.size() > 1 && arg.front() == '-') {
       Fail("unknown option '" + std::string(arg) +
            "'; usage: flint_drafter_parity TARGET.gguf DRAFT.gguf --out DIR");
@@ -164,8 +178,11 @@ struct Options {
     Fail("usage: flint_drafter_parity TARGET.gguf DRAFT.gguf --out DIR");
   options.target = positional[0];
   options.draft = positional[1];
-  if (options.out.empty() && options.accept_tokens == 0)
-    Fail("--out is required unless --accept is given");
+  if (options.out.empty() && options.accept_tokens == 0 &&
+      options.dump_path.empty())
+    Fail("--out is required unless --accept or --dump-prompts is given");
+  if (options.dump_path.empty() != options.prompts_path.empty())
+    Fail("--prompts and --dump-prompts must be given together");
   if (options.head != "native" && options.head != "reference")
     Fail("--head must be 'native' or 'reference'");
   if (options.position == 0)
@@ -232,11 +249,9 @@ struct Target {
   std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer;
 };
 
-[[nodiscard]] Target LoadTarget(const std::string& path) {
+[[nodiscard]] std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer>
+LoadTokenizer(const std::string& path) {
   std::string error;
-  auto model = flint::Model::Load(path, {}, &error);
-  if (model == nullptr)
-    Fail("target model: " + error);
   auto metadata = core::GgufReader::OpenFile(path, &error);
   if (!metadata)
     Fail("target GGUF: " + error);
@@ -245,7 +260,163 @@ struct Target {
                                                                      &error);
   if (tokenizer == nullptr)
     Fail("target tokenizer: " + error);
-  return {std::move(model), std::move(tokenizer)};
+  return tokenizer;
+}
+
+[[nodiscard]] Target LoadTarget(const std::string& path) {
+  std::string error;
+  auto model = flint::Model::Load(path, {}, &error);
+  if (model == nullptr)
+    Fail("target model: " + error);
+  return {std::move(model), LoadTokenizer(path)};
+}
+
+// ---------------------------------------------------------------------------
+// Prompt dump (M1c B2). The oracle consumes these ids byte for byte, so the
+// chat template is applied here and never by llama.cpp.
+// ---------------------------------------------------------------------------
+/// The git work tree holding the prompts file: `raw` prompts name repo paths
+/// and must resolve the same way whatever directory the tool runs from.
+[[nodiscard]] std::filesystem::path RepoRoot(const std::string& prompts) {
+  std::error_code error;
+  auto dir = std::filesystem::absolute(prompts, error).parent_path();
+  while (!dir.empty()) {
+    if (std::filesystem::exists(dir / ".git", error))
+      return dir;
+    if (dir == dir.parent_path())
+      break;
+    dir = dir.parent_path();
+  }
+  Fail("no git repository above " + prompts);
+}
+
+/// `git show REV:PATH` as bytes. Pinning the revision keeps the raw prompts
+/// fixed while the files change.
+[[nodiscard]] std::string GitShow(const std::filesystem::path& root,
+                                  const std::string& rev,
+                                  const std::string& path) {
+  const std::string root_text = root.string();
+  if (root_text.find('\'') != std::string::npos ||
+      rev.find('\'') != std::string::npos ||
+      path.find('\'') != std::string::npos)
+    Fail("prompt paths and revisions may not contain single quotes");
+  const std::string command = "git -C '" + root_text + "' show '" + rev + ":" +
+                              path + "'";
+  FILE* pipe = popen(command.c_str(), "r");
+  if (pipe == nullptr)
+    Fail("cannot run: " + command);
+  std::string content;
+  std::array<char, 4096> buffer{};
+  std::size_t read = 0;
+  while ((read = std::fread(buffer.data(), 1, buffer.size(), pipe)) > 0)
+    content.append(buffer.data(), read);
+  if (pclose(pipe) != 0)
+    Fail("git show failed: " + rev + ":" + path);
+  return content;
+}
+
+[[nodiscard]] std::vector<std::uint32_t> EncodeChat(
+    const gufo::vendor::qwen::tokenization::QwenTokenizer& tokenizer,
+    const std::string& text) {
+  model::ChatTemplateOptions template_options;
+  template_options.enable_thinking = false;
+  gufo::vendor::qwen::tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  return tokenizer.Encode(
+      model::RenderPrompt(std::vector<model::ChatMessage>{{"user", text, ""}},
+                          template_options),
+      encode_options);
+}
+
+[[nodiscard]] int DumpPrompts(const Options& options) {
+  const auto tokenizer = LoadTokenizer(options.target);
+  const auto root = RepoRoot(options.prompts_path);
+
+  std::ifstream input(options.prompts_path, std::ios::binary);
+  if (!input)
+    Fail("cannot read " + options.prompts_path);
+  std::error_code error;
+  const auto dump_parent =
+      std::filesystem::absolute(options.dump_path, error).parent_path();
+  std::filesystem::create_directories(dump_parent, error);
+  if (error)
+    Fail("cannot create " + dump_parent.string() + ": " + error.message());
+  std::ofstream output(options.dump_path, std::ios::binary | std::ios::trunc);
+  if (!output)
+    Fail("cannot open " + options.dump_path);
+
+  std::string line;
+  std::size_t line_number = 0;
+  std::size_t written = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.find_first_not_of(" \t\r") == std::string::npos)
+      continue;
+    const std::string where =
+        options.prompts_path + ":" + std::to_string(line_number) + ": ";
+    gufo::json::Value spec;
+    try {
+      spec = gufo::json::parse(line);
+    } catch (const std::exception& error) {
+      Fail(where + error.what());
+    }
+
+    const std::string id = spec.member_str("id");
+    const std::string category = spec.member_str("category");
+    const std::string kind = spec.member_str("kind");
+    const std::size_t max_tokens = spec.member_size("max_tokens");
+    if (id.empty() || max_tokens == 0)
+      Fail(where + "needs an id and a positive max_tokens");
+
+    std::vector<std::uint32_t> ids;
+    bool stop_on_eos = false;
+    if (kind == "chat") {
+      const std::string text = spec.member_str("text");
+      if (text.empty())
+        Fail(where + "chat prompt needs text");
+      ids = EncodeChat(*tokenizer, text);
+      stop_on_eos = true;
+    } else if (kind == "raw") {
+      // Raw text must not parse special tokens: it is document content, not
+      // a chat turn, and the prefill length is part of the contract.
+      const std::string file = spec.member_str("file");
+      const std::string rev = spec.member_str("git_rev");
+      const std::size_t prefill = spec.member_size("prefill");
+      if (file.empty() || rev.empty() || prefill == 0)
+        Fail(where + "raw prompt needs file, git_rev and prefill");
+      const std::string content = GitShow(root, rev, file);
+      gufo::vendor::qwen::tokenization::TokenizerOptions raw_options;
+      raw_options.parse_special_tokens = false;
+      ids = tokenizer->Encode(content, raw_options);
+      if (ids.size() < prefill)
+        Fail(where + file + " has only " + std::to_string(ids.size()) +
+             " tokens at " + rev);
+      ids.resize(prefill);
+      stop_on_eos = false;
+    } else {
+      Fail(where + "unknown kind '" + kind + "'");
+    }
+
+    gufo::json::Value prompt_ids = gufo::json::Value::array();
+    for (const std::uint32_t token : ids)
+      prompt_ids.push_back(
+          gufo::json::Value(static_cast<unsigned long long>(token)));
+    gufo::json::Value record = gufo::json::Value::object();
+    record["id"] = id;
+    record["category"] = category;
+    record["kind"] = kind;
+    record["prompt_ids"] = prompt_ids;
+    record["max_tokens"] = static_cast<unsigned long long>(max_tokens);
+    record["stop_on_eos"] = stop_on_eos;
+    output << record.dump() << '\n';
+    ++written;
+    std::cout << id << "\t" << kind << "\t" << ids.size() << " prompt tokens\n";
+  }
+  if (!output)
+    Fail("cannot write " + options.dump_path);
+  std::cout << "wrote " << written << " prompts to " << options.dump_path
+            << '\n';
+  return 0;
 }
 
 /// The prompt as engine token ids, exactly `count` of them.
@@ -556,6 +727,8 @@ struct AcceptanceRow {
 }
 
 [[nodiscard]] int Run(const Options& options) {
+  if (!options.dump_path.empty())
+    return DumpPrompts(options);
   const Target target = LoadTarget(options.target);
   const model::Config& config = target.model->config();
 

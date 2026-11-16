@@ -1440,6 +1440,16 @@ bool Session::HasHidden(std::uint32_t row) const noexcept {
   return CapturedHiddenDevice(row, 0) != nullptr;
 }
 
+void Session::KeepLogitRow(std::uint32_t row) noexcept {
+  if (row >= impl_->logit_rows)
+    return;
+  const std::size_t vocab = impl_->model->config.vocab_size;
+  if (row != 0)
+    std::memmove(impl_->h_logits, impl_->h_logits + std::size_t{row} * vocab,
+                 vocab * sizeof(float));
+  impl_->logit_rows = 1;
+}
+
 bool Session::CopyHiddenRows(std::uint32_t first, std::uint32_t count,
                              std::span<float> out, std::string* error_msg) {
   Impl& s = *impl_;

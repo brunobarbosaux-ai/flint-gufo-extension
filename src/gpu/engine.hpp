@@ -72,6 +72,10 @@ public:
   /// The span aliases per-session scratch: copy it before the next call.
   [[nodiscard]] std::span<const float> CapturedHidden(std::uint32_t row,
                                                       std::uint32_t tap);
+  /// After a verification pass (AppendAll) and a Rewind: makes row `row` of that
+  /// pass the current logits (Logits()), as if the session had stopped there.
+  void KeepLogitRow(std::uint32_t row) noexcept;
+
   /// Copies `count` consecutive rows starting at `first` (every tap, in the
   /// drafter's [row][tap][hidden] layout) into `out`, in at most two device
   /// copies. False when any of them has left the ring.

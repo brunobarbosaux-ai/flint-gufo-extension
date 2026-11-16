@@ -267,6 +267,32 @@ void TestContextAndBlock() {
     throw std::runtime_error("Run mutated the injected context");
 }
 
+void TestResetContext() {
+  Fixture fixture;
+  std::string error;
+  auto forward = MakeForward(fixture, &error);
+  constexpr std::uint32_t kRows = 40;
+  const auto features = fixture.Features(kRows);
+  if (!forward->AppendContext(features, 0, kRows, &error))
+    throw std::runtime_error("AppendContext failed: " + error);
+  dflash::DflashDraft first;
+  if (!forward->Run(5, kRows, 7, 0.0F, {}, {}, &first, &error))
+    throw std::runtime_error("Run failed: " + error);
+
+  // A new prompt starts over: the length goes back to zero, and the same rows
+  // re-injected from position zero give the same block.
+  forward->ResetContext();
+  if (forward->ContextLength() != 0)
+    throw std::runtime_error("ResetContext did not clear the context length");
+  if (!forward->AppendContext(features, 0, kRows, &error))
+    throw std::runtime_error("re-injection failed: " + error);
+  dflash::DflashDraft second;
+  if (!forward->Run(5, kRows, 7, 0.0F, {}, {}, &second, &error))
+    throw std::runtime_error("Run after reset failed: " + error);
+  if (second.tokens != first.tokens)
+    throw std::runtime_error("proposals changed after ResetContext");
+}
+
 void TestSampledDraft() {
   Fixture fixture;
   std::string error;
@@ -331,6 +357,7 @@ int main() {
   try {
     TestUploadAndConfig();
     TestContextAndBlock();
+    TestResetContext();
     TestSampledDraft();
     TestClampedBlock();
   } catch (const std::exception& error) {

@@ -5,6 +5,8 @@ Subcommands:
   oracle   Run the shared prompt workload through llama.cpp's DFlash
            speculative decoding (llama-server) and record acceptance and
            mean length per prompt and per category.
+  compare  Join the oracle report with the extension's free-running and
+           streamed reports by id and write a markdown + JSON comparison.
 
 Input is the token-id dump written by `flint_drafter_parity --dump-prompts`
 (so both engines see identical prompt ids). llama-server is started here
@@ -328,6 +330,134 @@ def run_oracle(args):
             )
 
 
+CATEGORY_ORDER = ["code", "json", "prose", "continuation"]
+COUNT_FIELDS = ("drafted", "accepted", "emitted", "cycles")
+
+
+def load_report(path, label, extra_fields=()):
+    """One JSON object per prompt line, keyed by id. Summary lines are skipped."""
+    rows = {}
+    required = ("id", "category") + COUNT_FIELDS + tuple(extra_fields)
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise SystemExit(f"{label} {path}:{number}: {error}") from error
+            if "summary" in obj and "id" not in obj:
+                continue
+            missing = [f for f in required if f not in obj]
+            if missing:
+                raise SystemExit(f"{label} {path}:{number}: missing fields {missing}")
+            if obj["id"] in rows:
+                raise SystemExit(f"{label} {path}: duplicate id {obj['id']!r}")
+            rows[obj["id"]] = obj
+    if not rows:
+        raise SystemExit(f"{label} {path}: no prompt rows")
+    return rows
+
+
+def join_reports(oracle, free, stream):
+    """Joins the three reports by id. Fails if any id set differs."""
+    ids_o, ids_f, ids_s = set(oracle), set(free), set(stream)
+    if not (ids_o == ids_f == ids_s):
+        union = ids_o | ids_f | ids_s
+        raise SystemExit(
+            "id sets differ; missing ids per input: "
+            f"oracle={sorted(union - ids_o)} "
+            f"ours-free={sorted(union - ids_f)} "
+            f"ours-stream={sorted(union - ids_s)}"
+        )
+    joined = []
+    for pid in oracle:
+        o, f, s = oracle[pid], free[pid], stream[pid]
+        if not (o["category"] == f["category"] == s["category"]):
+            raise SystemExit(
+                f"{pid}: category mismatch {o['category']!r}/"
+                f"{f['category']!r}/{s['category']!r}"
+            )
+        joined.append((o, f, s))
+    return joined
+
+
+def compare_table(joined):
+    """Per-category and pooled ('all') rows. Divergence is a mean over prompts."""
+    categories = sorted({t[0]["category"] for t in joined},
+                        key=lambda c: (CATEGORY_ORDER.index(c)
+                                       if c in CATEGORY_ORDER else len(CATEGORY_ORDER), c))
+    table = []
+    for name in categories + ["all"]:
+        sel = joined if name == "all" else [t for t in joined if t[0]["category"] == name]
+        oracle = pooled([t[0] for t in sel])
+        free = pooled([t[1] for t in sel])
+        stream = pooled([t[2] for t in sel])
+        divergence = sum(float(t[2]["stream_divergence"]) for t in sel) / len(sel)
+        table.append(
+            {
+                "category": name,
+                "prompts": len(sel),
+                "oracle_p0": oracle,
+                "ours_free": free,
+                "ours_stream": stream,
+                "delta_mean_len": stream["mean_len"] - oracle["mean_len"],
+                "stream_divergence_mean": divergence,
+            }
+        )
+    return table
+
+
+def render_markdown(table):
+    header = (
+        "| category | oracle p0 acc | oracle p0 mean len | ours free acc | "
+        "ours free mean len | ours stream acc | ours stream mean len | "
+        "delta mean len (stream - oracle) | stream divergence |"
+    )
+    lines = [header, "|" + "---|" * 9]
+    for row in table:
+        o, f, s = row["oracle_p0"], row["ours_free"], row["ours_stream"]
+        lines.append(
+            f"| {row['category']} "
+            f"| {o['acceptance'] * 100:.2f}% | {o['mean_len']:.3f} "
+            f"| {f['acceptance'] * 100:.2f}% | {f['mean_len']:.3f} "
+            f"| {s['acceptance'] * 100:.2f}% | {s['mean_len']:.3f} "
+            f"| {row['delta_mean_len']:+.3f} "
+            f"| {row['stream_divergence_mean']:.4f} |"
+        )
+    lines.append("")
+    lines.append(
+        "Acceptance = sum accepted / sum drafted; mean len = 1 + sum accepted / "
+        "sum cycles (pooled). Stream divergence = mean over prompts of the "
+        "per-prompt stream_divergence value."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def run_compare(args):
+    oracle = load_report(args.oracle, "oracle")
+    free = load_report(args.ours_free, "ours-free")
+    stream = load_report(args.ours_stream, "ours-stream", ("stream_divergence",))
+    table = compare_table(join_reports(oracle, free, stream))
+    markdown = render_markdown(table)
+    print(markdown, end="")
+    with open(args.out + ".md", "w", encoding="utf-8") as handle:
+        handle.write(markdown)
+    payload = {
+        "inputs": {
+            "oracle": args.oracle,
+            "ours_free": args.ours_free,
+            "ours_stream": args.ours_stream,
+        },
+        "stream_divergence_basis": "mean over prompts",
+        "rows": table,
+    }
+    with open(args.out + ".json", "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    print(f"wrote {args.out}.md and {args.out}.json")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -348,6 +478,16 @@ def build_parser():
     oracle.add_argument("--timeout", type=int, default=900,
                         help="per /completion request, seconds")
     oracle.set_defaults(func=run_oracle)
+    compare = sub.add_parser("compare", help="join oracle and ours reports by id")
+    compare.add_argument("--oracle", required=True,
+                         help="oracle JSONL report (one prompt per line)")
+    compare.add_argument("--ours-free", required=True,
+                         help="free-running flint_drafter_parity report")
+    compare.add_argument("--ours-stream", required=True,
+                         help="streamed flint_drafter_parity report")
+    compare.add_argument("--out", required=True,
+                         help="writes PREFIX.md and PREFIX.json")
+    compare.set_defaults(func=run_compare)
     return parser
 
 

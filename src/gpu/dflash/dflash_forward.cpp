@@ -546,6 +546,10 @@ std::uint32_t DflashForward::ContextLength() const noexcept {
   return impl_->injected_context_len;
 }
 
+void DflashForward::ResetContext() noexcept {
+  impl_->injected_context_len = 0;
+}
+
 std::uint32_t DflashForward::HistoryCapacity() const noexcept {
   return impl_->history_capacity;
 }
@@ -578,14 +582,21 @@ bool DflashForward::AppendContext(std::span<const float> features,
   }
   // The oracle chunks the injection at 256 rows; the batch boundaries decide
   // which GEMM route each chunk takes, so keep them.
-  const std::uint32_t chunk_rows = std::min(std::uint32_t{256}, count);
+  constexpr std::uint32_t kContextChunkRows = 256;
+  const std::uint32_t chunk_rows = std::min(kContextChunkRows, count);
   if (s.context_features == nullptr) {
+    // Scratch is sized for the cap, not this call's chunk: a later call with
+    // a larger count uses up to kContextChunkRows rows per batch, and sizing
+    // from the first call's count would overflow these buffers.
     s.context_features =
-        s.AllocateFloats(std::size_t{chunk_rows} * row, error_msg);
-    s.ctx_hidden = s.AllocateFloats(std::size_t{chunk_rows} * hidden, error_msg);
-    s.ctx_normed = s.AllocateFloats(std::size_t{chunk_rows} * hidden, error_msg);
-    s.ctx_key = s.AllocateFloats(std::size_t{chunk_rows} * kv, error_msg);
-    s.ctx_value = s.AllocateFloats(std::size_t{chunk_rows} * kv, error_msg);
+        s.AllocateFloats(std::size_t{kContextChunkRows} * row, error_msg);
+    s.ctx_hidden =
+        s.AllocateFloats(std::size_t{kContextChunkRows} * hidden, error_msg);
+    s.ctx_normed =
+        s.AllocateFloats(std::size_t{kContextChunkRows} * hidden, error_msg);
+    s.ctx_key = s.AllocateFloats(std::size_t{kContextChunkRows} * kv, error_msg);
+    s.ctx_value =
+        s.AllocateFloats(std::size_t{kContextChunkRows} * kv, error_msg);
     if (s.context_features == nullptr || s.ctx_hidden == nullptr ||
         s.ctx_normed == nullptr || s.ctx_key == nullptr ||
         s.ctx_value == nullptr)

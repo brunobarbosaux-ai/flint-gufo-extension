@@ -45,18 +45,27 @@
 //   flint_drafter_parity TARGET.gguf DRAFT.gguf --prompts P.jsonl --dump-prompts OUT.jsonl
 //     Writes the shared acceptance workload as prompt token ids (M1c). Needs
 //     only the tokenizer, so it does not load the target weights.
+//   flint_drafter_parity TARGET.gguf DRAFT.gguf --temperature 0
+//       --prompts-ids DUMP.jsonl --report ours.jsonl [--stream ORACLE.jsonl]
+//     Greedy acceptance on the shared workload (M1c C2). One line per prompt:
+//     acceptance, mean_len and per_row_accepted. With --stream the continuation
+//     is the oracle's ids, not the target's argmax, and stream_divergence
+//     reports how often the target's argmax disagrees with it.
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -110,6 +119,12 @@ struct Options {
   std::string prompts_path;
   /// Non-empty switches to "dump prompt token ids" (M1c B2).
   std::string dump_path;
+  /// Non-empty switches to the shared-workload acceptance run (M1c C2).
+  std::string prompts_ids;
+  /// Per-prompt JSONL report (--prompts-ids).
+  std::string report_path;
+  /// Forced continuation: the oracle's generated ids (--prompts-ids only).
+  std::string stream_path;
 };
 
 [[nodiscard]] std::uint32_t ParseUint(const char* value, const char* flag) {
@@ -167,6 +182,12 @@ struct Options {
       options.prompts_path = next("--prompts");
     } else if (arg == "--dump-prompts") {
       options.dump_path = next("--dump-prompts");
+    } else if (arg == "--prompts-ids") {
+      options.prompts_ids = next("--prompts-ids");
+    } else if (arg == "--report") {
+      options.report_path = next("--report");
+    } else if (arg == "--stream") {
+      options.stream_path = next("--stream");
     } else if (arg.size() > 1 && arg.front() == '-') {
       Fail("unknown option '" + std::string(arg) +
            "'; usage: flint_drafter_parity TARGET.gguf DRAFT.gguf --out DIR");
@@ -179,8 +200,17 @@ struct Options {
   options.target = positional[0];
   options.draft = positional[1];
   if (options.out.empty() && options.accept_tokens == 0 &&
-      options.dump_path.empty())
-    Fail("--out is required unless --accept or --dump-prompts is given");
+      options.dump_path.empty() && options.prompts_ids.empty())
+    Fail("--out is required unless --accept, --prompts-ids or --dump-prompts "
+         "is given");
+  if (options.prompts_ids.empty() != options.report_path.empty())
+    Fail("--prompts-ids and --report must be given together");
+  if (options.prompts_ids.empty() && !options.stream_path.empty())
+    Fail("--stream needs --prompts-ids");
+  if (!options.prompts_ids.empty() && options.temperature != 0.0F)
+    Fail("--prompts-ids measures greedy acceptance; use --temperature 0");
+  if (!options.prompts_ids.empty() && options.accept_tokens != 0)
+    Fail("--prompts-ids and --accept are different runs; give one");
   if (options.dump_path.empty() != options.prompts_path.empty())
     Fail("--prompts and --dump-prompts must be given together");
   if (options.head != "native" && options.head != "reference")
@@ -602,29 +632,86 @@ LoadTokenizer(const std::string& path) {
   return draws;
 }
 
+// ---------------------------------------------------------------------------
+// Acceptance: M1b --accept and M1c --prompts-ids run the same cycle.
+// ---------------------------------------------------------------------------
+using Tokenizer = gufo::vendor::qwen::tokenization::QwenTokenizer;
+
 /// One row of the acceptance table.
 struct AcceptanceRow {
   std::size_t drafted{0};
   std::size_t accepted{0};
 };
 
-/// Greedy speculative acceptance: draft a block, verify it in one target pass,
-/// keep the leading proposals the target's own argmax agrees with, and continue
-/// from the first disagreement. This is the same commit rule the runner will
-/// use, so the number it reports is the ratio the cycle would get -- measured
-/// without the runner.
-[[nodiscard]] int MeasureAcceptance(
+/// One prompt for the speculative cycle.
+struct AcceptanceJob {
+  std::vector<std::uint32_t> prompt;
+  std::uint32_t draft_count{0};
+  /// Tokens to generate, counting the first one the prompt's logits give.
+  std::uint32_t max_tokens{1};
+  /// Stop after the first stop token (EOS). The stop token is counted.
+  bool stop_on_eos{false};
+  /// Empty: free-running, the target's argmax is the continuation. Non-empty:
+  /// forced stream, the continuation is these ids (the oracle's output), so
+  /// the acceptance measures the drafter alone on a shared text.
+  std::vector<std::uint32_t> stream;
+};
+
+struct AcceptanceResult {
+  std::size_t prompt_len{0};
+  std::size_t cycles{0};
+  /// Tokens after the first one: sum of (accepted + 1) over the cycles, clipped
+  /// at max_tokens and at the stop token. Unclipped, emitted / cycles is the
+  /// oracle's mean length, 1 + accepted / cycles.
+  std::size_t emitted{0};
+  std::size_t drafted{0};
+  std::size_t accepted{0};
+  std::vector<AcceptanceRow> rows;
+  /// Forced streams only: verify rows whose target argmax was compared with
+  /// the stream token, and how many of them disagreed.
+  std::size_t divergence_rows{0};
+  std::size_t divergence_mismatches{0};
+};
+
+/// numerator / denominator, or 0 for an empty denominator so reports never
+/// print NaN.
+[[nodiscard]] double Ratio(std::size_t numerator, std::size_t denominator) {
+  return denominator == 0 ? 0.0
+                          : static_cast<double>(numerator) /
+                                static_cast<double>(denominator);
+}
+
+[[nodiscard]] std::uint32_t Argmax(std::span<const float> logits) {
+  if (logits.empty())
+    Fail("target produced no logits");
+  return static_cast<std::uint32_t>(std::distance(
+      logits.begin(), std::max_element(logits.begin(), logits.end())));
+}
+
+[[nodiscard]] bool IsStop(const Tokenizer* tokenizer, std::uint32_t token) {
+  return tokenizer != nullptr && tokenizer->IsStopToken(token);
+}
+
+/// One prompt through the speculative cycle: prefill, then draft, verify and
+/// commit until the stop rule fires. Greedy acceptance: a draft is kept when
+/// the target's own argmax agrees with it (free) or when it is the stream's
+/// token (forced). This is the commit rule the runner will use, so the ratio
+/// it reports is the one the cycle would get, without the runner.
+[[nodiscard]] AcceptanceResult RunAcceptance(
     flint::Session& session, dflash::DflashForward& forward,
-    const dflash::DflashConfig& config, const std::vector<std::uint32_t>& taps,
-    std::uint32_t hidden, std::uint32_t draft_count, std::uint32_t prefill,
-    std::uint32_t budget, const std::string& head_route) {
-  std::string error;
+    const std::vector<std::uint32_t>& taps, std::uint32_t hidden,
+    const Tokenizer* tokenizer, const AcceptanceJob& job) {
+  if (job.prompt.empty() || job.max_tokens == 0)
+    Fail("acceptance needs a prompt and at least one token to generate");
+  const bool forced = !job.stream.empty();
+  const std::uint32_t draft_count = job.draft_count;
   const std::size_t feature_row = std::size_t{taps.size()} * hidden;
+  std::string error;
   std::vector<float> features;
   std::uint32_t injected = 0;
 
   // The drafter reads the target's residuals up to the position it drafts at.
-  const auto append_context_to = [&](std::uint32_t position) {
+  const auto inject_to = [&](std::uint32_t position) {
     if (position == injected)
       return;
     features.resize(std::size_t{position - injected} * feature_row);
@@ -633,7 +720,7 @@ struct AcceptanceRow {
         const auto captured = session.CapturedHidden(r, t);
         if (captured.size() != hidden)
           Fail("residual for row " + std::to_string(r) +
-               " is not in the ring; lower --position or --accept");
+               " is not in the ring; lower the prompt length or the budget");
         std::memcpy(features.data() +
                         (std::size_t{r - injected} * taps.size() + t) * hidden,
                     captured.data(), hidden * sizeof(float));
@@ -644,29 +731,57 @@ struct AcceptanceRow {
     injected = position;
   };
 
-  const auto argmax = [](std::span<const float> logits) {
-    if (logits.empty())
-      Fail("target produced no logits");
-    return static_cast<std::uint32_t>(
-        std::distance(logits.begin(),
-                      std::max_element(logits.begin(), logits.end())));
-  };
+  // Each prompt starts from an empty target cache and an empty drafter
+  // context.
+  session.Rewind(0);
+  forward.ResetContext();
+  // The hidden ring keeps only kHiddenRingRows positions. Prefill in chunks and
+  // let the drafter take each chunk's rows before the next chunk can push them
+  // out of the ring.
+  constexpr std::size_t kPrefillChunk = 1024;
+  for (std::size_t offset = 0; offset < job.prompt.size();
+       offset += kPrefillChunk) {
+    const std::size_t count =
+        std::min(kPrefillChunk, job.prompt.size() - offset);
+    std::vector<std::int32_t> chunk(count);
+    for (std::size_t i = 0; i < count; ++i)
+      chunk[i] = static_cast<std::int32_t>(job.prompt[offset + i]);
+    if (!session.Append(chunk, &error))
+      Fail("prompt prefill: " + error);
+    if (session.Position() != offset + count)
+      Fail("prompt prefill stopped short of the requested position");
+    inject_to(session.Position());
+  }
 
-  std::uint32_t position = prefill;
-  std::uint32_t anchor = argmax(session.Logits());
-  std::vector<AcceptanceRow> rows(draft_count);
-  std::size_t cycles = 0;
-  std::size_t emitted = 0;
-  std::size_t accepted_total = 0;
+  AcceptanceResult result;
+  result.prompt_len = job.prompt.size();
+  result.rows.resize(draft_count);
 
-  while (emitted < budget) {
+  std::uint32_t anchor = Argmax(session.Logits());
+  if (forced) {
+    // The stream's first token replaces the target's. The comparison still
+    // counts toward the divergence: the prompt's logits are a real prediction.
+    const std::uint32_t target_first = anchor;
+    anchor = job.stream.front();
+    ++result.divergence_rows;
+    if (target_first != anchor)
+      ++result.divergence_mismatches;
+  }
+  bool done = IsStop(tokenizer, anchor) && job.stop_on_eos;
+  // max_tokens counts the first token, which is not part of `emitted`.
+  const std::size_t budget = job.max_tokens - 1U;
+
+  while (!done && result.emitted < budget) {
+    const std::uint32_t position = session.Position();
     if (position + draft_count + 1 > session.Capacity())
-      break;
-    append_context_to(position);
+      Fail("target session is too small for the next block; raise its context");
+    inject_to(position);
     dflash::DflashDraft draft;
     if (!forward.Run(anchor, position, draft_count, 0.0F, {}, {}, &draft,
                      &error))
       Fail("draft block: " + error);
+    if (draft.tokens.size() != draft_count)
+      Fail("draft block returned the wrong proposal count");
     std::vector<std::int32_t> batch(draft_count + 1);
     batch[0] = static_cast<std::int32_t>(anchor);
     for (std::uint32_t i = 0; i < draft_count; ++i)
@@ -674,55 +789,343 @@ struct AcceptanceRow {
     if (!session.AppendAll(batch, &error))
       Fail("verify pass: " + error);
 
+    // Stream index of the token that proposal i (and verify row i) predicts.
+    const std::size_t base = result.emitted + 1;
+    const auto stream_at = [&](std::size_t index) -> const std::uint32_t* {
+      return index < job.stream.size() ? &job.stream[index] : nullptr;
+    };
+    const auto matches = [&](std::uint32_t i) {
+      if (!forced)
+        return Argmax(session.Logits(i)) == draft.tokens[i];
+      const std::uint32_t* reference = stream_at(base + i);
+      return reference != nullptr && *reference == draft.tokens[i];
+    };
     std::uint32_t accepted = 0;
-    while (accepted < draft_count &&
-           argmax(session.Logits(accepted)) == draft.tokens[accepted]) {
+    while (accepted < draft_count && matches(accepted))
       ++accepted;
-    }
-    for (std::uint32_t i = 0; i < draft_count; ++i) {
-      ++rows[i].drafted;
-      if (i < accepted)
-        ++rows[i].accepted;
-    }
-    // Row `accepted` is the token that replaces the first disagreement (or the
-    // free token after a fully accepted block); it becomes the next anchor.
-    const std::uint32_t bonus = argmax(session.Logits(accepted));
-    accepted_total += accepted;
-    ++cycles;
-    emitted += accepted + 1;
-    position += accepted + 1;
-    anchor = bonus;
-    session.Rewind(position);
-  }
 
-  if (cycles == 0)
+    // Divergence: rows 0..accepted are conditioned on the stream prefix (the
+    // accepted drafts equal it), so their argmax is the target's own greedy
+    // choice on the shared text.
+    if (forced) {
+      for (std::uint32_t row = 0; row <= accepted; ++row) {
+        const std::uint32_t* reference = stream_at(base + row);
+        if (reference == nullptr)
+          break;
+        ++result.divergence_rows;
+        if (Argmax(session.Logits(row)) != *reference)
+          ++result.divergence_mismatches;
+      }
+    }
+
+    // The token after the accepted drafts: the target's argmax when free, the
+    // stream's when forced. Empty means the forced stream has run out.
+    std::optional<std::uint32_t> bonus;
+    if (forced) {
+      if (const std::uint32_t* reference = stream_at(base + accepted))
+        bonus = *reference;
+    } else {
+      bonus = Argmax(session.Logits(accepted));
+    }
+
+    for (std::uint32_t i = 0; i < draft_count; ++i) {
+      ++result.rows[i].drafted;
+      if (i < accepted)
+        ++result.rows[i].accepted;
+    }
+    result.drafted += draft_count;
+    result.accepted += accepted;
+    ++result.cycles;
+
+    // Commit the accepted drafts and the bonus. Clip at the budget, and at the
+    // stop token, which is counted and ends the run.
+    for (std::uint32_t j = 0; j <= accepted; ++j) {
+      std::uint32_t token = 0;
+      if (j < accepted) {
+        token = draft.tokens[j];
+      } else if (bonus) {
+        token = *bonus;
+      } else {
+        done = true;
+        break;
+      }
+      if (result.emitted >= budget) {
+        done = true;
+        break;
+      }
+      ++result.emitted;
+      anchor = token;
+      if (job.stop_on_eos && IsStop(tokenizer, token)) {
+        done = true;
+        break;
+      }
+    }
+    // Keep the anchor and the accepted drafts; the next block re-appends the
+    // bonus as its anchor.
+    session.Rewind(position + accepted + 1);
+  }
+  return result;
+}
+
+/// M1b's --accept: greedy acceptance on one repeated-text prompt, free-running.
+/// Prints the markdown table.
+[[nodiscard]] int MeasureAcceptance(
+    flint::Session& session, dflash::DflashForward& forward,
+    const std::vector<std::uint32_t>& taps, std::uint32_t hidden,
+    std::uint32_t draft_count, const std::vector<std::uint32_t>& prompt,
+    std::uint32_t budget, const std::string& head_route) {
+  AcceptanceJob job;
+  job.prompt = prompt;
+  job.draft_count = draft_count;
+  job.max_tokens = budget + 1U;
+  const AcceptanceResult result =
+      RunAcceptance(session, forward, taps, hidden, nullptr, job);
+  if (result.cycles == 0)
     Fail("no cycle ran; the context is too small for one block");
 
   std::cout << "| quantity | value |\n| :-- | --: |\n"
-            << "| prefill rows | " << prefill << " |\n"
+            << "| prefill rows | " << prompt.size() << " |\n"
             << "| proposals per block | " << draft_count << " |\n"
-            << "| cycles | " << cycles << " |\n"
-            << "| tokens emitted | " << emitted << " |\n"
-            << "| accepted drafts | " << accepted_total << " |\n"
+            << "| cycles | " << result.cycles << " |\n"
+            << "| tokens emitted | " << result.emitted << " |\n"
+            << "| accepted drafts | " << result.accepted << " |\n"
             << "| acceptance | "
-            << 100.0 * double{accepted_total} / (double{cycles} * draft_count)
+            << 100.0 * static_cast<double>(result.accepted) /
+                   (static_cast<double>(result.cycles) * draft_count)
             << "% |\n"
-            << "| tokens per cycle | " << (double{emitted} / double{cycles})
-            << " |\n"
+            << "| tokens per cycle | "
+            << (Ratio(result.emitted, result.cycles)) << " |\n"
             << "| head route | " << head_route << " |\n\n"
             << "| proposal | drafted | accepted | acceptance |\n"
             << "| --: | --: | --: | --: |\n";
   for (std::uint32_t i = 0; i < draft_count; ++i) {
-    const auto& row = rows[i];
+    const auto& row = result.rows[i];
     std::cout << "| " << i << " | " << row.drafted << " | " << row.accepted
               << " | "
               << (row.drafted == 0 ? 0.0
-                                   : 100.0 * double{row.accepted} /
-                                         double{row.drafted})
+                                   : 100.0 * Ratio(row.accepted, row.drafted))
               << "% |\n";
   }
   std::cout << "\nacceptance is `P(the target's greedy token equals the draft)`"
                " -- distribution overlap, not the min(1, p/q) rate.\n";
+  return 0;
+}
+
+/// The drafter, borrowing the target's tied embedding and LM head.
+[[nodiscard]] std::unique_ptr<dflash::DflashForward> CreateDrafter(
+    const Target& target, const dflash::DflashWeights& weights,
+    const std::string& head, std::uint32_t max_context) {
+  const flint::TiedWeights tied = target.model->Tied();
+  if (tied.token_embedding == nullptr || tied.output == nullptr)
+    Fail("target exposes no tied weights");
+  const dflash::DflashBorrowed borrowed{
+      .token_embedding = tied.token_embedding,
+      .token_embedding_type = tied.token_embedding_type,
+      .output = tied.output,
+      .output_type = tied.output_type};
+  std::string error;
+  auto forward = dflash::DflashForward::Create(
+      weights, borrowed, max_context, &error,
+      head == "reference" ? dflash::DflashHeadRoute::kFp32
+                          : dflash::DflashHeadRoute::kNative);
+  if (forward == nullptr)
+    Fail("drafter forward: " + error);
+  return forward;
+}
+
+/// One prompt from the shared workload dump (M1c B2).
+struct PromptRecord {
+  std::string id;
+  std::string category;
+  std::vector<std::uint32_t> prompt;
+  std::uint32_t max_tokens{0};
+  bool stop_on_eos{false};
+};
+
+[[nodiscard]] std::vector<PromptRecord> ReadPromptIds(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input)
+    Fail("cannot read " + path);
+  std::vector<PromptRecord> records;
+  std::string line;
+  std::size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.find_first_not_of(" \t\r") == std::string::npos)
+      continue;
+    const std::string where = path + ":" + std::to_string(line_number) + ": ";
+    gufo::json::Value spec;
+    try {
+      spec = gufo::json::parse(line);
+    } catch (const std::exception& error) {
+      Fail(where + error.what());
+    }
+    PromptRecord record;
+    record.id = spec.member_str("id");
+    record.category = spec.member_str("category");
+    record.max_tokens =
+        static_cast<std::uint32_t>(spec.member_size("max_tokens"));
+    const gufo::json::Value* ids = spec.find("prompt_ids");
+    if (record.id.empty() || record.max_tokens == 0 || ids == nullptr ||
+        !ids->is_array())
+      Fail(where + "needs id, max_tokens and prompt_ids");
+    for (const auto& token : ids->items())
+      record.prompt.push_back(static_cast<std::uint32_t>(token.as_size()));
+    const gufo::json::Value* stop = spec.find("stop_on_eos");
+    record.stop_on_eos = stop != nullptr && stop->as_bool();
+    records.push_back(std::move(record));
+  }
+  return records;
+}
+
+/// Forced streams: the oracle's generated ids keyed by prompt id. Lines without
+/// a token array (the oracle's trailing summary) are skipped.
+[[nodiscard]] std::map<std::string, std::vector<std::uint32_t>> ReadStreams(
+    const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input)
+    Fail("cannot read " + path);
+  std::map<std::string, std::vector<std::uint32_t>> streams;
+  std::string line;
+  std::size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.find_first_not_of(" \t\r") == std::string::npos)
+      continue;
+    const std::string where = path + ":" + std::to_string(line_number) + ": ";
+    gufo::json::Value spec;
+    try {
+      spec = gufo::json::parse(line);
+    } catch (const std::exception& error) {
+      Fail(where + error.what());
+    }
+    const gufo::json::Value* tokens = spec.find("tokens");
+    if (tokens == nullptr || !tokens->is_array())
+      continue;
+    const std::string id = spec.member_str("id");
+    if (id.empty())
+      Fail(where + "stream line needs an id");
+    std::vector<std::uint32_t> ids;
+    for (const auto& token : tokens->items())
+      ids.push_back(static_cast<std::uint32_t>(token.as_size()));
+    streams[id] = std::move(ids);
+  }
+  return streams;
+}
+
+/// One report line: the fields the compare step joins on `id`.
+[[nodiscard]] std::string ReportLine(const PromptRecord& record,
+                                     const AcceptanceResult& result,
+                                     bool forced) {
+  const auto round4 = [](double value) {
+    return std::round(value * 1e4) / 1e4;
+  };
+  const double acceptance =
+      result.drafted == 0 ? 0.0
+                          : Ratio(result.accepted, result.drafted);
+  const double mean_len =
+      result.cycles == 0 ? 0.0 : Ratio(result.emitted, result.cycles);
+  using U = unsigned long long;
+  gufo::json::Value line = gufo::json::Value::object();
+  line["id"] = record.id;
+  line["category"] = record.category;
+  line["prompt_len"] = static_cast<U>(result.prompt_len);
+  line["emitted"] = static_cast<U>(result.emitted);
+  line["cycles"] = static_cast<U>(result.cycles);
+  line["drafted"] = static_cast<U>(result.drafted);
+  line["accepted"] = static_cast<U>(result.accepted);
+  line["acceptance"] = round4(acceptance);
+  line["mean_len"] = round4(mean_len);
+  gufo::json::Value per_row = gufo::json::Value::array();
+  for (const auto& row : result.rows)
+    per_row.push_back(gufo::json::Value(static_cast<U>(row.accepted)));
+  line["per_row_accepted"] = per_row;
+  if (forced) {
+    const double divergence =
+        result.divergence_rows == 0
+            ? 0.0
+            : Ratio(result.divergence_mismatches, result.divergence_rows);
+    line["stream_divergence"] = round4(divergence);
+  }
+  return line.dump();
+}
+
+/// M1c: the shared workload. One target and one drafter serve every prompt;
+/// each prompt starts from an empty session and an empty drafter context.
+[[nodiscard]] int MeasurePromptIds(const Options& options,
+                                   const Target& target,
+                                   const dflash::DflashWeights& weights,
+                                   const std::vector<std::uint32_t>& taps,
+                                   std::uint32_t draft_count) {
+  const std::vector<PromptRecord> records = ReadPromptIds(options.prompts_ids);
+  if (records.empty())
+    Fail("no prompts in " + options.prompts_ids);
+  std::map<std::string, std::vector<std::uint32_t>> streams;
+  if (!options.stream_path.empty())
+    streams = ReadStreams(options.stream_path);
+
+  // Each session needs its prompt, the whole budget and one block of headroom.
+  std::size_t longest = 0;
+  for (const auto& record : records)
+    longest = std::max(longest, record.prompt.size() + record.max_tokens);
+  const auto context = static_cast<std::uint32_t>(std::max<std::size_t>(
+      longest + weights.config.block_size + 16U,
+      flint::Session::kHiddenRingRows));
+
+  std::string error;
+  auto session = target.model->CreateSession(context, &error);
+  if (session == nullptr)
+    Fail("target session: " + error);
+  if (!session->SetHiddenCapture(taps, &error))
+    Fail("hidden capture: " + error);
+  auto forward = CreateDrafter(target, weights, options.head, context);
+
+  std::ofstream report(options.report_path, std::ios::binary | std::ios::trunc);
+  if (!report)
+    Fail("cannot open " + options.report_path);
+  std::cout << "# DFlash2 acceptance on the shared workload\n\n"
+            << "| quantity | value |\n| :-- | --: |\n"
+            << "| prompts | " << records.size() << " |\n"
+            << "| proposals per block | " << draft_count << " |\n"
+            << "| head route | " << options.head << " |\n"
+            << "| forced stream | "
+            << (streams.empty() ? std::string("none") : options.stream_path)
+            << " |\n\n";
+
+  const bool forced = !streams.empty();
+  for (const auto& record : records) {
+    AcceptanceJob job;
+    job.prompt = record.prompt;
+    job.draft_count = draft_count;
+    job.max_tokens = record.max_tokens;
+    job.stop_on_eos = record.stop_on_eos;
+    if (forced) {
+      const auto found = streams.find(record.id);
+      if (found == streams.end() || found->second.empty())
+        Fail("stream " + options.stream_path + " has no tokens for prompt " +
+             record.id);
+      job.stream = found->second;
+    }
+    const AcceptanceResult result = RunAcceptance(
+        *session, *forward, taps, target.model->config().hidden_size,
+        target.tokenizer.get(), job);
+    report << ReportLine(record, result, forced) << '\n';
+    std::cout << record.id << "\tcycles " << result.cycles << "\temitted "
+              << result.emitted << "\tacceptance "
+              << (result.drafted == 0
+                      ? 0.0
+                      : Ratio(result.accepted, result.drafted))
+              << "\tmean_len "
+              << (result.cycles == 0
+                      ? 0.0
+                      : Ratio(result.emitted, result.cycles))
+              << '\n';
+  }
+  report.flush();
+  if (!report)
+    Fail("cannot write " + options.report_path);
+  std::cout << "wrote " << records.size() << " reports to "
+            << options.report_path << '\n';
   return 0;
 }
 
@@ -744,6 +1147,15 @@ struct AcceptanceRow {
   if (!options.taps.empty() && options.taps != draft_config.target_layer_ids)
     Fail("--target-layer disagrees with the artifact's taps");
 
+  const auto taps = options.taps.empty() ? draft_config.target_layer_ids
+                                         : options.taps;
+  const std::uint32_t draft_count =
+      std::min(options.draft_count == 0 ? draft_config.block_size - 1U
+                                        : options.draft_count,
+               draft_config.block_size - 1U);
+  if (!options.prompts_ids.empty())
+    return MeasurePromptIds(options, target, *weights, taps, draft_count);
+
   std::cout << "# DFlash2 drafter parity\n\n| quantity | value |\n| :-- | --: |\n"
             << "| target | " << options.target << " |\n"
             << "| drafter | " << options.draft << " |\n"
@@ -757,8 +1169,6 @@ struct AcceptanceRow {
 
   // A session that only ever prefills the prompt: the drafter needs residuals
   // for `position` rows, so the ring must hold at least that many.
-  const auto taps = options.taps.empty() ? draft_config.target_layer_ids
-                                         : options.taps;
   const std::uint32_t context = std::max<std::uint32_t>(
       options.position + options.accept_tokens + draft_config.block_size + 16U,
       flint::Session::kHiddenRingRows);
@@ -767,6 +1177,21 @@ struct AcceptanceRow {
     Fail("target session: " + error);
   if (!session->SetHiddenCapture(taps, &error))
     Fail("hidden capture: " + error);
+
+  auto forward = CreateDrafter(
+      target, *weights, options.head,
+      options.position + options.accept_tokens + draft_config.block_size);
+
+  // M1b --accept: the acceptance loop does its own prefill, so it gets the
+  // prompt ids and the session as it is.
+  if (options.accept_tokens != 0) {
+    const auto pool = PromptTokens(*target.tokenizer, options.text,
+                                   options.position);
+    std::vector<std::uint32_t> prompt(pool.begin(), pool.end());
+    return MeasureAcceptance(*session, *forward, taps, config.hidden_size,
+                             draft_count, prompt, options.accept_tokens,
+                             options.head);
+  }
 
   const auto prompt = PromptTokens(*target.tokenizer, options.text,
                                    options.position);
@@ -780,45 +1205,9 @@ struct AcceptanceRow {
 
   // Anchor: what the target itself would emit next. The block is then a
   // proposal *from* that token, which is the shape of a real cycle.
-  std::uint32_t anchor = 0;
-  {
-    const auto logits = session->Logits();
-    if (logits.empty())
-      Fail("target produced no logits for the anchor");
-    anchor = static_cast<std::uint32_t>(
-        std::distance(logits.begin(),
-                      std::max_element(logits.begin(), logits.end())));
-  }
+  const std::uint32_t anchor = Argmax(session->Logits());
 
   const flint::TiedWeights tied = target.model->Tied();
-  if (tied.token_embedding == nullptr || tied.output == nullptr)
-    Fail("target exposes no tied weights");
-  const dflash::DflashBorrowed borrowed{
-      .token_embedding = tied.token_embedding,
-      .token_embedding_type = tied.token_embedding_type,
-      .output = tied.output,
-      .output_type = tied.output_type};
-
-  const std::uint32_t draft_count =
-      std::min(options.draft_count == 0 ? draft_config.block_size - 1U
-                                        : options.draft_count,
-               draft_config.block_size - 1U);
-
-  auto forward = dflash::DflashForward::Create(
-      *weights, borrowed,
-      options.position + options.accept_tokens + draft_config.block_size,
-      &error,
-      options.head == "reference" ? dflash::DflashHeadRoute::kFp32
-                                  : dflash::DflashHeadRoute::kNative);
-  if (forward == nullptr)
-    Fail("drafter forward: " + error);
-
-  if (options.accept_tokens != 0) {
-    return MeasureAcceptance(*session, *forward, draft_config, taps,
-                             config.hidden_size, draft_count, options.position,
-                             options.accept_tokens, options.head);
-  }
-
   TraceDir trace(options.out);
   const auto hook = [&](std::string_view name, const float* data,
                         std::size_t count) { trace.Write(name, data, count); };

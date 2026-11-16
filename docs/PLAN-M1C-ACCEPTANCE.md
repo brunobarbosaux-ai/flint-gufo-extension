@@ -1,5 +1,8 @@
 # M1c: close the acceptance gap against the oracle
 
+> **Status: complete (2026-11-15).** All phases A-G done; verdict A. Results in
+> `docs/REPORT-M1C.md`. The phase table below is the execution record.
+
 This plan can be executed by a model that has not seen the earlier conversation.
 Everything it needs is in this file or in files it names. Read all of it before
 starting, including §0, "Rules".
@@ -159,13 +162,13 @@ Files you will work in:
 ## Phase order and decision points
 
 ```
-A  selector batch regression test            (0.5 d)  always
-B  facts + shared workload + oracle baseline (1 d)    always
-C  extension on the same workload, compare   (1 d)    always   -> verdict A or B
-D  input diagnostics                          (1.5 d)  ONLY if verdict is B
-E  20-position parity sweep (Levels 1 and 2)  (1 d)    always (after D, if D ran)
-F  one-command gate script                    (0.5 d)  always
-G  docs + final report                        (0.5 d)  always
+A  selector batch regression test            (0.5 d)  always          done (5bfc314)
+B  facts + shared workload + oracle baseline (1 d)    always          done (fc9eeb3)
+C  extension on the same workload, compare   (1 d)    always   -> A   done (3d78abb), verdict A
+D  input diagnostics                          (1.5 d)  ONLY if B      skipped (verdict A)
+E  20-position parity sweep (Levels 1 and 2)  (1 d)    always          done (faad940)
+F  one-command gate script                    (0.5 d)  always          done (8e2b1df)
+G  docs + final report                        (0.5 d)  always          done (27d91f2)
 ```
 
 Why this order: A is cheap and removes a GPU-hang risk before many long runs.

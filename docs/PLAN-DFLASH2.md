@@ -31,11 +31,12 @@ expert reads), and global-layer KV is re-read per row. We build anyway, with a
 bounded win, because the remaining cost is implementation and the risk is now
 known.
 
-**Kill criterion:** M1a (adoption probe) must load `Flint-DFlash2-BF16.gguf`
-and emit draft tokens inside half a day, and M1b must match the oracle on 20/20
-fixed positions, first on BF16 and then on Q6_K. If both checkpoints are not met
-inside 3 working days, stop the drafter and ship the prompt-lookup fallback
-(§3.7). Everything before M1a is a prerequisite that stands on its own merits.
+**Kill criterion (met):** M1a (adoption probe) loaded `Flint-DFlash2-BF16.gguf`
+and emitted draft tokens inside half a day, and M1b/M1c matched the oracle on
+20/20 fixed positions on BF16 (Q6_K sits at its quantisation floor). Both
+checkpoints were met, so the drafter is kept and the prompt-lookup fallback
+(§3.7) is not needed. Everything before M1a is a prerequisite that stands on
+its own merits.
 
 ## 2. Current state
 
@@ -62,17 +63,28 @@ Done and committed:
   reversed order, 3 tail dependence), `FLINT_PROFILE`, `FLINT_NO_GRAPH`,
   `FLINT_DEBUG_ATTN`.
 
+Done and committed (M1, the drafter itself):
+
+- **drafter kernels, loader and forward** — `src/gpu/dflash/` in the extension:
+  the vendored kernels (`flint.dflash_ops`), the loader with the rotary-dim
+  fallback and Q5_K support, and the single-request block forward with context
+  injection (`flint.dflash_forward`). The in-tree `src/models/qwen/hip/dflash/`
+  was the port source, not a dependency.
+- **parity against the upstream reference** (M1b/M1c): 20 positions 64..4500,
+  BF16 worst stage 6.0e-5 against the 1e-4 gate, candidate sets equal, selector
+  probabilities within 5e-6. Q6_K sits at its quantisation floor, which an fp32
+  reference cannot match by construction.
+- **acceptance against the oracle** (M1c): forced stream, BF16, matches the
+  oracle at `p_min 0` (pooled mean len 3.05 vs 3.04). See `docs/REPORT-M1C.md`.
+
 Not built — the rest of the deliverable:
 
-- **drafter forward pass: vendored, not written.** `src/models/qwen/hip/dflash/`
-  is already generic over the drafter GGUF — `QwenDFlashConfig`
-  (`src/models/qwen/dflash_weights.hpp:17`) reads `target_layer_ids`,
-  `block_size`, `mask_token_id`, conv kernel/group, selector rank/top-k, SWA and
-  layer count from the file — and its loader dequantizes Q6_K
-  (`dflash/model.cpp:70`). The work is a config mapping and an adoption test.
-- draft backend, target adapter and the speculative cycle
-- target hidden-state capture in the engine
-- any integration with the decode loop
+- **target adapter** (M2): `VerifyRows([anchor, drafts])` over `gpu::Session`,
+  per-row logits and per-row 5-tap hidden rows, `Rewind`, position tracking.
+- **speculative cycle + runner integration** (M3): the draft -> verify -> commit
+  -> rewind loop inside the runner, with the sampler as a black box.
+- **draft policy** (M4): adaptive draft length priced by measured per-row cost.
+- **gates** (M5) and **release** (M6).
 
 ## 3. How the cycle integrates without a core hook
 
@@ -217,18 +229,22 @@ the sampling and GGUF headers already in use, and its own engine.
 New files, all under the extension's `src/` (vendored code namespaced
 `gufo::vendor::*` where it is copied from in-tree sources):
 
-| file | contents | ~LOC |
-| :-- | :-- | --: |
-| `src/drafter/model.{hpp,cpp}` | **vendored** `dflash` loader: 81 tensors, Q6_K dequant, F32 promotion, plus the config mapping | ~450 vendored + 150 written |
-| `src/drafter/forward.{hpp,cpp}` | **vendored**: encoder, 5 blocks (dynamic grouped conv, non-causal SWA 2048, gated MLP), selector lattice | ~950 vendored |
-| `src/drafter/backend.{hpp,cpp}` | internal drafter: context priming from the five taps, KV ring, `Propose(prefix, pos, max)`, `AcceptFeedback`; no `IDraftBackend` | 250 |
-| `src/spec/target_adapter.{hpp,cpp}` | internal adapter over `gpu::Session`: prompt append, batched verify, row logits, hidden rows, rewind; no `ISpeculativeTargetExecutor` | 200 |
-| `src/spec/cycle.{hpp,cpp}` | draft -> `AppendAll` -> lazy row acceptance -> `Rewind`; adaptive length from measured per-row cost; stats | 450 |
-| engine changes | hidden capture ring (~80 MB at 2048 rows x 5 taps x 2048 F32) | 150 |
+| file | contents | state |
+| :-- | :-- | :-- |
+| `src/gpu/dflash/dflash_kernels.{hpp,hip.cpp}` | vendored kernels: conv, SiLU-mul, non-causal SWA 2048 attention, selector lattice, gather, BF16->Q8_0 | **done** (`flint.dflash_ops`) |
+| `src/gpu/dflash/dflash_weights.{hpp,cpp}` | `dflash` loader: 81 tensors, Q6_K dequant, F32 promotion, rotary-dim fallback, Q5_K | **done** |
+| `src/gpu/dflash/dflash_forward.{hpp,cpp}` | encoder, 5 blocks (dynamic grouped conv, non-causal SWA 2048, gated MLP), selector, context injection, `ResetContext` | **done** (`flint.dflash_forward`) |
+| `src/spec/target_adapter.{hpp,cpp}` | internal adapter over `gpu::Session`: prompt append, batched verify, row logits, hidden rows, rewind; no `ISpeculativeTargetExecutor` | M2 |
+| `src/spec/cycle.{hpp,cpp}` | draft -> `AppendAll` -> lazy row acceptance -> `Rewind`; adaptive length from measured per-row cost; stats | M3 |
+| engine changes | hidden capture ring (~80 MB at 2048 rows x 5 taps x 2048 F32) | **done** (M0) |
+
+The drafter landed at `src/gpu/dflash/` (not the `src/drafter/` sketched
+above); the adapter and cycle are still planned at `src/spec/`.
 
 Memory: drafter Q6_K 336 MB + feature ring 80 MB + draft KV ring 40 MB, against
-a 112 GiB unified heap. Written code is ~1,050 LOC; ~1,400 LOC are vendored from
-the in-tree Qwen DFlash2 stack and carry `THIRD_PARTY_NOTICES.md` attribution.
+a 112 GiB unified heap. The drafter (kernels, loader, forward) is written and
+vendored from the in-tree Qwen DFlash2 stack, with `THIRD_PARTY_NOTICES.md`
+attribution; the adapter and cycle (~650 LOC) remain.
 
 ## 6. Milestones
 
@@ -375,7 +391,7 @@ job with four units**, not a 50-line shim:
   `DflashBorrowed` needs. No copy, no re-encode: the drafter reads the target's
   own tables.
 
-### M1b unit 5 — parity against the oracle  **[BF16 done; Q6_K measured]**
+### M1b unit 5 — parity against the oracle  **[done; superseded by M1c]**
 Harness: `tools/drafter_parity.cpp` -> `flint_drafter_parity`. It loads the
 target, captures the five tapped residuals for a fixed 64-token prompt, feeds
 them to the drafter, drafts one block with tracing on, and writes the trace
@@ -480,14 +496,14 @@ The remaining piece of level 3 is the same measurement through the runner's
 real cycle (M2/M3), which also exercises the sampler-as-black-box commit path
 rather than this driver's argmax.
 
-### M2 — Target adapter (1-1.5 d)
+### M2 — Target adapter (1-1.5 d)  **[next]**
 - Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row
   logits and per-row 5-tap hidden rows, `Rewind`, and position tracking.
 - Acceptance: `VerifyRows` rows are **bit-identical** to `Append` one token at a
   time (the `FLINT_CHECK_ROWS` property, asserted from inside the adapter);
   hidden rows equal the captured values; rewind leaves identical state.
 
-### M3 — Cycle + runner integration (2 d)
+### M3 — Cycle + runner integration (2 d)  **[not started]**
 - `SpecCycle` per §3.2, including `Advance` no-op, position bookkeeping, EOS
   mid-block (drop remaining rows), and `PreviewFirstToken` **must not** start a
   cycle.
@@ -503,7 +519,7 @@ rather than this driver's argmax.
     12-prompt set; the table in §1 is replaced with measurements.
 - If either gate fails, do not proceed: the cycle is not distribution-correct.
 
-### M4 — Draft policy (1 d)
+### M4 — Draft policy (1 d)  **[not started]**
 - Adaptive length priced by measured per-row cost at the current depth (the
   Strycast pattern), plus `fixed`; honour `max_draft_tokens` /
   `min_draft_tokens` / `dflash_policy`.
@@ -511,7 +527,7 @@ rather than this driver's argmax.
   never slower than spec-off at temperature 1.0; stats (`draft_rounds`,
   `draft_tokens`, `draft_accepted_tokens`) match the oracle within noise.
 
-### M5 — Gates (2-3 d)
+### M5 — Gates (2-3 d)  **[not started]**
 | gate | criterion |
 | :-- | :-- |
 | GX | greedy spec on == spec off, byte-identical, 12 prompts x 4 depths |
@@ -524,15 +540,16 @@ rather than this driver's argmax.
 | memory | drafter + ring accounted in `ResourceClaim` |
 | concurrency | > 1 request: speculation off initially, documented |
 
-### M6 — Release (1 d)
+### M6 — Release (1 d)  **[not started]**
 - `docs/QUALITY.md` evidence, roadmap update, `extension.json` -> 0.3.0 +
   `speculative_defaults` (`dflash2`, max 7, min 1, policies fixed+adaptive),
   registry PR, llama-swap entry, issue #1 reply with the measured table.
 - Ship with speculation **opt-in** (`FLINT_SPEC=dflash`) until the sampled-mode
   numbers are known-good in the field; document the seed-reproducibility caveat.
 
-**Total: ~10-12 working days** (~1,050 LOC written, ~1,400 vendored). M1 is the
-only real technical unknown, and its first checkpoint is half a day away.
+**Total: ~10-12 working days** (~1,050 LOC written, ~1,400 vendored). M1 is
+done (drafter written, parity and acceptance measured); M2-M6 remain, ~6-8
+working days.
 
 ## 7. Risks
 

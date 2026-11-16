@@ -8,15 +8,20 @@ their fabric-clock requirements stay out).
 
 Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 
-## Current state (2026-11-15) — build approved
+## Current state (2026-11-15) — M1 done, integration next
 
 **Decision: build it, sampler-agnostic.** The gate below was measured twice and
 the 2x target is not reachable on this engine, so we build for the bounded win:
-**~1.4-1.5x greedy**, **~1.1-1.2x at temperature ~0.7**, ~1.0x at 131k, best on
-code/JSON. The cycle batches the forward pass and samples one row per token with
-the live sampler, so any temperature, penalty and grammar setting behaves as it
-does without speculation; the sampler is never reimplemented. Execution plan:
-[`PLAN-DFLASH2.md`](PLAN-DFLASH2.md).
+**1.2-1.5x greedy at depth 0** (measured, M1c), **~1.1-1.2x at temperature
+~0.7**, below 1x past 32k, best on code/JSON. The cycle batches the forward pass
+and samples one row per token with the live sampler, so any temperature, penalty
+and grammar setting behaves as it does without speculation; the sampler is never
+reimplemented. Execution plan: [`PLAN-DFLASH2.md`](PLAN-DFLASH2.md).
+
+M1 (the drafter) is done: kernels, loader and forward in the extension, parity
+20/20 on BF16, acceptance matching the oracle at `p_min 0`. M2 (target adapter)
+and M3 (runner cycle) are next; M4 (adaptive draft length) is required before
+the long-context case stops being a regression. See `docs/REPORT-M1C.md`.
 
 | | state |
 | :-- | :-- |
@@ -35,7 +40,7 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | drafter parity vs oracle (BF16) | **passes** — 89 traced stages, worst drafter-owned stage 4.71e-6 against a 1e-4 gate, candidate sets 7/7, proposal TV 6.8e-6 (`flint_drafter_parity` + `tools/qwen27b/dflash_reference.py`) |
 | drafter parity vs oracle (Q6_K) | **quantisation floor** — 1-2.4e-2 per stage, candidate sets 5/7, TV 2.0e-2: the decode route rounds activations to int8 and the block weights to Q6_K, which an fp32 reference cannot match; `logits` on a reference head is still 7.7e-7, so the block wiring is exact |
 | drafter kernels (extension) | **done** — `src/gpu/dflash`, vendored verbatim (namespace + includes only), `flint.dflash_ops` covers conv/SiLU-mul/attention/selector/gather/BF16->Q8_0 against host references |
-| drafter code | **none in the extension.** The forward is vendored-ready in-tree: `QwenDFlashConfig` is file-driven and the loader handles Q6_K, so M1a is an adoption probe, not a rewrite |
+| drafter code | **in the extension** — `src/gpu/dflash/` (kernels, loader, forward); the in-tree Qwen DFlash2 stack was the port source, not a dependency |
 
 Three findings from Steps 0-2 changed the shape of the work and are worth
 keeping in view:

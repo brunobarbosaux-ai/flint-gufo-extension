@@ -89,6 +89,8 @@ public:
   FlintContinuationAdapter& adapter;
   cache::MutationGuard& guard;
   std::unique_ptr<FlintSession> session;
+  // Declared after the session it reads from, so it is destroyed first.
+  std::unique_ptr<gpu::dflash::DflashForward> draft;
   bool restoring{false};
   bool failed{false};
   std::mutex mutex;
@@ -102,8 +104,9 @@ public:
 
 FlintContinuationAdapter::FlintContinuationAdapter(
     std::shared_ptr<FlintModel> model, std::uint32_t context,
-    cache::Identity identity)
+    cache::Identity identity, std::shared_ptr<const DraftArtifact> draft)
     : model_(std::move(model)),
+      draft_(std::move(draft)),
       context_(context),
       identity_(std::move(identity)),
       layout_(model_ ? model_->config() : Config{}, context) {
@@ -134,6 +137,10 @@ FlintSession& FlintContinuationAdapter::GetSession(cache::Slot& slot) {
   if (!state.IsValid())
     throw std::logic_error("Flint slot is not valid");
   return *state.session;
+}
+
+gpu::dflash::DflashForward* FlintContinuationAdapter::GetDraft(cache::Slot& slot) {
+  return As(slot).draft.get();
 }
 
 std::vector<cache::BackingClass> FlintContinuationAdapter::BackingPlan(
@@ -171,7 +178,25 @@ std::unique_ptr<cache::Slot> FlintContinuationAdapter::CreateSlot(
   auto session = model_->CreateSession(context_, &error);
   if (!session)
     throw std::runtime_error(error);
-  return std::make_unique<State>(*this, guard, std::move(session));
+  auto state = std::make_unique<State>(*this, guard, std::move(session));
+  if (draft_) {
+    // The target records the residual rows the drafter reads, and the drafter
+    // borrows the target's embedding and head.
+    if (!state->session->SetHiddenCapture(
+            draft_->weights.config.target_layer_ids, &error))
+      throw std::runtime_error("Flint drafter capture: " + error);
+    const auto tied = model_->Tied();
+    state->draft = gpu::dflash::DflashForward::Create(
+        draft_->weights,
+        {.token_embedding = tied.token_embedding,
+         .token_embedding_type = tied.token_embedding_type,
+         .output = tied.output,
+         .output_type = tied.output_type},
+        context_, &error);
+    if (!state->draft)
+      throw std::runtime_error("Flint drafter: " + error);
+  }
+  return state;
 }
 
 std::vector<cache::ComponentPosition> FlintContinuationAdapter::Positions(
@@ -394,6 +419,11 @@ bool FlintContinuationAdapter::Validate(
     return refuse();
   state.restoring = false;
   state.ResetRestore();
+  // A restored session has no drafter history before this frontier.
+  if (state.draft) {
+    state.draft->ResetContext();
+    state.draft->SkipContextTo(static_cast<std::uint32_t>(position));
+  }
   return true;
 }
 
@@ -401,6 +431,8 @@ bool FlintContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
   try {
     auto& state = As(slot);
     state.session->Reset();
+    if (state.draft)
+      state.draft->ResetContext();
     state.failed = false;
     state.restoring = false;
     state.ResetRestore();

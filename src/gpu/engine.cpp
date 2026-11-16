@@ -1440,6 +1440,33 @@ bool Session::HasHidden(std::uint32_t row) const noexcept {
   return CapturedHiddenDevice(row, 0) != nullptr;
 }
 
+bool Session::CopyHiddenRows(std::uint32_t first, std::uint32_t count,
+                             std::span<float> out, std::string* error_msg) {
+  Impl& s = *impl_;
+  const std::size_t taps = s.tap_layers.size();
+  const std::size_t hidden = s.model->config.hidden_size;
+  const std::size_t record = taps * hidden;
+  if (count == 0 || taps == 0 || out.size() != std::size_t{count} * record)
+    return Fail(error_msg, "Flint: hidden rows request is malformed");
+  for (std::uint32_t r : {first, first + count - 1}) {
+    if (CapturedHiddenDevice(r, 0) == nullptr)
+      return Fail(error_msg, "Flint: hidden rows are no longer in the ring");
+  }
+  if (hipStreamSynchronize(s.stream) != hipSuccess)
+    return Fail(error_msg, "Flint: device synchronization failed");
+  for (std::uint32_t done = 0; done < count;) {
+    const std::uint32_t slot = (first + done) % s.hidden_ring_rows;
+    const std::uint32_t run = std::min(count - done, s.hidden_ring_rows - slot);
+    if (hipMemcpy(out.data() + std::size_t{done} * record,
+                  s.hidden_ring.get() + std::size_t{slot} * record,
+                  std::size_t{run} * record * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+      return Fail(error_msg, "Flint: hidden rows copy failed");
+    done += run;
+  }
+  return true;
+}
+
 std::span<const float> Session::CapturedHidden(std::uint32_t row,
                                                std::uint32_t tap) {
   const float* src = CapturedHiddenDevice(row, tap);

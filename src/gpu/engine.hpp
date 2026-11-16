@@ -72,6 +72,12 @@ public:
   /// The span aliases per-session scratch: copy it before the next call.
   [[nodiscard]] std::span<const float> CapturedHidden(std::uint32_t row,
                                                       std::uint32_t tap);
+  /// Copies `count` consecutive rows starting at `first` (every tap, in the
+  /// drafter's [row][tap][hidden] layout) into `out`, in at most two device
+  /// copies. False when any of them has left the ring.
+  [[nodiscard]] bool CopyHiddenRows(std::uint32_t first, std::uint32_t count,
+                                    std::span<float> out,
+                                    std::string* error_msg = nullptr);
   /// Device pointer to the same row, for a consumer that reads it in place.
   /// nullptr when unavailable; valid until the row leaves the ring.
   [[nodiscard]] const float* CapturedHiddenDevice(std::uint32_t row,

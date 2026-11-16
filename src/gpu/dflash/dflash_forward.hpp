@@ -113,6 +113,12 @@ class DflashForward final {
   /// min(position, ContextLength()) rows), so they need no clearing.
   void ResetContext() noexcept;
 
+  /// Continues from `position` without the rows before it (a session restored
+  /// from a cache has its K/V but not the hidden states the drafter needs for
+  /// them). `position` must be at least ContextLength(). Rows before it are
+  /// never attended to: Run shrinks the window to the rows that exist.
+  void SkipContextTo(std::uint32_t position) noexcept;
+
   /// Runs one block: the committed `anchor` at `position` plus `draft_count`
   /// proposals. `uniforms` supplies one draw per proposal when `temperature`
   /// is positive.

@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,8 @@
 #include <vector>
 
 #include "continuation_adapter.hpp"
+#include "src/gpu/dflash/dflash_forward.hpp"
+#include "src/gpu/dflash/dflash_weights.hpp"
 #include "hip/vendor/qwen/tokenizer.hpp"
 #include "src/chat_template.hpp"
 #include "src/gpu/engine.hpp"
@@ -110,12 +113,18 @@ public:
   // Component-cache slot: the session is owned by the adapter's slot, which
   // outlives this state through the retained adapter/slot handles. Invalidate
   // routes through the adapter so the slot resets its session and guard.
+  // `draft` (may be null) is the slot's drafter, owned by the same slot.
   FlintTextRunnerState(FlintSession& session, cache::Adapter& adapter,
-                       cache::Slot& slot)
-      : session_(&session), adapter_(&adapter), slot_(&slot) {}
+                       cache::Slot& slot, gpu::dflash::DflashForward* draft = nullptr)
+      : session_(&session),
+        adapter_(&adapter),
+        slot_(&slot),
+        draft_(draft),
+        speculating_(draft != nullptr) {}
 
   void Invalidate() noexcept override {
     position_ = 0;
+    pending_.reset();
     (void)adapter_->Invalidate(*slot_);
   }
 
@@ -123,10 +132,28 @@ public:
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
 
+  [[nodiscard]] gpu::dflash::DflashForward* draft() const noexcept { return draft_; }
+  [[nodiscard]] bool speculating() const noexcept { return speculating_; }
+  void stop_speculating() noexcept { speculating_ = false; }
+  // A token already sampled and handed to the host but not yet consumed by the
+  // session: it is the anchor of the next draft block, so the verification
+  // pass consumes it with the drafted tokens instead of paying a forward pass
+  // of its own.
+  [[nodiscard]] std::optional<std::int32_t>& pending() noexcept {
+    return pending_;
+  }
+  [[nodiscard]] std::vector<float>& feature_scratch() noexcept {
+    return feature_scratch_;
+  }
+
 private:
   FlintSession* session_{nullptr};
   cache::Adapter* adapter_{nullptr};
   cache::Slot* slot_{nullptr};
+  gpu::dflash::DflashForward* draft_{nullptr};
+  bool speculating_{false};
+  std::optional<std::int32_t> pending_;
+  std::vector<float> feature_scratch_;
   std::size_t position_{0};
 };
 
@@ -164,7 +191,9 @@ std::string FlintRoleName(ext::ChatRole role) {
 
 class FlintTextRunner final : public ext::HipTextModelRunner {
 public:
-  static constexpr std::size_t kPrefillChunk = 8192;
+  // One engine pass: the drafter ingests the target features of the last pass
+  // only, so a prefill chunk must not span two.
+  static constexpr std::size_t kPrefillChunk = 4096;
   static constexpr std::size_t kWarmupTokens = 9000;
 
   FlintTextRunner(
@@ -172,11 +201,15 @@ public:
       std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer>
           tokenizer,
       std::vector<std::int32_t> stop_tokens, std::uint32_t max_context,
-      std::string artifact_fingerprint = {})
+      std::string artifact_fingerprint = {},
+      std::shared_ptr<const DraftArtifact> draft = {},
+      std::uint32_t max_draft_tokens = 0)
       : model_(std::move(model)),
+        draft_model_(std::move(draft)),
         tokenizer_(std::move(tokenizer)),
         stop_tokens_(std::move(stop_tokens)),
-        max_context_(max_context) {
+        max_context_(max_context),
+        max_draft_(max_draft_tokens) {
     // Durable caches require the validated artifact fingerprint; without it the
     // loaded model instance is the identity, as for the LFM3 continuation.
     if (!artifact_fingerprint.empty()) {
@@ -189,6 +222,20 @@ public:
     } else {
       component_identity_ = ComponentIdentity(model_.get(), max_context_);
     }
+    if (const char* env = std::getenv("FLINT_DRAFT_MAX_CONTEXT");
+        env != nullptr && env[0] != '\0')
+      draft_max_context_ = static_cast<std::uint32_t>(std::atoi(env));
+    if (const char* env = std::getenv("FLINT_DRAFT_TOKENS");
+        env != nullptr && env[0] != '\0') {
+      max_draft_ = static_cast<std::uint32_t>(std::atoi(env));
+      draft_fixed_ = true;
+    }
+    if (draft_model_)
+      std::fprintf(stderr,
+                   "[flint] event=speculation backend=dflash2 max_draft=%u "
+                   "drafter_layers=%u taps=%zu\n",
+                   max_draft_, draft_model_->weights.config.num_layers,
+                   draft_model_->weights.config.target_layer_ids.size());
     Warmup();
     SnapshotSelfTest();
   }
@@ -404,6 +451,10 @@ public:
                 .incremental_prefill = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
+                // The scheduler calls DecodeStep with the whole remaining
+                // budget (instead of Advance, one token at a time) only for a
+                // runner that can emit several tokens per step.
+                .multi_token_decode = draft_model_ != nullptr,
                 .prefix_reuse = true,
             },
         .sampling_defaults = FlintSamplingDefaults(),
@@ -438,8 +489,8 @@ public:
                                 std::size_t ram) const override {
     (void)ram;
     return hip::CreateHipComponentCacheResources(
-        std::make_unique<FlintContinuationAdapter>(model_, max_context_,
-                                                   component_identity_),
+        std::make_unique<FlintContinuationAdapter>(
+            model_, max_context_, component_identity_, draft_model_),
         ledger,
         hip::ComponentCacheHooks{
             [] { return ext::HostSnapshotCeilingBytes(); },
@@ -451,8 +502,8 @@ public:
   [[nodiscard]] std::unique_ptr<ext::TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
     auto& flint = dynamic_cast<FlintContinuationAdapter&>(adapter);
-    return std::make_unique<FlintTextRunnerState>(flint.GetSession(slot),
-                                                  adapter, slot);
+    return std::make_unique<FlintTextRunnerState>(
+        flint.GetSession(slot), adapter, slot, flint.GetDraft(slot));
   }
 
   void ReconcileComponentState(ext::TextRunnerState& state,
@@ -553,12 +604,15 @@ public:
       throw std::logic_error("Flint prefill has no remaining input");
     const std::size_t consumed = std::min<std::size_t>(
         {max_input_tokens, prompt.size() - offset, kPrefillChunk});
+    if (flint.draft() != nullptr && prompt.size() > draft_max_context_)
+      flint.stop_speculating();
     const auto chunk = FlintEngineTokens(prompt.subspan(offset, consumed));
     std::string error;
     if (!flint.session().Append(chunk, &error)) {
       flint.Invalidate();
       throw std::runtime_error("Flint prefill failed: " + error);
     }
+    InjectFeatures(flint, consumed);
     flint.set_position(offset + consumed);
     return {.consumed_tokens = consumed,
             .decode_ready = offset + consumed == prompt.size()};
@@ -591,7 +645,198 @@ public:
       flint.Invalidate();
       throw std::runtime_error("Flint decode failed: " + error);
     }
+    InjectFeatures(flint, 1);
     flint.set_position(flint.position() + 1);
+  }
+
+  // Speculative decoding (docs/DFLASH2.md). Each call is one draft block: the
+  // drafter proposes k tokens after the anchor, one verification pass runs the
+  // anchor and the proposals through the target, and the tokens are accepted
+  // by the target's own sampler: a proposal is kept when the sample drawn from
+  // the target distribution at its row equals it, otherwise that sample is the
+  // next token. Each emitted token is therefore one draw from the target
+  // distribution given its prefix, so the output distribution is unchanged
+  // (greedy output is identical). The token that ends a block is sampled but
+  // left unconsumed (pending): it anchors the next block.
+  [[nodiscard]] ext::TextDecodeStep DecodeStep(
+      ext::TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& flint = RequireFlintState(state);
+    if (flint.draft() != nullptr && flint.speculating() &&
+        flint.position() > draft_max_context_)
+      flint.stop_speculating();
+    if (flint.draft() == nullptr || !flint.speculating() || max_draft_ == 0) {
+      FlushPending(flint);
+      return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    ext::TextDecodeStep step;
+    if (max_tokens == 0)
+      return step;
+    if (flint.position() >= max_context_) {
+      step.stop = true;
+      return step;
+    }
+    // The anchor: the pending token, or a first token sampled now.
+    std::int32_t anchor = 0;
+    if (flint.pending().has_value()) {
+      anchor = *flint.pending();
+    } else {
+      auto selection = SelectNext(state, sampler);
+      if (selection.stop) {
+        step.stop = true;
+        step.terminal_logprobs = std::move(selection.logprobs);
+        return step;
+      }
+      anchor = static_cast<std::int32_t>(selection.token);
+      step.selections.push_back(std::move(selection));
+      --max_tokens;
+      flint.pending() = anchor;
+    }
+    if (max_tokens == 0)
+      return step;
+    // The block is sampled on a tentative copy of the request's sampler: each
+    // token is accepted into the copy as it is chosen (repetition penalties and
+    // grammar state follow), and only the draw state is published at the end.
+    // The host accepts the emitted tokens into the real sampler itself.
+    sampling::SamplerState tentative = sampler;
+    const auto& sampling_config = tentative.config();
+    // Rejection sampling against the drafter's own distribution (opt-in with
+    // FLINT_DRAFT_REJECTION=1: measured no better than the exact match rule,
+    // which is rejection sampling for a deterministic draft). Grammars and
+    // reasoning budgets always use the match rule.
+    static const bool rejection_enabled = [] {
+      const char* e = std::getenv("FLINT_DRAFT_REJECTION");
+      return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const bool rejection = rejection_enabled &&
+                           sampling_config.temperature > 0.0F &&
+                           sampling_config.uses_random_sampling() &&
+                           !sampling_config.constraint &&
+                           !sampling_config.reasoning_budget &&
+                           !tentative.ForcedToken().has_value();
+
+    // Each drafted row costs about 2.5 ms of verification and is accepted less
+    // often than the one before: measured on Flint, the best block is 3 tokens
+    // greedy and 2 when sampling. FLINT_DRAFT_TOKENS fixes it.
+    const std::uint32_t tuned = sampling_config.temperature > 0.0F ? 2U : 3U;
+    const std::uint32_t wanted = draft_fixed_ ? max_draft_ : std::min(max_draft_, tuned);
+    const std::uint32_t room = max_context_ - static_cast<std::uint32_t>(
+                                                  flint.position());
+    std::uint32_t k = std::min<std::uint32_t>(
+        {wanted, flint.draft()->config().block_size - 1U,
+         static_cast<std::uint32_t>(max_tokens - 1),
+         room > 2 ? room - 2 : 0});
+
+    const auto t_start = std::chrono::steady_clock::now();
+    gpu::dflash::DflashDraft proposal;
+    std::vector<std::int32_t> drafted;
+    const std::uint32_t top_k = flint.draft()->config().selector_top_k;
+    if (k > 0 && flint.draft()->ContextLength() == flint.position()) {
+      std::vector<float> uniforms;
+      if (rejection) {
+        uniforms.resize(k);
+        for (auto& u : uniforms)
+          u = static_cast<float>(tentative.Uniform());
+      }
+      std::string error;
+      if (!flint.draft()->Run(static_cast<std::uint32_t>(anchor),
+                              static_cast<std::uint32_t>(flint.position()), k,
+                              rejection ? sampling_config.temperature : 0.0F,
+                              uniforms, {}, &proposal, &error)) {
+        std::fprintf(stderr, "[flint] drafter failed, speculation off: %s\n",
+                     error.c_str());
+        flint.stop_speculating();
+        proposal = {};
+      } else {
+        drafted.assign(proposal.tokens.begin(), proposal.tokens.end());
+      }
+    }
+    k = static_cast<std::uint32_t>(drafted.size());
+    const auto t_drafted = std::chrono::steady_clock::now();
+
+    std::vector<std::int32_t> run;
+    run.reserve(k + 1);
+    run.push_back(anchor);
+    run.insert(run.end(), drafted.begin(), drafted.end());
+    const auto base = static_cast<std::uint32_t>(flint.position());
+    std::string error;
+    const bool ok = run.size() == 1
+                        ? flint.session().Append(run, &error)
+                        : flint.session().AppendAll(run, &error);
+    if (!ok) {
+      flint.Invalidate();
+      throw std::runtime_error("Flint decode failed: " + error);
+    }
+    const auto t_verified = std::chrono::steady_clock::now();
+
+    // Row i is the distribution after run[0..i].
+    std::uint32_t consumed = 0;  // index of the last consumed row
+    bool stop = false;
+    const auto emit = [&](std::int32_t token) {
+      step.selections.push_back(ext::TextDecodeSelection{
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = std::string(tokenizer_->DecodeToken(token)),
+          .logprobs = std::nullopt});
+    };
+    for (std::uint32_t i = 0; i <= k; ++i) {
+      const auto logits = run.size() == 1 ? flint.session().Logits()
+                                          : flint.session().Logits(i);
+      consumed = i;
+      std::int32_t token = 0;
+      bool accepted = false;
+      if (rejection && i < k) {
+        // Keep the proposal with probability min(1, p / q); on rejection draw
+        // from the residual of p over q, which keeps the output distribution.
+        const auto distribution = tentative.Distribution(logits);
+        const auto proposed = static_cast<sampling::TokenId>(drafted[i]);
+        const double p = distribution.probability(proposed);
+        const double q = proposal.confidences[i];
+        if (q > 0.0 && tentative.Uniform() * q < p) {
+          token = drafted[i];
+          accepted = true;
+        } else {
+          const auto ids = std::span<const sampling::TokenId>(
+              proposal.candidate_ids.data() + std::size_t{i} * top_k, top_k);
+          const auto probs = std::span<const float>(
+              proposal.candidate_probabilities.data() +
+                  std::size_t{i} * top_k, top_k);
+          token = static_cast<std::int32_t>(distribution.SampleResidual(
+              ids, probs, tentative.mutable_rng_state()));
+        }
+      } else {
+        token = static_cast<std::int32_t>(tentative.Sample(logits));
+        accepted = i < k && token == drafted[i];
+      }
+      if (flint.stop_at_eos() && IsStop(token)) {
+        stop = true;
+        flint.pending().reset();
+        break;
+      }
+      tentative.Accept(static_cast<sampling::TokenId>(token));
+      emit(token);
+      if (accepted) {
+        ++step.draft_accepted_tokens;
+        continue;
+      }
+      flint.pending() = token;
+      break;
+    }
+    sampler.CopyDrawStateFrom(tentative);
+    const std::uint32_t kept = consumed + 1;  // the anchor and what it accepted
+    if (run.size() > 1) {
+      if (kept < run.size())
+        flint.session().Rewind(base + kept);
+      flint.session().KeepLogitRow(consumed);
+    }
+    InjectFeatures(flint, kept);
+    flint.set_position(base + kept);
+    ReportRound(t_start, t_drafted, t_verified, std::chrono::steady_clock::now(),
+                k, kept);
+    step.draft_rounds = k > 0 ? 1 : 0;
+    step.draft_tokens = k;
+    step.stop = stop;
+    return step;
   }
 
   [[nodiscard]] std::optional<ext::TextDecodeSelection> PreviewFirstToken(
@@ -624,15 +869,109 @@ public:
   }
 
 private:
+  // FLINT_DRAFT_TIMING=1: mean milliseconds per speculation round (draft,
+  // verification pass, acceptance and feature injection), every 64 rounds.
+  static void ReportRound(std::chrono::steady_clock::time_point start,
+                          std::chrono::steady_clock::time_point drafted,
+                          std::chrono::steady_clock::time_point verified,
+                          std::chrono::steady_clock::time_point done,
+                          std::uint32_t proposed, std::uint32_t kept) {
+    static const bool on = [] {
+      const char* e = std::getenv("FLINT_DRAFT_TIMING");
+      return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (!on)
+      return;
+    static std::atomic<std::uint64_t> rounds{0}, proposed_sum{0}, kept_sum{0};
+    static std::atomic<std::uint64_t> draft_us{0}, verify_us{0}, tail_us{0};
+    const auto us = [](auto a, auto b) {
+      return static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+    };
+    draft_us += us(start, drafted);
+    verify_us += us(drafted, verified);
+    tail_us += us(verified, done);
+    proposed_sum += proposed;
+    kept_sum += kept;
+    const auto n = ++rounds;
+    if (n % 64 == 0)
+      std::fprintf(stderr,
+                   "[flint] event=round_timing rounds=%llu draft_ms=%.1f "
+                   "verify_ms=%.1f tail_ms=%.1f proposed=%.1f kept=%.2f\n",
+                   static_cast<unsigned long long>(n),
+                   draft_us.exchange(0) / 64000.0,
+                   verify_us.exchange(0) / 64000.0,
+                   tail_us.exchange(0) / 64000.0,
+                   proposed_sum.exchange(0) / 64.0, kept_sum.exchange(0) / 64.0);
+  }
+
+  // Lets the drafter read the features of the forward pass that just ran for
+  // `rows` tokens. A failure ends speculation for this state, not the request.
+  void InjectFeatures(FlintTextRunnerState& flint, std::size_t rows) const {
+    auto* draft = flint.draft();
+    if (draft == nullptr || !flint.speculating() || rows == 0)
+      return;
+    auto& session = flint.session();
+    // The `rows` tokens that just ran sit at [first, first + rows). The target
+    // keeps the last HiddenRingRows of them; the drafter attends to its window
+    // only, so earlier rows are skipped rather than injected.
+    const std::uint32_t first = static_cast<std::uint32_t>(flint.position());
+    std::uint32_t skip = 0;
+    if (rows > session.HiddenRingRows())
+      skip = static_cast<std::uint32_t>(rows) - session.HiddenRingRows();
+    std::string error;
+    bool ok = draft->ContextLength() == first;
+    if (!ok) {
+      error = "drafter context is not contiguous with the target";
+    } else {
+      if (skip > 0)
+        draft->SkipContextTo(first + skip);
+      const auto count = static_cast<std::uint32_t>(rows) - skip;
+      auto& scratch = flint.feature_scratch();
+      scratch.resize(std::size_t{count} * draft->config().target_layer_ids.size() *
+                     draft->config().hidden_size);
+      ok = session.CopyHiddenRows(first + skip, count, scratch, &error) &&
+           draft->AppendContext(scratch, first + skip, count, &error);
+    }
+    if (!ok) {
+      std::fprintf(stderr, "[flint] drafter context lost, speculation off: %s\n",
+                   error.c_str());
+      flint.stop_speculating();
+    }
+  }
+
+  // Consumes a sampled-but-unconsumed token so the state can be driven one
+  // token at a time again.
+  void FlushPending(FlintTextRunnerState& flint) const {
+    if (!flint.pending().has_value())
+      return;
+    const std::int32_t token = *flint.pending();
+    flint.pending().reset();
+    std::string error;
+    if (!flint.session().Append({&token, 1}, &error)) {
+      flint.Invalidate();
+      throw std::runtime_error("Flint decode failed: " + error);
+    }
+    InjectFeatures(flint, 1);
+    flint.set_position(flint.position() + 1);
+  }
+
   [[nodiscard]] bool IsStop(std::int32_t token) const {
     return std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
            stop_tokens_.end();
   }
 
   std::shared_ptr<FlintModel> model_;
+  std::shared_ptr<const DraftArtifact> draft_model_;
   std::unique_ptr<gufo::vendor::qwen::tokenization::QwenTokenizer> tokenizer_;
   std::vector<std::int32_t> stop_tokens_;
   std::uint32_t max_context_;
+  std::uint32_t max_draft_{0};
+  bool draft_fixed_{false};
+  // Speculation pays up to about this many tokens of context: beyond it the
+  // verification pass costs more in attention than the accepted tokens save
+  // (measured: parity at 9k, -10 % at 38k, -15 % at 125k).
+  std::uint32_t draft_max_context_{8192};
   cache::Identity component_identity_;
 };
 
@@ -651,9 +990,17 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
         *error = "Flint requires a model path";
       return nullptr;
     }
-    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) {
+    const bool speculative =
+        options.speculative.backend == ext::TextSpeculativeBackend::kDFlash;
+    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled &&
+        !speculative) {
       if (error)
-        *error = "Flint does not support draft-model speculation";
+        *error = "Flint supports dflash2 speculation only";
+      return nullptr;
+    }
+    if (speculative && options.speculative.draft_model_path.empty()) {
+      if (error)
+        *error = "Flint dflash2 speculation requires --draft-model";
       return nullptr;
     }
     if (!options.vision_model_path.empty()) {
@@ -720,6 +1067,30 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
         *error = "Failed to create Flint model: " + load_error;
       return nullptr;
     }
+    // The drafter's weights reference its mapped GGUF, which they keep alive.
+    std::shared_ptr<const DraftArtifact> draft;
+    if (speculative) {
+      std::shared_ptr<const core::GgufReader> draft_reader =
+          core::GgufReader::OpenFile(options.speculative.draft_model_path,
+                                     &load_error);
+      std::optional<gpu::dflash::DflashWeights> weights;
+      if (draft_reader)
+        weights = gpu::dflash::DflashWeights::LoadFromGguf(*draft_reader,
+                                                           &load_error);
+      if (!weights) {
+        if (error)
+          *error = "Failed to load the Flint drafter: " + load_error;
+        return nullptr;
+      }
+      if (weights->config.hidden_size != config->hidden_size ||
+          weights->config.vocab_size != config->vocab_size) {
+        if (error)
+          *error = "the drafter does not match this Flint model";
+        return nullptr;
+      }
+      draft = std::make_shared<const DraftArtifact>(
+          DraftArtifact{std::move(draft_reader), std::move(*weights)});
+    }
 
     std::uint32_t max_context = options.max_context;
     if (max_context == 0)
@@ -736,7 +1107,8 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
 
     return std::make_shared<FlintTextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
-        max_context, std::move(fingerprint));
+        max_context, std::move(fingerprint), std::move(draft),
+        speculative ? options.speculative.max_draft_tokens : 0U);
   } catch (const std::exception& e) {
     if (error)
       *error = std::string("Flint runner creation failed: ") + e.what();

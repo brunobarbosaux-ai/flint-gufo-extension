@@ -10,12 +10,21 @@
 #include <vector>
 
 #include "continuation_layout.hpp"
+#include "src/gpu/dflash/dflash_forward.hpp"
+#include "src/gpu/dflash/dflash_weights.hpp"
 #include "src/gpu/engine.hpp"
 
 namespace gufo::models::flint {
 
 using FlintModel = gpu::Model;
 using FlintSession = gpu::Session;
+
+/// A DFlash-2 drafter artifact: the weights reference the mapped GGUF, so the
+/// reader travels with them.
+struct DraftArtifact {
+  std::shared_ptr<const core::GgufReader> reader;
+  gpu::dflash::DflashWeights weights;
+};
 
 // Prefix-continuation adapter for the Flint ROCm session (docs/CACHE-ROWS.md).
 //
@@ -28,10 +37,13 @@ using FlintSession = gpu::Session;
 class FlintContinuationAdapter final : public cache::Adapter {
 public:
   FlintContinuationAdapter(std::shared_ptr<FlintModel> model,
-                           std::uint32_t context, cache::Identity identity);
+                           std::uint32_t context, cache::Identity identity,
+                           std::shared_ptr<const DraftArtifact> draft = {});
   ~FlintContinuationAdapter() override;
 
   [[nodiscard]] FlintSession& GetSession(cache::Slot&);
+  /// The slot's drafter, or null when speculation is off.
+  [[nodiscard]] gpu::dflash::DflashForward* GetDraft(cache::Slot&);
 
   [[nodiscard]] std::vector<cache::BackingClass> BackingPlan(
       std::size_t ram_bytes) const override;
@@ -80,6 +92,7 @@ private:
   State& As(cache::Slot&) const;
 
   std::shared_ptr<FlintModel> model_;
+  std::shared_ptr<const DraftArtifact> draft_;
   std::uint32_t context_;
   cache::Identity identity_;
   ContinuationLayout layout_;

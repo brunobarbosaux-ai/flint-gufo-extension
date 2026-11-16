@@ -139,6 +139,15 @@ struct DflashForward::Impl {
   std::vector<float*> injected_k, injected_v;
   std::uint32_t history_capacity{0};
   std::uint32_t injected_context_len{0};
+  /// First position whose K/V is present; rows before it were skipped.
+  std::uint32_t context_floor{0};
+  /// The attention window at `position`, shrunk so that skipped rows (before
+  /// context_floor) fall outside it.
+  [[nodiscard]] std::uint32_t AttentionWindow(std::uint32_t position) const {
+    const std::uint32_t reach =
+        position + 1 - std::min(position + 1, context_floor);
+    return std::max<std::uint32_t>(1, std::min(config.sliding_window, reach));
+  }
 
   ~Impl() {
     if (stream != nullptr)
@@ -546,7 +555,15 @@ std::uint32_t DflashForward::ContextLength() const noexcept {
   return impl_->injected_context_len;
 }
 
+void DflashForward::SkipContextTo(std::uint32_t position) noexcept {
+  if (position <= impl_->injected_context_len)
+    return;
+  impl_->injected_context_len = position;
+  impl_->context_floor = position;
+}
+
 void DflashForward::ResetContext() noexcept {
+  impl_->context_floor = 0;
   impl_->injected_context_len = 0;
 }
 
@@ -791,7 +808,8 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
     LaunchDFlashNonCausalAttention(
         s.query, s.injected_k[i], s.injected_v[i], s.key, s.value, s.attention,
         position, std::min(position, s.injected_context_len), rows,
-        c.sliding_window, c.num_attention_heads, c.num_key_value_heads, head_dim,
+        s.AttentionWindow(position), c.num_attention_heads,
+        c.num_key_value_heads, head_dim,
         scale, s.stream, s.history_capacity);
     stage("attention", s.attention, query);
 

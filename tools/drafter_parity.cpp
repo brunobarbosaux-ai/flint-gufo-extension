@@ -38,6 +38,8 @@
 //                           (0) writes one-hot probabilities, which the
 //                           harness's sampling checks cannot verify.
 //     --text TEXT           prompt text (default: a fixed paragraph)
+//     --text-file PATH      prompt text from a file; a repeated prompt makes
+//                           acceptance meaningless, so measure on real content
 //     --target-layer TAP    repeatable; overrides the artifact's taps
 //     --head native|reference  see above (default native)
 
@@ -96,6 +98,8 @@ struct Options {
   std::uint32_t draft_count{0};  // 0 means block_size - 1
   float temperature{0.8F};
   std::vector<std::uint32_t> taps;
+  /// Non-zero switches from "dump one block" to "measure acceptance".
+  std::uint32_t accept_tokens{0};
 };
 
 [[nodiscard]] std::uint32_t ParseUint(const char* value, const char* flag) {
@@ -128,6 +132,13 @@ struct Options {
       options.out = next("--out");
     } else if (arg == "--text") {
       options.text = next("--text");
+    } else if (arg == "--text-file") {
+      std::ifstream file(next("--text-file"), std::ios::binary);
+      if (!file)
+        Fail(std::string("cannot read ") + argv[i]);
+      std::ostringstream buffer;
+      buffer << file.rdbuf();
+      options.text = buffer.str();
     } else if (arg == "--head") {
       options.head = next("--head");
     } else if (arg == "--position") {
@@ -137,6 +148,8 @@ struct Options {
     } else if (arg == "--temperature") {
       options.temperature =
           std::stof(std::string(next("--temperature")));
+    } else if (arg == "--accept") {
+      options.accept_tokens = ParseUint(next("--accept"), "--accept");
     } else if (arg == "--target-layer") {
       options.taps.push_back(
           ParseUint(next("--target-layer"), "--target-layer"));
@@ -151,14 +164,16 @@ struct Options {
     Fail("usage: flint_drafter_parity TARGET.gguf DRAFT.gguf --out DIR");
   options.target = positional[0];
   options.draft = positional[1];
-  if (options.out.empty())
-    Fail("--out is required: it is where the trace directory is written");
+  if (options.out.empty() && options.accept_tokens == 0)
+    Fail("--out is required unless --accept is given");
   if (options.head != "native" && options.head != "reference")
     Fail("--head must be 'native' or 'reference'");
   if (options.position == 0)
     Fail("--position must be at least one row");
   if (options.temperature < 0.0F)
     Fail("--temperature must not be negative");
+  if (options.accept_tokens != 0 && options.temperature != 0.0F)
+    Fail("--accept measures greedy acceptance; use --temperature 0");
   return options;
 }
 
@@ -237,12 +252,14 @@ struct Target {
 [[nodiscard]] std::vector<std::int32_t> PromptTokens(
     const gufo::vendor::qwen::tokenization::QwenTokenizer& tokenizer,
     const std::string& text, std::uint32_t count) {
-  const auto pool = tokenizer.Encode(
-      text + " " + std::string(kDefaultText) +
-      " The residuals, the mask rows and the anchor are all fixed so two runs "
-      "of this tool describe the same block.");
+  const auto pool = tokenizer.Encode(text);
   if (pool.empty())
     Fail("prompt produced no tokens");
+  if (pool.size() < count)
+    std::cerr << "warning: prompt text is only " << pool.size()
+              << " tokens; the " << count
+              << " asked for repeat it, and a repeated prompt inflates\n"
+                 "         acceptance because the continuation is predictable\n";
   std::vector<std::int32_t> ids(count);
   for (std::uint32_t i = 0; i < count; ++i)
     ids[i] = static_cast<std::int32_t>(pool[i % pool.size()]);
@@ -414,6 +431,130 @@ struct Target {
   return draws;
 }
 
+/// One row of the acceptance table.
+struct AcceptanceRow {
+  std::size_t drafted{0};
+  std::size_t accepted{0};
+};
+
+/// Greedy speculative acceptance: draft a block, verify it in one target pass,
+/// keep the leading proposals the target's own argmax agrees with, and continue
+/// from the first disagreement. This is the same commit rule the runner will
+/// use, so the number it reports is the ratio the cycle would get -- measured
+/// without the runner.
+[[nodiscard]] int MeasureAcceptance(
+    flint::Session& session, dflash::DflashForward& forward,
+    const dflash::DflashConfig& config, const std::vector<std::uint32_t>& taps,
+    std::uint32_t hidden, std::uint32_t draft_count, std::uint32_t prefill,
+    std::uint32_t budget, const std::string& head_route) {
+  std::string error;
+  const std::size_t feature_row = std::size_t{taps.size()} * hidden;
+  std::vector<float> features;
+  std::uint32_t injected = 0;
+
+  // The drafter reads the target's residuals up to the position it drafts at.
+  const auto append_context_to = [&](std::uint32_t position) {
+    if (position == injected)
+      return;
+    features.resize(std::size_t{position - injected} * feature_row);
+    for (std::uint32_t r = injected; r < position; ++r) {
+      for (std::size_t t = 0; t < taps.size(); ++t) {
+        const auto captured = session.CapturedHidden(r, t);
+        if (captured.size() != hidden)
+          Fail("residual for row " + std::to_string(r) +
+               " is not in the ring; lower --position or --accept");
+        std::memcpy(features.data() +
+                        (std::size_t{r - injected} * taps.size() + t) * hidden,
+                    captured.data(), hidden * sizeof(float));
+      }
+    }
+    if (!forward.AppendContext(features, injected, position - injected, &error))
+      Fail("context injection: " + error);
+    injected = position;
+  };
+
+  const auto argmax = [](std::span<const float> logits) {
+    if (logits.empty())
+      Fail("target produced no logits");
+    return static_cast<std::uint32_t>(
+        std::distance(logits.begin(),
+                      std::max_element(logits.begin(), logits.end())));
+  };
+
+  std::uint32_t position = prefill;
+  std::uint32_t anchor = argmax(session.Logits());
+  std::vector<AcceptanceRow> rows(draft_count);
+  std::size_t cycles = 0;
+  std::size_t emitted = 0;
+  std::size_t accepted_total = 0;
+
+  while (emitted < budget) {
+    if (position + draft_count + 1 > session.Capacity())
+      break;
+    append_context_to(position);
+    dflash::DflashDraft draft;
+    if (!forward.Run(anchor, position, draft_count, 0.0F, {}, {}, &draft,
+                     &error))
+      Fail("draft block: " + error);
+    std::vector<std::int32_t> batch(draft_count + 1);
+    batch[0] = static_cast<std::int32_t>(anchor);
+    for (std::uint32_t i = 0; i < draft_count; ++i)
+      batch[i + 1] = static_cast<std::int32_t>(draft.tokens[i]);
+    if (!session.AppendAll(batch, &error))
+      Fail("verify pass: " + error);
+
+    std::uint32_t accepted = 0;
+    while (accepted < draft_count &&
+           argmax(session.Logits(accepted)) == draft.tokens[accepted]) {
+      ++accepted;
+    }
+    for (std::uint32_t i = 0; i < draft_count; ++i) {
+      ++rows[i].drafted;
+      if (i < accepted)
+        ++rows[i].accepted;
+    }
+    // Row `accepted` is the token that replaces the first disagreement (or the
+    // free token after a fully accepted block); it becomes the next anchor.
+    const std::uint32_t bonus = argmax(session.Logits(accepted));
+    accepted_total += accepted;
+    ++cycles;
+    emitted += accepted + 1;
+    position += accepted + 1;
+    anchor = bonus;
+    session.Rewind(position);
+  }
+
+  if (cycles == 0)
+    Fail("no cycle ran; the context is too small for one block");
+
+  std::cout << "| quantity | value |\n| :-- | --: |\n"
+            << "| prefill rows | " << prefill << " |\n"
+            << "| proposals per block | " << draft_count << " |\n"
+            << "| cycles | " << cycles << " |\n"
+            << "| tokens emitted | " << emitted << " |\n"
+            << "| accepted drafts | " << accepted_total << " |\n"
+            << "| acceptance | "
+            << 100.0 * double{accepted_total} / (double{cycles} * draft_count)
+            << "% |\n"
+            << "| tokens per cycle | " << (double{emitted} / double{cycles})
+            << " |\n"
+            << "| head route | " << head_route << " |\n\n"
+            << "| proposal | drafted | accepted | acceptance |\n"
+            << "| --: | --: | --: | --: |\n";
+  for (std::uint32_t i = 0; i < draft_count; ++i) {
+    const auto& row = rows[i];
+    std::cout << "| " << i << " | " << row.drafted << " | " << row.accepted
+              << " | "
+              << (row.drafted == 0 ? 0.0
+                                   : 100.0 * double{row.accepted} /
+                                         double{row.drafted})
+              << "% |\n";
+  }
+  std::cout << "\nacceptance is `P(the target's greedy token equals the draft)`"
+               " -- distribution overlap, not the min(1, p/q) rate.\n";
+  return 0;
+}
+
 [[nodiscard]] int Run(const Options& options) {
   const Target target = LoadTarget(options.target);
   const model::Config& config = target.model->config();
@@ -446,7 +587,7 @@ struct Target {
   const auto taps = options.taps.empty() ? draft_config.target_layer_ids
                                          : options.taps;
   const std::uint32_t context = std::max<std::uint32_t>(
-      options.position + draft_config.block_size + 16U,
+      options.position + options.accept_tokens + draft_config.block_size + 16U,
       flint::Session::kHiddenRingRows);
   auto session = target.model->CreateSession(context, &error);
   if (session == nullptr)
@@ -485,17 +626,25 @@ struct Target {
       .output = tied.output,
       .output_type = tied.output_type};
 
+  const std::uint32_t draft_count =
+      std::min(options.draft_count == 0 ? draft_config.block_size - 1U
+                                        : options.draft_count,
+               draft_config.block_size - 1U);
+
   auto forward = dflash::DflashForward::Create(
-      *weights, borrowed, options.position + draft_config.block_size, &error,
+      *weights, borrowed,
+      options.position + options.accept_tokens + draft_config.block_size,
+      &error,
       options.head == "reference" ? dflash::DflashHeadRoute::kFp32
                                   : dflash::DflashHeadRoute::kNative);
   if (forward == nullptr)
     Fail("drafter forward: " + error);
 
-  const std::uint32_t draft_count =
-      std::min(options.draft_count == 0 ? draft_config.block_size - 1U
-                                        : options.draft_count,
-               draft_config.block_size - 1U);
+  if (options.accept_tokens != 0) {
+    return MeasureAcceptance(*session, *forward, draft_config, taps,
+                             config.hidden_size, draft_count, options.position,
+                             options.accept_tokens, options.head);
+  }
 
   TraceDir trace(options.out);
   const auto hook = [&](std::string_view name, const float* data,

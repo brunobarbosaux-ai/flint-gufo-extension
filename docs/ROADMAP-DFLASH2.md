@@ -23,6 +23,7 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | verify rows bit-identical to decode | **yes**, 256/256 at 0/8k/32k/131k (`FLINT_CHECK_ROWS`) |
 | verify cost, width 8 | 2.21 / 2.48 / 3.16 / 4.25 at 0 / 8k / 32k / 131k |
 | acceptance (oracle, `p_min=0.5`) | 51.1% — code 50.0, JSON 62.8, prose 41.9 |
+| acceptance (extension, greedy, 7 proposals) | **measured** — C++ source 30.7% / 3.15 tokens per cycle, markdown 17.6% / 2.23; first-proposal 65% / 60% sits in the oracle's band, and 2.2-3.2 tokens at a 2.21 verify ratio is the ~1.3x the gate predicted. Q6_K costs 0.2-0.3 points |
 | hidden capture (engine) | **done** — 5 taps x 2048 rows, rows bit-identical to single-token decode at widths 1-8, 0.3-1.7% of a decode step (`FLINT_CHECK_HIDDEN`) |
 | drafter artifact contract | **verified** — 81 tensors / 315.3 MiB, taps `[6,16,27,37,47]`→`[5,15,26,36,46]`, identical inventory in Q6_K/BF16/Q4_K_M/Q8_0 (`flint_drafter_probe`); the export has **no rotary metadata** (fall back to head_dim) and Q5_K_M stores Q5_K, which the loader rejects |
 | drafter quant | Q6_K (336 MB) |

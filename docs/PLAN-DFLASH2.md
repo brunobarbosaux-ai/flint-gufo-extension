@@ -125,9 +125,10 @@ be silently wrong. This is the property Step 0.5 bought.
 Acceptance is `P(the target's own draw equals the draft)`, i.e. distribution
 overlap — not the `min(1, p/q)` rate proper speculative sampling achieves:
 
-| settings | tokens/cycle (est.) | where it lands |
+| settings | tokens/cycle | where it lands |
 | :-- | --: | :-- |
-| temperature 0 | ~2.9 (measured, 51.1%) | the 1.4-1.5x column |
+| temperature 0, markdown prose | 2.23 (17.6% acceptance) | ~1.0-1.1x |
+| temperature 0, C++ source | 3.15 (30.7% acceptance) | ~1.3x on the 2.21 verify ratio |
 | temperature 0.6-0.8 | ~1.6-1.9 | ~1.1-1.2x |
 | high temperature / flat | ~1.1 | controller drafts 1-2, near-neutral |
 
@@ -425,11 +426,34 @@ target's Q8_0 head the way every decode does and lands `logits` at that head's
 own quantisation floor (2.7e-3), which is the right arithmetic for acceptance
 and the wrong one for an fp32 stage gate.
 
-### M1b level 3 — acceptance  **[next]**
-- Greedy acceptance on the 12-prompt set, within +-3 points of the 51.1%
-  oracle figure, for both artifacts. Q6_K's 1-2e-2 block perturbation is the
-  thing this measures: at 336 MB it is the shipped candidate, and BF16 at
-  810 MB is the exact one.
+### M1b level 3 — acceptance  **[measured offline; runner cycle still open]**
+`flint_drafter_parity --accept N` runs the commit rule the runner will use,
+without the runner: draft a block, verify it in one target pass, keep the
+leading proposals the target's own greedy token agrees with, continue from the
+first disagreement, and rewind. Two pieces of real content, 1024 rows of prefill
+and 512 target tokens each:
+
+| prompt | drafter | acceptance | tokens/cycle | first proposal |
+| :-- | :-- | --: | --: | --: |
+| `docs/PLAN-DFLASH2.md` (markdown) | BF16 | 17.6% | 2.23 | 60.4% |
+| `docs/PLAN-DFLASH2.md` (markdown) | Q6_K | 17.4% | 2.22 | 59.3% |
+| `src/gpu/dflash/dflash_forward.cpp` | BF16 | 30.7% | 3.15 | 65.2% |
+| `src/gpu/dflash/dflash_forward.cpp` | Q6_K | 30.4% | 3.13 | 64.2% |
+
+The per-row curve is the shape a diffusion block should have: first proposal
+60-65%, then roughly halving per row (30/16/8/4/2/1% on prose). The oracle's
+51.1% figure lands in the same band as the first-proposal rates here, and the
+resulting 2.2-3.2 tokens/cycle at a 2.21 verify ratio is the ~1.3x the gate
+predicted -- the win is real on code and marginal on prose.
+
+**Q6_K costs 0.2-0.3 points of acceptance and 0.6% of tokens per cycle**, not
+the 1-2e-2 per-stage difference the parity run shows: a block that is 1% off in
+logit space still picks the same greedy token almost always. So the 336 MB
+artifact is the shipped one, and BF16 stays available as the exact reference.
+
+The remaining piece of level 3 is the same measurement through the runner's
+real cycle (M2/M3), which also exercises the sampler-as-black-box commit path
+rather than this driver's argmax.
 
 ### M2 — Target adapter (1-1.5 d)
 - Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row

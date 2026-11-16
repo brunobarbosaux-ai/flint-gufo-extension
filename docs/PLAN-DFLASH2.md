@@ -11,15 +11,18 @@ traffic, or a particular sampling configuration.
 
 | depth | plain decode | greedy (temp 0) | sampled (temp >= 0.6) |
 | --: | --: | --: | --: |
-| 0 | 71 t/s | ~1.4-1.5x | ~1.1-1.2x |
-| 8k | 63 t/s | ~1.3-1.4x | ~1.05-1.15x |
-| 32k | 50 t/s | ~1.1-1.2x | ~1.0x |
-| 131k | 28 t/s | ~1.0x | ~1.0x |
+| 0 | 71 t/s | 1.2-1.5x | ~1.1-1.2x |
+| 8k | 63 t/s | 1.1-1.35x | ~1.05-1.15x |
+| 32k | 50 t/s | 0.8-1.1x | ~1.0x |
+| 131k | 28 t/s | 0.6-0.8x | ~1.0x |
 
 Best content is code and JSON; prose is ~0.2x lower in every column. The greedy
-column is an upper bound — it is the one measured on the oracle (51.1%
-acceptance). The sampled column is estimated from distribution overlap and must
-be **measured** in M3, because it is the common case for a generic extension.
+column is the one measured end to end (M1c): the oracle at `p_min 0` accepts
+29.5% pooled (mean len 3.04) and the extension matches it (29.3% / 3.05). The
+51.1% figure quoted earlier is the oracle at `p_min 0.5` with 3.69 drafts per
+cycle — a different workload, not comparable to a `p_min 0` mean len. The
+sampled column is estimated from distribution overlap and must be **measured**
+in M3, because it is the common case for a generic extension.
 
 The 2x gate this project started with is not reachable on this engine, and the
 reasons are measured rather than assumed: verify rows genuinely route to
@@ -48,10 +51,13 @@ Done and committed:
   131k.
 - Drafter quant chosen: **Q6_K** (336 MB; BF16 811 MB, Q4_K_M 240 MB). All five
   quants are in `/home/bruno/AI/GGUF/mtp/`.
-- Oracle acceptance (llama.cpp b11804, `--spec-type draft-dflash`,
-  `--draft-p-min 0.5`, 12 greedy prompts, 192 tokens): **51.1%**
-  (1506/2947) — code 50.0%, JSON 62.8%, prose 41.9%; 3.69 drafts and 2.89
-  accepted tokens per cycle. At `p_min=0`: 33.5%.
+- Oracle acceptance (llama.cpp b11804, `--spec-type draft-dflash`, 12 greedy
+  prompts, 192 tokens): **51.1%** at `--draft-p-min 0.5` (1506/2947) — code
+  50.0%, JSON 62.8%, prose 41.9%; 3.69 drafts and 2.89 accepted tokens per
+  cycle. That is a `p_min 0.5` figure and is not comparable to a `p_min 0`
+  mean len. The comparable baseline is `p_min 0` (M1c, shared workload):
+  **29.5% pooled, mean len 3.04** — code 33.9%/3.35, JSON 34.1%/3.34, prose
+  24.5%/2.69, continuation 27.6%/2.93.
 - Bench tooling: `FLINT_BENCH_VERIFY`, `FLINT_CHECK_ROWS` (1 invariance, 2
   reversed order, 3 tail dependence), `FLINT_PROFILE`, `FLINT_NO_GRAPH`,
   `FLINT_DEBUG_ATTN`.
@@ -123,14 +129,23 @@ be silently wrong. This is the property Step 0.5 bought.
 ### 3.4 Expected acceptance
 
 Acceptance is `P(the target's own draw equals the draft)`, i.e. distribution
-overlap — not the `min(1, p/q)` rate proper speculative sampling achieves:
+overlap — not the `min(1, p/q)` rate proper speculative sampling achieves.
+Measured on the shared workload (M1c, forced stream, BF16 drafter): pooled mean
+len 3.05, code 3.35, JSON 3.38, prose 2.66. Speedup is `mean_len / verify
+ratio`, with the measured width-8 ratios 2.21 / 2.48 / 3.16 / 4.25 at 0 / 8k /
+32k / 131k:
 
-| settings | tokens/cycle | where it lands |
-| :-- | --: | :-- |
-| temperature 0, markdown prose | 2.23 (17.6% acceptance) | ~1.0-1.1x |
-| temperature 0, C++ source | 3.15 (30.7% acceptance) | ~1.3x on the 2.21 verify ratio |
-| temperature 0.6-0.8 | ~1.6-1.9 | ~1.1-1.2x |
-| high temperature / flat | ~1.1 | controller drafts 1-2, near-neutral |
+| depth | verify ratio | code | JSON | prose |
+| --: | --: | --: | --: | --: |
+| 0 | 2.21 | 1.51x | 1.53x | 1.20x |
+| 8k | 2.48 | 1.35x | 1.36x | 1.07x |
+| 32k | 3.16 | 1.06x | 1.07x | 0.84x |
+| 131k | 4.25 | 0.79x | 0.79x | 0.63x |
+
+Past 32k the verify ratio outruns the mean len, so a fixed 7-proposal block is
+a net slowdown there; the adaptive controller must draft fewer rows (M4). At
+temperature 0.6-0.8 the mean len is lower still (~1.6-1.9 estimated), and at
+high temperature the controller drafts 1-2 rows to stay near-neutral.
 
 Rejection sampling with the draft's `q` would raise the middle row, but it needs
 the *transformed* target distribution (after penalties and constraint masking)
@@ -426,30 +441,40 @@ target's Q8_0 head the way every decode does and lands `logits` at that head's
 own quantisation floor (2.7e-3), which is the right arithmetic for acceptance
 and the wrong one for an fp32 stage gate.
 
-### M1b level 3 — acceptance  **[measured offline; runner cycle still open]**
-`flint_drafter_parity --accept N` runs the commit rule the runner will use,
-without the runner: draft a block, verify it in one target pass, keep the
-leading proposals the target's own greedy token agrees with, continue from the
-first disagreement, and rewind. Two pieces of real content, 1024 rows of prefill
-and 512 target tokens each:
+### M1c — acceptance against the oracle  **[done]**
 
-| prompt | drafter | acceptance | tokens/cycle | first proposal |
-| :-- | :-- | --: | --: | --: |
-| `docs/PLAN-DFLASH2.md` (markdown) | BF16 | 17.6% | 2.23 | 60.4% |
-| `docs/PLAN-DFLASH2.md` (markdown) | Q6_K | 17.4% | 2.22 | 59.3% |
-| `src/gpu/dflash/dflash_forward.cpp` | BF16 | 30.7% | 3.15 | 65.2% |
-| `src/gpu/dflash/dflash_forward.cpp` | Q6_K | 30.4% | 3.13 | 64.2% |
+M1c closed the acceptance question against the oracle and replaced M1b's
+single-position parity check with three levels, run by
+`tools/drafter_gate.sh` (see `docs/REPORT-M1C.md`).
+
+| level | check | result |
+| :-- | :-- | :-- |
+| 1 (BF16 vs upstream) | reference harness on 20 positions 64..4500, `--head reference` | **20/20 pass** — worst stage 6.0e-5 against the 1e-4 gate |
+| 2 (Q6_K vs BF16) | greedy proposals identical, native head | **125/140 (89.3%)** — below the 95% gate; the Q6_K selector codebooks are quantised and the argmax flips at long context |
+| 3 (acceptance) | forced stream vs the oracle at `p_min 0` | **pass** — pooled mean len 3.05 (BF16) / 3.06 (Q6_K) vs oracle 3.04 |
+
+The 20-position sweep found two bugs the single-position check could not: the
+harness config omitted the top-level `use_sliding_window`/`sliding_window`, so
+the reference ran unwindowed past 2048 rows; and the traced context skipped the
+rows the ring overwrites, leaving early trace rows uninitialised.
+
+Acceptance on the shared workload (forced stream, BF16 drafter, vs the oracle
+at `p_min 0`):
+
+| category | oracle acc / mean len | ours stream acc / mean len | delta mean len |
+| :-- | --: | --: | --: |
+| code | 33.9% / 3.35 | 33.5% / 3.35 | -0.00 |
+| JSON | 34.1% / 3.34 | 34.0% / 3.38 | +0.04 |
+| prose | 24.5% / 2.69 | 23.7% / 2.66 | -0.03 |
+| continuation | 27.6% / 2.93 | 28.1% / 2.97 | +0.04 |
+| pooled | 29.5% / 3.04 | 29.3% / 3.05 | +0.01 |
 
 The per-row curve is the shape a diffusion block should have: first proposal
-60-65%, then roughly halving per row (30/16/8/4/2/1% on prose). The oracle's
-51.1% figure lands in the same band as the first-proposal rates here, and the
-resulting 2.2-3.2 tokens/cycle at a 2.21 verify ratio is the ~1.3x the gate
-predicted -- the win is real on code and marginal on prose.
-
-**Q6_K costs 0.2-0.3 points of acceptance and 0.6% of tokens per cycle**, not
-the 1-2e-2 per-stage difference the parity run shows: a block that is 1% off in
-logit space still picks the same greedy token almost always. So the 336 MB
-artifact is the shipped one, and BF16 stays available as the exact reference.
+69%, then roughly halving per row (46/30/23/17/13/11% pooled chat). Q6_K costs
+0.01 mean len, not the 1-2e-2 per-stage difference the parity run shows: a block
+that is 1% off in logit space still picks the same greedy token almost always.
+So the 336 MB artifact is the shipped one, and BF16 stays available as the exact
+reference.
 
 The remaining piece of level 3 is the same measurement through the runner's
 real cycle (M2/M3), which also exercises the sampler-as-black-box commit path

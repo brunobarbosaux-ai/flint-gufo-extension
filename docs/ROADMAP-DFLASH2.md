@@ -22,8 +22,11 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | :-- | :-- |
 | verify rows bit-identical to decode | **yes**, 256/256 at 0/8k/32k/131k (`FLINT_CHECK_ROWS`) |
 | verify cost, width 8 | 2.21 / 2.48 / 3.16 / 4.25 at 0 / 8k / 32k / 131k |
-| acceptance (oracle, `p_min=0.5`) | 51.1% — code 50.0, JSON 62.8, prose 41.9 |
-| acceptance (extension, greedy, 7 proposals) | **measured** — C++ source 30.7% / 3.15 tokens per cycle, markdown 17.6% / 2.23; first-proposal 65% / 60% sits in the oracle's band, and 2.2-3.2 tokens at a 2.21 verify ratio is the ~1.3x the gate predicted. Q6_K costs 0.2-0.3 points |
+| acceptance (oracle, `p_min=0.5`) | 51.1% — code 50.0, JSON 62.8, prose 41.9; a `p_min 0.5` figure with 3.69 drafts/cycle, not comparable to a `p_min 0` mean len |
+| acceptance (oracle, `p_min=0`) | 29.5% pooled / mean len 3.04 — code 33.9/3.35, JSON 34.1/3.34, prose 24.5/2.69, continuation 27.6/2.93 (M1c shared workload) |
+| acceptance (extension, forced stream) | **matches the oracle** — pooled 29.3% / 3.05 (BF16), 29.4% / 3.06 (Q6_K); every category within 0.04 mean len. Speedup `mean_len / ratio`: 1.5x code at depth 0, 1.35x at 8k, 1.06x at 32k, 0.79x at 131k |
+| parity (BF16 vs upstream, 20 positions) | **20/20 pass** — worst stage 6.0e-5 against the 1e-4 gate (M1c) |
+| parity (Q6_K vs BF16 greedy) | 125/140 (89.3%) — below the 95% gate; quantised selector codebooks flip the argmax at long context |
 | hidden capture (engine) | **done** — 5 taps x 2048 rows, rows bit-identical to single-token decode at widths 1-8, 0.3-1.7% of a decode step (`FLINT_CHECK_HIDDEN`) |
 | drafter artifact contract | **verified** — 81 tensors / 315.3 MiB, taps `[6,16,27,37,47]`→`[5,15,26,36,46]`, identical inventory in Q6_K/BF16/Q4_K_M/Q8_0 (`flint_drafter_probe`); the export has **no rotary metadata** (fall back to head_dim) and Q5_K_M stores Q5_K, which the loader rejects |
 | drafter quant | Q6_K (336 MB) |

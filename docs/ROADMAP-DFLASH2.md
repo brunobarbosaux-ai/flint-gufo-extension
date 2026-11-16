@@ -28,6 +28,8 @@ does without speculation; the sampler is never reimplemented. Execution plan:
 | drafter quant | Q6_K (336 MB) |
 | drafter forward (extension) | **done** — `src/gpu/dflash/dflash_forward.cpp`, single-request block + context injection on the engine's own projection routes; `flint.dflash_forward` covers wiring on synthetic weights |
 | drafter loader (extension) | **done** — `src/gpu/dflash/dflash_weights.cpp`, rotary-dim fallback and Q5_K support; probe and loader agree on all five quants (`--loader`) |
+| drafter parity vs oracle (BF16) | **passes** — 89 traced stages, worst drafter-owned stage 4.71e-6 against a 1e-4 gate, candidate sets 7/7, proposal TV 6.8e-6 (`flint_drafter_parity` + `tools/qwen27b/dflash_reference.py`) |
+| drafter parity vs oracle (Q6_K) | **quantisation floor** — 1-2.4e-2 per stage, candidate sets 5/7, TV 2.0e-2: the decode route rounds activations to int8 and the block weights to Q6_K, which an fp32 reference cannot match; `logits` on a reference head is still 7.7e-7, so the block wiring is exact |
 | drafter kernels (extension) | **done** — `src/gpu/dflash`, vendored verbatim (namespace + includes only), `flint.dflash_ops` covers conv/SiLU-mul/attention/selector/gather/BF16->Q8_0 against host references |
 | drafter code | **none in the extension.** The forward is vendored-ready in-tree: `QwenDFlashConfig` is file-driven and the loader handles Q6_K, so M1a is an adoption probe, not a rewrite |
 

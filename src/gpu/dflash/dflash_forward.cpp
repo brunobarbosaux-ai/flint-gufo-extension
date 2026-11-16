@@ -32,8 +32,6 @@ namespace vq = ::gufo::vendor::quant;
 /// Rows the routed projection accepts per launch (the engine's kVecBatch).
 constexpr std::uint32_t kVecRows = 8;
 
-/// The in-tree executor's RMSNorm epsilon for every draft norm.
-constexpr float kNormEps = 1e-6F;
 /// Rows one block ever holds: the anchor plus `block_size - 1` proposals. The
 /// artifact's block size is 8, and the projections below run in groups of eight.
 constexpr std::uint32_t kMaxRows = 8;
@@ -102,6 +100,10 @@ struct DflashForward::Impl {
   /// while injection runs in 256-row chunks.
   float *context_features{nullptr}, *ctx_hidden{nullptr}, *ctx_normed{nullptr};
   float *ctx_key{nullptr}, *ctx_value{nullptr};
+  /// Traced context stages, sized for every row at once. Null unless a trace
+  /// was requested; only the parity harness asks for them.
+  float* trace_normed{nullptr};
+  std::vector<float*> trace_key, trace_value;
   float *confidences{nullptr}, *probabilities{nullptr}, *uniforms{nullptr};
   float *partial_scores{nullptr};
   std::uint32_t *tokens{nullptr}, *candidates{nullptr}, *partial_ids{nullptr};
@@ -110,6 +112,27 @@ struct DflashForward::Impl {
   /// to behave as a dense one.
   std::int32_t* zero_ids{nullptr};
   std::string project_error;
+
+  /// Host staging for traced stages. The trace callback is handed host memory,
+  /// as in the in-tree executor: the stage lives in device memory, and reading
+  /// it from the host is not what a device pointer means.
+  ///
+  /// The copy is ordered on this block's own stream. A blocking hipMemcpy on
+  /// the null stream would not be: `stream` is created non-blocking, so it is
+  /// not implicitly synchronized with the null stream, and a dump could then
+  /// read a buffer the launch had not written yet.
+  std::vector<float> trace_host;
+  void Emit(const DflashTrace& trace, std::string_view name, const float* device,
+            std::size_t count) {
+    if (!trace)
+      return;
+    trace_host.resize(count);
+    Check(hipMemcpyAsync(trace_host.data(), device, count * sizeof(float),
+                         hipMemcpyDeviceToHost, stream),
+          nullptr, "trace copy failed");
+    Check(hipStreamSynchronize(stream), nullptr, "trace synchronize failed");
+    trace(name, trace_host.data(), count);
+  }
   std::vector<void*> allocations;
 
   // Injected target context: one K/V ring per draft layer.
@@ -142,8 +165,14 @@ struct DflashForward::Impl {
   /// Uploads one weight row-major with `cols` elements per row. Types the draft
   /// GEMM tier reads stay packed; everything else (Q5_K) is host-dequantized to
   /// BF16, which costs device memory but keeps drafting correct.
+  ///
+  /// `force_bf16` widens every artifact type, including the native ones. The
+  /// selector codebooks need it: the selector kernel reads them as BF16
+  /// unconditionally, so an artifact that stores them Q6_K (or Q8_0) has to be
+  /// widened here or the kernel reads quant blocks as half floats.
   [[nodiscard]] bool Upload(const DflashTensor& source, std::uint32_t cols,
-                            DeviceWeight* destination, std::string* error_msg) {
+                            DeviceWeight* destination, std::string* error_msg,
+                            bool force_bf16 = false) {
     if (source.empty() || cols == 0) {
       SetError(error_msg, "DFlash2 drafter tensor is missing");
       return false;
@@ -153,7 +182,7 @@ struct DflashForward::Impl {
       SetError(error_msg, "DFlash2 drafter tensor has an invalid shape");
       return false;
     }
-    if (IsNativeMatrix(source.type)) {
+    if (!force_bf16 && IsNativeMatrix(source.type)) {
       const std::size_t bytes = source.EncodedSizeBytes();
       void* device = Allocate(bytes, error_msg);
       if (device == nullptr)
@@ -219,10 +248,16 @@ struct DflashForward::Impl {
     const std::uint32_t hidden = config.hidden_size;
     const std::uint32_t intermediate = config.intermediate_size;
     const std::uint32_t query = config.AttentionSize();
+    // The injected context projects through K and V over whole 256-row
+    // chunks, the one place the in-tree executor widens these two matrices to
+    // BF16 regardless of the artifact's quant. Mirroring it keeps the context
+    // keys on the same arithmetic as the oracle and costs ~40 MB.
     return UploadVector(source.attn_norm, &layer->attn_norm, error_msg) &&
            Upload(source.attn_q, hidden, &layer->attn_q, error_msg) &&
-           Upload(source.attn_k, hidden, &layer->attn_k, error_msg) &&
-           Upload(source.attn_v, hidden, &layer->attn_v, error_msg) &&
+           Upload(source.attn_k, hidden, &layer->attn_k, error_msg,
+                  /*force_bf16=*/true) &&
+           Upload(source.attn_v, hidden, &layer->attn_v, error_msg,
+                  /*force_bf16=*/true) &&
            Upload(source.attn_output, query, &layer->attn_output, error_msg) &&
            UploadVector(source.attn_q_norm, &layer->attn_q_norm, error_msg) &&
            UploadVector(source.attn_k_norm, &layer->attn_k_norm, error_msg) &&
@@ -284,7 +319,7 @@ struct DflashForward::Impl {
   void Norm(const float* input, const DeviceWeight& gamma, float* output,
             std::uint32_t rows) {
     fk::RmsNormRows(input, static_cast<const float*>(gamma.data), output, rows,
-                    config.hidden_size, 1, kNormEps, stream);
+                    config.hidden_size, 1, config.rms_norm_eps, stream);
   }
 
   /// Per-head RMSNorm on Q and K, then NEOX rotary at `position`.
@@ -293,10 +328,10 @@ struct DflashForward::Impl {
     const std::uint32_t head_dim = config.head_dim;
     fk::RmsNormRows(query, static_cast<const float*>(layer.attn_q_norm.data),
                     query, rows * config.num_attention_heads, head_dim, 1,
-                    kNormEps, stream);
+                    config.rms_norm_eps, stream);
     fk::RmsNormRows(key, static_cast<const float*>(layer.attn_k_norm.data), key,
-                    rows * config.num_key_value_heads, head_dim, 1, kNormEps,
-                    stream);
+                    rows * config.num_key_value_heads, head_dim, 1,
+                    config.rms_norm_eps, stream);
     Check(hipMemcpyAsync(position_device, &position, sizeof(position),
                          hipMemcpyHostToDevice, stream),
           nullptr, "position upload failed");
@@ -312,8 +347,8 @@ struct DflashForward::Impl {
                       std::uint32_t position) {
     const std::uint32_t head_dim = config.head_dim;
     fk::RmsNormRows(key, static_cast<const float*>(layer.attn_k_norm.data), key,
-                    rows * config.num_key_value_heads, head_dim, 1, kNormEps,
-                    stream);
+                    rows * config.num_key_value_heads, head_dim, 1,
+                    config.rms_norm_eps, stream);
     Check(hipMemcpyAsync(position_device, &position, sizeof(position),
                          hipMemcpyHostToDevice, stream),
           nullptr, "position upload failed");
@@ -361,7 +396,8 @@ DflashForward::~DflashForward() = default;
 
 std::unique_ptr<DflashForward> DflashForward::Create(
     const DflashWeights& weights, const DflashBorrowed& borrowed,
-    std::uint32_t max_context, std::string* error_msg) {
+    std::uint32_t max_context, std::string* error_msg,
+    DflashHeadRoute head_route) {
   auto forward = std::unique_ptr<DflashForward>(new DflashForward());
   Impl& s = *forward->impl_;
   s.config = weights.config;
@@ -410,15 +446,19 @@ std::unique_ptr<DflashForward> DflashForward::Create(
   s.uniforms = s.AllocateFloats(rows, error_msg);
   s.probabilities =
       s.AllocateFloats(std::size_t{rows} * c.selector_top_k, error_msg);
-  s.partial_scores = s.AllocateFloats(
-      DFlashSelectorScratchElements(c.vocab_size), error_msg);
+  // The selector's partial top-k scratch is per row: the batch launcher runs a
+  // grid of (partial blocks, rows) and offsets each row by a full block set.
+  const std::size_t selector_scratch =
+      DFlashSelectorScratchElements(c.vocab_size);
+  s.partial_scores =
+      s.AllocateFloats(std::size_t{rows} * selector_scratch, error_msg);
   s.tokens = static_cast<std::uint32_t*>(
       s.Allocate(std::size_t{rows} * sizeof(std::uint32_t), error_msg));
   s.candidates = static_cast<std::uint32_t*>(
       s.Allocate(std::size_t{rows} * c.selector_top_k * sizeof(std::uint32_t),
                  error_msg));
   s.partial_ids = static_cast<std::uint32_t*>(s.Allocate(
-      DFlashSelectorScratchElements(c.vocab_size) * sizeof(std::uint32_t),
+      std::size_t{rows} * selector_scratch * sizeof(std::uint32_t),
       error_msg));
   s.position_device = static_cast<std::uint32_t*>(
       s.Allocate(sizeof(std::uint32_t), error_msg));
@@ -445,13 +485,18 @@ std::unique_ptr<DflashForward> DflashForward::Create(
   bool ok =
       s.UploadVector(weights.fc_norm, &s.fc_norm, &error) &&
       s.UploadVector(weights.output_norm, &s.output_norm, &error) &&
-      s.Upload(weights.fc_projection, hidden, &s.fc_projection, &error) &&
-      // The codebooks are [vocab][rank] and read element-wise, so rank is
-      // their row length.
+      // The encoder's row length is the fused feature width, not the hidden
+      // size: `fc.weight` is [hidden, taps * hidden].
+      s.Upload(weights.fc_projection,
+               static_cast<std::uint32_t>(weights.config.target_layer_ids.size()) *
+                   hidden,
+               &s.fc_projection, &error) &&
+      // The codebooks are [vocab][rank], read element-wise as BF16 by the
+      // selector kernel, so rank is their row length and BF16 their storage.
       s.Upload(weights.selector_predecessor, c.selector_rank,
-               &s.selector_predecessor, &error) &&
+               &s.selector_predecessor, &error, /*force_bf16=*/true) &&
       s.Upload(weights.selector_successor, c.selector_rank,
-               &s.selector_successor, &error) &&
+               &s.selector_successor, &error, /*force_bf16=*/true) &&
       s.Upload(weights.selector_hidden, hidden, &s.selector_hidden, &error);
   s.layers.resize(c.num_layers);
   for (std::uint32_t i = 0; ok && i < c.num_layers; ++i)
@@ -459,6 +504,36 @@ std::unique_ptr<DflashForward> DflashForward::Create(
   if (!ok) {
     SetError(error_msg, error);
     return nullptr;
+  }
+
+  // The parity route: one F32 copy of the borrowed head, so the head's
+  // arithmetic stops being the comparison's floor. The shipped route keeps the
+  // target's own storage and the engine's projection for it.
+  if (head_route == DflashHeadRoute::kFp32) {
+    std::vector<float> head(std::size_t{c.vocab_size} * hidden);
+    const std::size_t row_bytes =
+        vq::EncodedSizeBytes(borrowed.output_type, hidden);
+    if (row_bytes == 0) {
+      SetError(error_msg, "DFlash2 cannot read the target head's storage type");
+      return nullptr;
+    }
+    const auto* bytes = static_cast<const unsigned char*>(borrowed.output);
+    for (std::uint32_t row = 0; row < c.vocab_size; ++row) {
+      if (!vq::DequantizeRow(borrowed.output_type, bytes + row * row_bytes,
+                             head.data() + std::size_t{row} * hidden, hidden)) {
+        SetError(error_msg, "DFlash2 target head dequantization failed");
+        return nullptr;
+      }
+    }
+    float* device = s.AllocateFloats(head.size(), error_msg);
+    if (device == nullptr)
+      return nullptr;
+    if (hipMemcpy(device, head.data(), head.size() * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      SetError(error_msg, "DFlash2 target head upload failed");
+      return nullptr;
+    }
+    s.output_weight = {device, core::GgmlType::kF32};
   }
   return forward;
 }
@@ -485,7 +560,8 @@ const float* DflashForward::InjectedValue(std::uint32_t layer) const noexcept {
 
 bool DflashForward::AppendContext(std::span<const float> features,
                                   std::uint32_t position, std::uint32_t count,
-                                  std::string* error_msg) {
+                                  std::string* error_msg,
+                                  const DflashTrace& trace) {
   Impl& s = *impl_;
   const DflashConfig& c = s.config;
   const std::uint32_t hidden = c.hidden_size;
@@ -515,6 +591,25 @@ bool DflashForward::AppendContext(std::span<const float> features,
         s.ctx_value == nullptr)
       return false;
   }
+  // A traced run dumps the whole context as one tensor per stage, the way the
+  // oracle records it, so the encoder output and each layer's injected K and V
+  // get a contiguous buffer sized for every row. Untraced runs allocate none of
+  // this: the parity harness is the only consumer.
+  if (trace) {
+    s.trace_normed = s.AllocateFloats(std::size_t{count} * hidden, error_msg);
+    s.trace_key.resize(c.num_layers);
+    s.trace_value.resize(c.num_layers);
+    for (std::uint32_t i = 0; i < c.num_layers; ++i) {
+      s.trace_key[i] = s.AllocateFloats(std::size_t{count} * kv, error_msg);
+      s.trace_value[i] = s.AllocateFloats(std::size_t{count} * kv, error_msg);
+    }
+    if (s.trace_normed == nullptr)
+      return false;
+    for (std::uint32_t i = 0; i < c.num_layers; ++i) {
+      if (s.trace_key[i] == nullptr || s.trace_value[i] == nullptr)
+        return false;
+    }
+  }
   // A chunk the ring would overwrite before anything reads it is skipped; the
   // surviving rows keep their absolute positions and batch boundaries.
   const auto expired = count > s.history_capacity ? count - s.history_capacity
@@ -530,11 +625,29 @@ bool DflashForward::AppendContext(std::span<const float> features,
     s.Project(s.fc_projection, s.context_features, s.ctx_hidden, batch, hidden,
               row);
     s.Norm(s.ctx_hidden, s.fc_norm, s.ctx_normed, batch);
+    if (trace) {
+      Check(hipMemcpyAsync(s.trace_normed + std::size_t{offset} * hidden,
+                           s.ctx_normed, std::size_t{batch} * hidden * sizeof(float),
+                           hipMemcpyDeviceToDevice, s.stream),
+            error_msg, "context trace copy failed");
+    }
     for (std::uint32_t i = 0; i < c.num_layers; ++i) {
       const auto& layer = s.layers[i];
       s.Project(layer.attn_k, s.ctx_normed, s.ctx_key, batch, kv, hidden);
       s.Project(layer.attn_v, s.ctx_normed, s.ctx_value, batch, kv, hidden);
       s.ApplyKNormRope(s.ctx_key, layer, batch, position + offset);
+      if (trace) {
+        Check(hipMemcpyAsync(s.trace_key[i] + std::size_t{offset} * kv,
+                             s.ctx_key,
+                             std::size_t{batch} * kv * sizeof(float),
+                             hipMemcpyDeviceToDevice, s.stream),
+              error_msg, "context trace copy failed");
+        Check(hipMemcpyAsync(s.trace_value[i] + std::size_t{offset} * kv,
+                             s.ctx_value,
+                             std::size_t{batch} * kv * sizeof(float),
+                             hipMemcpyDeviceToDevice, s.stream),
+              error_msg, "context trace copy failed");
+      }
       // Split a write that crosses the physical end of the ring.
       for (std::uint32_t written = 0; written < batch;) {
         const auto slot = (position + offset + written) % s.history_capacity;
@@ -558,6 +671,17 @@ bool DflashForward::AppendContext(std::span<const float> features,
     SetError(error_msg, s.project_error);
     s.project_error.clear();
     return false;
+  }
+  if (trace) {
+    // Stage names match the oracle's: one encoder output and, per layer, the
+    // injected keys after the per-head norm and rotary, and the raw values.
+    s.Emit(trace, "context.0.normalized", s.trace_normed,
+           std::size_t{count} * hidden);
+    for (std::uint32_t i = 0; i < c.num_layers; ++i) {
+      const std::string prefix = "context.0." + std::to_string(i) + ".";
+      s.Emit(trace, prefix + "k", s.trace_key[i], std::size_t{count} * kv);
+      s.Emit(trace, prefix + "v", s.trace_value[i], std::size_t{count} * kv);
+    }
   }
   s.injected_context_len = std::max(s.injected_context_len, position + count);
   return true;
@@ -600,8 +724,7 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
   const std::uint32_t rows = draft_count + 1U;
   const auto emit = [&](std::string_view name, const float* data,
                         std::size_t width, std::uint32_t row_count) {
-    if (trace)
-      trace(name, data, std::size_t{row_count} * width);
+    s.Emit(trace, name, data, std::size_t{row_count} * width);
   };
   const auto emit_block = [&](std::string_view name, const float* data,
                               std::size_t width) {
@@ -630,9 +753,8 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
     const auto& layer = s.layers[i];
     const auto stage = [&](std::string_view name, const float* data,
                            std::size_t width) {
-      if (trace)
-        trace("layer." + std::to_string(i) + "." + std::string(name), data,
-              std::size_t{rows} * width);
+      s.Emit(trace, "layer." + std::to_string(i) + "." + std::string(name),
+             data, std::size_t{rows} * width);
     };
 
     s.Norm(s.hidden, layer.attn_norm, s.normed, rows);

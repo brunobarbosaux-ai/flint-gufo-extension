@@ -56,6 +56,20 @@ using DflashTrace =
     std::function<void(std::string_view name, const float* data,
                        std::size_t count)>;
 
+/// How the drafter reads the head it borrows from the target.
+enum class DflashHeadRoute {
+  /// As stored, on the route the engine uses for that tensor. Flint's head is
+  /// Q8_0, so this quantizes the activation the way every decode does -- which
+  /// is what the drafter should approximate, because the verifier reads the
+  /// same head the same way.
+  kNative,
+  /// Dequantized to F32 once and projected in F32. Only the parity harness
+  /// asks for this: it compares the block against an FP32 reference, and a
+  /// quantized head would put the logits stage at the head's own quantisation
+  /// floor instead of the block's error.
+  kFp32,
+};
+
 /// A drafter resident in device memory, with its own block workspace and the
 /// ring that holds the target context it attends to.
 class DflashForward final {
@@ -66,9 +80,12 @@ class DflashForward final {
 
   /// Uploads `weights` and allocates the context ring for `max_context`
   /// positions (the drafter only ever reads the last `sliding_window`).
+  /// `head_route` selects `kFp32` only for parity runs; it costs a full F32
+  /// copy of the target's head.
   [[nodiscard]] static std::unique_ptr<DflashForward> Create(
       const DflashWeights& weights, const DflashBorrowed& borrowed,
-      std::uint32_t max_context, std::string* error_msg = nullptr);
+      std::uint32_t max_context, std::string* error_msg = nullptr,
+      DflashHeadRoute head_route = DflashHeadRoute::kNative);
 
   const DflashConfig& config() const noexcept;
 
@@ -76,10 +93,15 @@ class DflashForward final {
   /// `count * taps * hidden` floats, row-major by position and then by tap in
   /// the order of `config().target_layer_ids` -- exactly the layout the
   /// drafter's `fc.weight` expects.
+  /// When `trace` is set it also emits `context.0.normalized` and, per layer,
+  /// `context.0.<layer>.k` / `.v` for every appended row — the stages the
+  /// parity harness compares. Tracing allocates buffers for the whole context,
+  /// so it is a diagnostic path, not the shipped one.
   [[nodiscard]] bool AppendContext(std::span<const float> features,
                                    std::uint32_t position,
                                    std::uint32_t count,
-                                   std::string* error_msg = nullptr);
+                                   std::string* error_msg = nullptr,
+                                   const DflashTrace& trace = {});
 
   /// Positions the drafter can attend to: rows appended by AppendContext.
   [[nodiscard]] std::uint32_t ContextLength() const noexcept;

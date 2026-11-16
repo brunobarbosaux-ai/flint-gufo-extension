@@ -173,30 +173,40 @@ void ConvReference(const std::vector<float>& input,
   }
 }
 
-void TestGroupedDynamicConv() {
-  constexpr std::uint32_t kTokens = 6, kHidden = 32, kKernel = 2, kGroup = 4;
-  const auto input = Data(std::size_t{kTokens} * kHidden);
-  const auto dynamic =
-      Data(std::size_t{kTokens} * 2 * kKernel * (kHidden / kGroup));
-  const auto base = Data(std::size_t{2} * kKernel * kHidden);
+void TestGroupedDynamicConvShape(std::uint32_t tokens, std::uint32_t hidden,
+                                 std::uint32_t kernel, std::uint32_t group,
+                                 const char* label) {
+  const auto input = Data(std::size_t{tokens} * hidden);
+  const auto dynamic = Data(std::size_t{tokens} * 2 * kernel * (hidden / group));
+  const auto base = Data(std::size_t{2} * kernel * hidden);
 
-  Dev<float> in(input.size()), dyn(dynamic.size()), kernel(base.size()),
-      out(std::size_t{kTokens} * kHidden);
+  Dev<float> in(input.size()), dyn(dynamic.size()), kernel_dev(base.size()),
+      out(std::size_t{tokens} * hidden);
   in.Upload(input);
   dyn.Upload(dynamic);
-  kernel.Upload(base);
+  kernel_dev.Upload(base);
 
   for (std::uint32_t side = 0; side < 2; ++side) {
-    dflash::LaunchDFlashGroupedDynamicConv(
-        in.get(), dyn.get(), kernel.get(), out.get(), kTokens, kHidden, kKernel,
-        kGroup, side, nullptr);
+    dflash::LaunchDFlashGroupedDynamicConv(in.get(), dyn.get(),
+                                           kernel_dev.get(), out.get(), tokens,
+                                           hidden, kernel, group, side,
+                                           nullptr);
     Check(hipStreamSynchronize(nullptr), "sync conv");
     std::vector<float> want;
-    ConvReference(input, dynamic, base, kTokens, kHidden, kKernel, kGroup, side,
+    ConvReference(input, dynamic, base, tokens, hidden, kernel, group, side,
                   &want);
-    Near(out.Download(), want, 1e-5F,
-         side == 0 ? "GroupedDynamicConv.attn" : "GroupedDynamicConv.ffn");
+    const std::string name =
+        std::string("GroupedDynamicConv.") + label + (side == 0 ? ".attn" : ".ffn");
+    Near(out.Download(), want, 1e-5F, name.c_str());
   }
+}
+
+void TestGroupedDynamicConv() {
+  // A block-sized batch over the shipped geometry: eight rows, hidden 2048,
+  // kernel 2, groups of 16. The small shape below it catches index arithmetic;
+  // this one catches anything that only holds at toy sizes.
+  TestGroupedDynamicConvShape(8, 2048, 2, 16, "shipped");
+  TestGroupedDynamicConvShape(6, 32, 2, 4, "small");
 }
 
 // ---------------------------------------------------------------------------

@@ -239,6 +239,11 @@ std::optional<DflashWeights> DflashWeights::LoadFromGguf(
   config.context_length = *context_length;
   config.num_layers = *num_layers;
   config.rotary_from_head_dim = rotary.from_head_dim;
+  if (const auto eps =
+          reader.GetMetadataFloat32(prefix + "attention.layer_norm_rms_epsilon");
+      eps.has_value() && *eps > 0.0F) {
+    config.rms_norm_eps = *eps;
+  }
 
   if (config.hidden_size == 0 || config.intermediate_size == 0 ||
       config.num_attention_heads == 0 || config.num_key_value_heads == 0 ||

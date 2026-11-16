@@ -359,20 +359,77 @@ job with four units**, not a 50-line shim:
   `DflashBorrowed` needs. No copy, no re-encode: the drafter reads the target's
   own tables.
 
-### M1b — Parity against the oracle (2 d, boxed)  **[kills or confirms the track]**
-- Instrument the oracle to dump the encoder output, block-0 output and lattice
-  scores for one fixed prompt, then compare stage by stage. End-to-end comparison
-  only says "wrong"; intermediates say where.
-- Level 1: BF16 drafter, 20 fixed positions, draft ids **identical**.
-- Level 2: Q6_K drafter, 20/20 identical — this isolates quantization order from
-  math, which is the most likely false alarm.
-- Level 3: greedy acceptance on the 12-prompt set within ±3 points of 51.1%.
-- Acceptance: levels 1 and 2 pass. Not met within 3 working days of M1a ->
-  prompt-lookup fallback (§3.7).
-- Start with the four vendoring units above, in that order: kernels first (they
-  compile and unit-test without weights), then the loader with the rotary
-  fallback, then the extracted forward, then the engine's tied-weight
-  accessors.
+### M1b unit 5 — parity against the oracle  **[BF16 done; Q6_K measured]**
+Harness: `tools/drafter_parity.cpp` -> `flint_drafter_parity`. It loads the
+target, captures the five tapped residuals for a fixed 64-token prompt, feeds
+them to the drafter, drafts one block with tracing on, and writes the trace
+directory `tools/qwen27b/dflash_reference.py` compares: one `<stage>.f32` per
+stage, `trace.json`, and a `config.json` synthesised from the artifact's
+`DflashConfig`. The upstream reference is `z-lab/dflash` at the harness's pinned
+`07ebd93` (`dflash/model.py`, sha256 `f55b7fe0...`).
+
+**BF16 drafter: passes.** 89 stages, worst drafter-owned stage
+`layer.4.ffn_conv_out` at **4.71e-6** relative RMSE against a 1e-4 gate — 21x
+inside it. Candidate sets 7/7, proposal distributions agree to **6.8e-6** total
+variation, selector probabilities to **5.4e-7**. `logits` is **7.9e-7** on the
+reference head.
+
+**Q6_K drafter: quantisation floor, not a parity failure.** The same block
+through the artifact's quantized route sits at 1-2.4e-2 per stage (worst
+`context.0.4.v` at 2.43e-2), candidate sets 5/7, TV 2.0e-2. The cause is
+structural: a quantized draft GEMM rounds its weights to the block format and,
+on the decode path, its activation to int8 — while the reference dequantizes the
+same weights to float32 and multiplies in fp32. `logits` on the reference head
+is still 7.7e-7, so the selector, the head plumbing and the stage wiring are all
+exact; only the block GEMMs differ. A 1e-4 gate is therefore a BF16-only
+instrument, which is what `packed_bf16()` in the harness already assumed.
+
+**Five bugs the parity run found**, four of them invisible to synthetic-weight
+tests:
+1. `fc.weight` was uploaded with row length `hidden` instead of
+   `taps * hidden`, so the encoder's `fc` projection read the weight as a
+   10240x2048 matrix and the whole injected context was noise.
+2. The trace callback was handed **device** pointers. The oracle's contract is
+   a host buffer; the forward now copies through a staging buffer.
+3. Those copies were issued with blocking `hipMemcpy`, which is ordered on the
+   null stream — and the block's stream is created non-blocking, so the copy
+   could read a buffer the launch had not written yet. `attn_conv_in` came out
+   1979x off for exactly this reason. `Emit` now copies with `hipMemcpyAsync`
+   on the block's stream and synchronizes it.
+4. The selector's partial top-k scratch was sized for one row, but the batch
+   launcher runs a grid of `(partial blocks, rows)` and offsets each row by a
+   full block set. At the real vocabulary that is an out-of-bounds write; the
+   unit test only exercised the single-row entry point.
+5. The selector codebooks were uploaded in the artifact's quant while the
+   selector kernel reads them as BF16 unconditionally. Any drafter whose
+   codebooks are not BF16 read quant blocks as half floats. The oracle packs
+   them with `PackMatrixBf16` for the same reason, and also packs `attn_k` /
+   `attn_v` to BF16 for the 256-row context injection; the forward now matches
+   both.
+
+Also fixed on the way: `rms_norm_eps` is read from
+`dflash.attention.layer_norm_rms_epsilon` instead of being hardcoded to the
+in-tree executor's 1e-6.
+
+**Reproduce.**
+```sh
+flint_drafter_parity TARGET.gguf Flint-DFlash2-BF16.gguf \
+  --out /tmp/trace --head reference
+nix develop -c python3 tools/qwen27b/dflash_reference.py \
+  --upstream dflash/model.py --config /tmp/trace/config.json \
+  --target TARGET.gguf --draft Flint-DFlash2-BF16.gguf \
+  --trace /tmp/trace --output /tmp/trace/report.json
+```
+`--head reference` reads the borrowed head in F32. The shipped route reads the
+target's Q8_0 head the way every decode does and lands `logits` at that head's
+own quantisation floor (2.7e-3), which is the right arithmetic for acceptance
+and the wrong one for an fp32 stage gate.
+
+### M1b level 3 — acceptance  **[next]**
+- Greedy acceptance on the 12-prompt set, within +-3 points of the 51.1%
+  oracle figure, for both artifacts. Q6_K's 1-2e-2 block perturbation is the
+  thing this measures: at 336 MB it is the shipped candidate, and BF16 at
+  810 MB is the exact one.
 
 ### M2 — Target adapter (1-1.5 d)
 - Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row

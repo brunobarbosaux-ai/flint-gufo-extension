@@ -34,6 +34,10 @@ struct DflashConfig {
   std::uint32_t head_dim{0};
   std::uint32_t rotary_dim{0};
   float rope_theta{0.0F};
+  /// Epsilon of every RMSNorm in the draft block. The artifact carries it as
+  /// `dflash.attention.layer_norm_rms_epsilon`; unlike the rotary width it is
+  /// optional, and llama.cpp's default applies when it is absent.
+  float rms_norm_eps{1e-6F};
   std::uint32_t context_length{0};
   std::uint32_t num_layers{0};
   /// Inferred from the selector codebooks: the drafter has no head of its own.

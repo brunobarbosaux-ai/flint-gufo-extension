@@ -165,6 +165,29 @@ if(TARGET flint_drafter_probe)
 endif()
 
 # ---------------------------------------------------------------------------
+# Drafter parity driver (M1b): dumps the trace directory the upstream reference
+# harness compares stage by stage. Needs the target model (for the tapped
+# residuals and the borrowed embedding/head), so it links the HIP engine.
+# ---------------------------------------------------------------------------
+gufo_extension_target(
+  NAME flint_drafter_parity
+  SOURCES
+    tools/drafter_parity.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_drafter_parity)
+  target_include_directories(flint_drafter_parity PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
 gufo_extension_target(

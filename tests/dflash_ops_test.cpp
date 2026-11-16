@@ -641,6 +641,230 @@ void TestSelectorGreedy() {
                              "one-hot");
 }
 
+// ---------------------------------------------------------------------------
+// Batched selector: two greedy sequences, five proposal rows, one launch. Each
+// row owns its own partial scratch slice, so a buffer sized for one row writes
+// past its end on every later row. A guard tail behind the scratch makes that
+// visible on the host even when the device would not fault.
+// ---------------------------------------------------------------------------
+void TestSelectorBatch() {
+  constexpr std::uint32_t kVocab = 5000;  // three 2048-token partial blocks
+  constexpr std::uint32_t kRank = 4, kTopK = 4;
+  constexpr std::size_t kGuard = 1024;
+  constexpr std::uint32_t kGuardFloatBits = 0x7FC0BEEFU;  // quiet NaN, payload
+  constexpr std::uint32_t kGuardIdBits = 0xDEADBEEFU;
+  constexpr std::uint32_t kUnwritten = 0xFFFFFFFFU;
+
+  const std::vector<std::uint32_t> counts{3, 2};
+  const std::vector<std::uint32_t> anchors{3, 11};
+  const std::uint32_t kSequences = static_cast<std::uint32_t>(counts.size());
+  const std::uint32_t kRows = counts[0] + counts[1];
+  const std::uint32_t kTokens = kRows + kSequences;
+
+  // Contiguous row and token offsets, as the header defines them.
+  std::vector<std::uint32_t> row_offsets(kSequences), token_offsets(kSequences);
+  for (std::uint32_t s = 0; s < kSequences; ++s) {
+    row_offsets[s] = s == 0 ? 0U : row_offsets[s - 1] + counts[s - 1];
+    token_offsets[s] = row_offsets[s] + s;
+  }
+  if (token_offsets[0] != 0 || token_offsets[1] != 4)
+    throw std::runtime_error("Selector.batch: fixture offsets are wrong");
+
+  // Each row plants its own top-k, spread over the partial blocks, with a
+  // different winner order so the rows do not share one fixture.
+  const std::vector<std::vector<std::uint32_t>> planted{
+      {17, 2100, 4500, 900},  {901, 18, 2601, 4777}, {3333, 44, 1500, 4001},
+      {2047, 2048, 4999, 777}, {60, 3900, 2300, 1200}};
+  std::vector<float> logits(std::size_t{kRows} * kVocab);
+  for (std::uint32_t row = 0; row < kRows; ++row) {
+    float* out = logits.data() + std::size_t{row} * kVocab;
+    for (std::uint32_t token = 0; token < kVocab; ++token)
+      out[token] =
+          std::sin(static_cast<float>(token) * 0.37F + static_cast<float>(row)) *
+          4.0F;
+    for (std::uint32_t i = 0; i < kTopK; ++i)
+      out[planted[row][i]] = 8.0F + static_cast<float>((i + row) % kTopK) * 0.5F;
+  }
+
+  // Codebooks are vocabulary-wide and BF16-exact. Scales are multiples of
+  // 1/16 so the transitions are comparable to the logit gaps: neither term
+  // dominates, and the winners can move in both directions.
+  std::vector<std::uint16_t> predecessor(std::size_t{kVocab} * kRank),
+      successor(std::size_t{kVocab} * kRank);
+  std::vector<float> predecessor_f(predecessor.size()), successor_f(successor.size());
+  for (std::uint32_t token = 0; token < kVocab; ++token) {
+    for (std::uint32_t r = 0; r < kRank; ++r) {
+      const auto index = std::size_t{token} * kRank + r;
+      predecessor[index] = ExactBf16(0.0625F *
+                                     static_cast<float>((token % 5U) + 1U) *
+                                     static_cast<float>(r + 1U));
+      successor[index] = ExactBf16(0.0625F *
+                                   static_cast<float>((token % 7U) + 1U) *
+                                   static_cast<float>(r + 1U));
+      predecessor_f[index] = Bf16Value(predecessor[index]);
+      successor_f[index] = Bf16Value(successor[index]);
+    }
+  }
+  std::vector<float> projected(std::size_t{kRows} * kRank);
+  for (std::uint32_t row = 0; row < kRows; ++row)
+    for (std::uint32_t r = 0; r < kRank; ++r)
+      projected[std::size_t{row} * kRank + r] =
+          0.5F * static_cast<float>(((row + r) % 3U) + 1U);
+
+  // Host reference: walk each sequence's chain, step 0 from its anchor and
+  // each later step from the previously chosen token.
+  std::vector<std::uint32_t> want_tokens(kTokens, kUnwritten);
+  std::vector<std::uint32_t> want_chosen(kRows), want_candidates(std::size_t{kRows} * kTopK);
+  bool winner_moved = false;
+  for (std::uint32_t s = 0; s < kSequences; ++s) {
+    want_tokens[token_offsets[s]] = anchors[s];
+    std::uint32_t previous = anchors[s];
+    for (std::uint32_t step = 0; step < counts[s]; ++step) {
+      const auto row = row_offsets[s] + step;
+      const float* row_logits = logits.data() + std::size_t{row} * kVocab;
+      std::vector<std::uint32_t> order(kVocab);
+      for (std::uint32_t token = 0; token < kVocab; ++token)
+        order[token] = token;
+      std::partial_sort(order.begin(), order.begin() + kTopK, order.end(),
+                        [&](std::uint32_t a, std::uint32_t b) {
+                          return row_logits[a] > row_logits[b];
+                        });
+      double best_score = -std::numeric_limits<double>::infinity();
+      double second_score = -std::numeric_limits<double>::infinity();
+      std::uint32_t best = order[0];
+      for (std::uint32_t c = 0; c < kTopK; ++c) {
+        const auto candidate = order[c];
+        want_candidates[std::size_t{row} * kTopK + c] = candidate;
+        double transition = 0.0;
+        for (std::uint32_t r = 0; r < kRank; ++r)
+          transition += static_cast<double>(
+                            predecessor_f[std::size_t{previous} * kRank + r]) *
+                        projected[std::size_t{row} * kRank + r] *
+                        successor_f[std::size_t{candidate} * kRank + r];
+        const double score = static_cast<double>(row_logits[candidate]) + transition;
+        if (score > best_score) {
+          second_score = best_score;
+          best_score = score;
+          best = candidate;
+        } else if (score > second_score) {
+          second_score = score;
+        }
+      }
+      if (best_score - second_score < 1e-3)
+        throw std::runtime_error("Selector.batch: row " + std::to_string(row) +
+                                 " has a near-tie; the fixture is ambiguous");
+      winner_moved |= best != order[0];
+      want_chosen[row] = best;
+      want_tokens[token_offsets[s] + 1 + step] = best;
+      previous = best;
+    }
+  }
+  // At least one row must leave the logits argmax, or a kernel that ignored
+  // the codebooks would pass.
+  if (!winner_moved)
+    throw std::runtime_error("Selector.batch: no row's winner differs from its "
+                             "logits argmax");
+
+  const std::size_t scratch = dflash::DFlashSelectorScratchElements(kVocab);
+  // One scratch slice per row, followed by the guard tail.
+  const std::size_t partial_total = std::size_t{kRows} * scratch;
+  std::vector<float> partial_init(partial_total + kGuard, 0.0F);
+  std::vector<std::uint32_t> partial_id_init(partial_total + kGuard, 0U);
+  for (std::size_t i = partial_total; i < partial_init.size(); ++i) {
+    std::memcpy(&partial_init[i], &kGuardFloatBits, sizeof(float));
+    partial_id_init[i] = kGuardIdBits;
+  }
+
+  Dev<float> logits_dev(logits.size()), projected_dev(projected.size()),
+      confidence_dev(kRows), partial_scores_dev(partial_init.size()),
+      candidate_probabilities_dev(std::size_t{kRows} * kTopK);
+  Dev<std::uint16_t> predecessor_dev(predecessor.size()),
+      successor_dev(successor.size());
+  Dev<std::uint32_t> tokens_dev(kTokens), partial_ids_dev(partial_id_init.size()),
+      candidate_ids_dev(std::size_t{kRows} * kTopK);
+  std::vector<std::uint32_t> token_init(kTokens, kUnwritten);
+  for (std::uint32_t s = 0; s < kSequences; ++s)
+    token_init[token_offsets[s]] = anchors[s];
+  logits_dev.Upload(logits);
+  projected_dev.Upload(projected);
+  predecessor_dev.Upload(predecessor);
+  successor_dev.Upload(successor);
+  tokens_dev.Upload(token_init);
+  partial_scores_dev.Upload(partial_init);
+  partial_ids_dev.Upload(partial_id_init);
+
+  std::vector<dflash::DFlashSelectorSequence> sequences;
+  for (std::uint32_t s = 0; s < kSequences; ++s)
+    sequences.push_back({.count = counts[s], .temperature = 0.0F, .sampling = {}});
+
+  dflash::LaunchDFlashSelectorBatch(
+      logits_dev.get(), projected_dev.get(), predecessor_dev.get(),
+      successor_dev.get(), tokens_dev.get(), confidence_dev.get(),
+      partial_scores_dev.get(), partial_ids_dev.get(), /*uniforms=*/nullptr,
+      candidate_ids_dev.get(), candidate_probabilities_dev.get(), sequences,
+      kVocab, kRank, kTopK, nullptr);
+  Check(hipStreamSynchronize(nullptr), "sync selector batch");
+
+  // The guard must be bit-for-bit untouched: anything else is a row's partial
+  // scratch running past its slice.
+  const auto scores = partial_scores_dev.Download();
+  const auto ids = partial_ids_dev.Download();
+  for (std::size_t i = partial_total; i < scores.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &scores[i], sizeof(bits));
+    if (bits != kGuardFloatBits || ids[i] != kGuardIdBits)
+      throw std::runtime_error("Selector.batch: partial scratch wrote past its " +
+                               std::to_string(partial_total) +
+                               " elements at " + std::to_string(i));
+  }
+
+  const auto tokens = tokens_dev.Download();
+  for (std::uint32_t i = 0; i < kTokens; ++i) {
+    if (tokens[i] != want_tokens[i])
+      throw std::runtime_error("Selector.batch: token " + std::to_string(i) +
+                               " is " + std::to_string(tokens[i]) + ", want " +
+                               std::to_string(want_tokens[i]));
+  }
+  const auto confidences = confidence_dev.Download();
+  const auto candidates = candidate_ids_dev.Download();
+  const auto probabilities = candidate_probabilities_dev.Download();
+  for (std::uint32_t row = 0; row < kRows; ++row) {
+    const std::string label = "Selector.batch: row " + std::to_string(row);
+    if (confidences[row] != 1.0F)
+      throw std::runtime_error(label + ": confidence " +
+                               std::to_string(confidences[row]) + " is not 1");
+
+    std::vector<std::uint32_t> got(candidates.begin() + std::size_t{row} * kTopK,
+                                   candidates.begin() + std::size_t{row + 1} * kTopK);
+    std::vector<std::uint32_t> want(
+        want_candidates.begin() + std::size_t{row} * kTopK,
+        want_candidates.begin() + std::size_t{row + 1} * kTopK);
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    if (got != want)
+      throw std::runtime_error(label + ": candidate set differs from the host "
+                                       "top-k");
+
+    std::size_t hot = kTopK;
+    std::size_t ones = 0;
+    for (std::uint32_t c = 0; c < kTopK; ++c) {
+      const auto probability = probabilities[std::size_t{row} * kTopK + c];
+      if (probability == 1.0F) {
+        hot = c;
+        ++ones;
+      } else if (probability != 0.0F) {
+        throw std::runtime_error(label + ": probability is not one-hot");
+      }
+    }
+    if (ones != 1 || hot == kTopK)
+      throw std::runtime_error(label + ": probabilities are not one-hot");
+    if (candidates[std::size_t{row} * kTopK + hot] != want_chosen[row])
+      throw std::runtime_error(label + ": one-hot probability is on " +
+                               std::to_string(candidates[std::size_t{row} * kTopK + hot]) +
+                               ", want " + std::to_string(want_chosen[row]));
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -702,6 +926,7 @@ int main() {
     TestGatherRows();
     TestDraftTableLogits();
     TestSelectorGreedy();
+    TestSelectorBatch();
   } catch (const std::exception& error) {
     std::cerr << "flint dflash kernel tests failed: " << error.what() << "\n";
     return 1;

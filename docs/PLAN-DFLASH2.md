@@ -90,11 +90,22 @@ Not built — the rest of the deliverable:
 
 ### 3.1 The gap
 
-`ext::TextModelRunner` is **single-token**: core's serve loop calls `SelectNext`
-then `Advance` once per token. There is **no extension-facing speculative hook**
-in `src/ext/` — verified 2026-11-15; the only speculative symbols on the ext
-surface are `TextSpeculativeConfig` / `TextSpeculativeDefaults` (settings, no
-factory).
+`ext::TextModelRunner` is **single-token by default**: core's serve loop calls
+`SelectNext` then `Advance` once per token. There is **no extension-facing
+speculative *factory*** in `src/ext/` — verified 2026-11-15; the only
+speculative symbols on the ext surface are `TextSpeculativeConfig` /
+`TextSpeculativeDefaults` (settings, no factory).
+
+**Correction (M3, 2026-11-16).** The earlier claim that there is "no
+extension-facing speculative hook" was too strong. The host does expose
+`TextRunnerCapabilities.multi_token_decode` plus a virtual `DecodeStep`
+(`src/ext/text.hpp`), and the in-tree Qwen3.8-Flash-Next runner uses it to emit
+several tokens per call. It is a *multi-token* hook, not a *speculative* one:
+the runner owns the draft/verify loop and the sampler history between rows. This
+plan still drives the cycle through `SelectNext`/`Advance` (§3.2), because that
+keeps the sampler's history updated between rows for free — the `DecodeStep`
+path would require the runner to manage sampler history itself. The hook stays
+available if a future revision wants it.
 
 Qwen does speculation because it is in-tree: `src/models/qwen/drivers.cpp`
 constructs `SpeculativeVerifier` and `QwenDFlashGpuDraftBackend` and drives the
@@ -137,6 +148,20 @@ This is only valid because row *i*'s logits are bit-identical to a single-token
 decode at that position (§2, first item). If they were not, sampling row *i* from
 a verify pass would not be the draw core would have made, and the scheme would
 be silently wrong. This is the property Step 0.5 bought.
+
+**Scope of the bit-identity (M2, 2026-11-16).** The property holds for rows
+written by the **decode or verify** path. A multi-token *prefill* is **not**
+bit-identical to decoding the same tokens one at a time (M2 measured this on the
+real target). The cycle therefore never assumes that a rewound session equals a
+freshly-prefilled one: it re-appends the anchor before reading `Logits()`, and
+the rows it samples are always rows the verify pass just wrote. Prompt prefill
+and drafting are separate concerns and do not feed the exactness argument.
+
+A second M2 fact: `Session::Rewind` sets the position but does **not** restore
+the logits buffer. `Logits()` keeps showing the last row of the most recent pass
+until the next append. The cycle re-appends the anchor after every rewind, so it
+never reads stale logits; the adapter documents this and does not change engine
+semantics.
 
 ### 3.4 Expected acceptance
 
@@ -496,14 +521,22 @@ The remaining piece of level 3 is the same measurement through the runner's
 real cycle (M2/M3), which also exercises the sampler-as-black-box commit path
 rather than this driver's argmax.
 
-### M2 — Target adapter (1-1.5 d)  **[next]**
+### M2 — Target adapter (1-1.5 d)  **[done]**
 - Prompt append (batched), `VerifyRows([anchor, drafts])` returning per-row
   logits and per-row 5-tap hidden rows, `Rewind`, and position tracking.
 - Acceptance: `VerifyRows` rows are **bit-identical** to `Append` one token at a
   time (the `FLINT_CHECK_ROWS` property, asserted from inside the adapter);
   hidden rows equal the captured values; rewind leaves identical state.
+- **Done** (`50d9189`): `src/spec/target_adapter.{hpp,cpp}` +
+  `tests/target_adapter_test.cpp`; `flint.target_adapter` passes on the real
+  target — rows bit-identical (memcmp, no tolerance) for widths 1..8, features
+  bit-identical to a fresh capture over 96 rows x 5 taps, rewind matches a fresh
+  session (position and the next four appends). `Create(session, taps,
+  hidden_width, error_msg)` returns `unique_ptr`; `AppendPrompt` chunks at 1024.
+- Two engine facts recorded (see §3.3): `Rewind` does not restore logits, and a
+  multi-token prefill is not bit-identical to single-token decode.
 
-### M3 — Cycle + runner integration (2 d)  **[not started]**
+### M3 — Cycle + runner integration (2 d)  **[in progress]**
 - `SpecCycle` per §3.2, including `Advance` no-op, position bookkeeping, EOS
   mid-block (drop remaining rows), and `PreviewFirstToken` **must not** start a
   cycle.

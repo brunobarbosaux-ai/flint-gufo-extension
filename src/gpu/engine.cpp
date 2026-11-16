@@ -1391,6 +1391,14 @@ constexpr std::uint32_t kSnapshotMagic = 0x544e4c46;  // "FLNT"
 constexpr std::size_t kSnapshotHeaderBytes = 32;
 }  // namespace
 
+TiedWeights Model::Tied() const noexcept {
+  const DeviceModel& device = *state_->device;
+  return {.token_embedding = device.token_embd().data,
+          .token_embedding_type = device.token_embd().type,
+          .output = device.output().data,
+          .output_type = device.output().type};
+}
+
 std::size_t Model::SnapshotBytes(std::uint32_t tokens) const noexcept {
   const Config& c = state_->config;
   const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;

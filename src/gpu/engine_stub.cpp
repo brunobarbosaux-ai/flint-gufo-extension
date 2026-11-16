@@ -65,6 +65,7 @@ const Config& Model::config() const noexcept {
   static const Config empty;
   return empty;
 }
+TiedWeights Model::Tied() const noexcept { return {}; }
 std::size_t Model::ResidentBytes() const noexcept {
   return 0;
 }

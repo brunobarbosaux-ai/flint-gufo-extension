@@ -109,6 +109,16 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+/// The target's tied embedding table and LM head, as device pointers in their
+/// GGUF encoding. A DFlash2 drafter borrows both instead of carrying its own
+/// million-row copy, so it reads them from here.
+struct TiedWeights {
+  const void* token_embedding{nullptr};
+  core::GgmlType token_embedding_type{core::GgmlType::kF32};
+  const void* output{nullptr};
+  core::GgmlType output_type{core::GgmlType::kF32};
+};
+
 /// The Flint weights resident on the GPU, shared by sessions.
 class Model final {
 public:
@@ -133,6 +143,9 @@ public:
       std::uint32_t max_context) const noexcept;
   /// Bytes of a snapshot at `tokens` positions.
   [[nodiscard]] std::size_t SnapshotBytes(std::uint32_t tokens) const noexcept;
+  /// The embedding table and LM head a drafter borrows. Valid for the life of
+  /// the model; the pointers are the ones sessions read.
+  [[nodiscard]] TiedWeights Tied() const noexcept;
 
 private:
   Model() = default;

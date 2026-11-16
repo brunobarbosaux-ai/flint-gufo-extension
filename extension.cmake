@@ -58,6 +58,7 @@ if(TARGET gufo_flint_hip)
   # fast-math.
   gufo_extension_hip_sources(gufo_flint_hip
     SOURCES
+      src/gpu/dflash/dflash_forward.cpp
       src/gpu/kernels/kernels.hip.cpp
       # DFlash-2 draft kernels, vendored verbatim from the in-tree Qwen family.
       # Same tier as Flint's own kernels: -O3, no fast-math, so the arithmetic
@@ -224,12 +225,33 @@ gufo_extension_target(
     hip::host
 )
 
+# The DFlash2 draft forward: synthetic weights, no artifact, no target model.
+# Covers upload and role binding, the injected context ring, block bookkeeping,
+# the trace hook the parity harness reads, and the selector interface.
+gufo_extension_target(
+  NAME flint_dflash_forward_test
+  SOURCES
+    tests/dflash_forward_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+    hip::host
+)
+
 if(TARGET flint_dflash_ops_test)
   # The vendored header, like its in-tree source, is gated on the backend
   # macro its real consumer defines.
   target_compile_definitions(flint_dflash_ops_test PRIVATE ENGINE_ENABLE_HIP=1)
   add_test(NAME flint.dflash_ops COMMAND flint_dflash_ops_test)
   set_tests_properties(flint.dflash_ops PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+endif()
+
+if(TARGET flint_dflash_forward_test)
+  add_test(NAME flint.dflash_forward COMMAND flint_dflash_forward_test)
+  set_tests_properties(flint.dflash_forward
+    PROPERTIES LABELS "flint;hip;gpu;gfx1151")
 endif()
 
 # Source extensions own installation of their additional data and notices.

@@ -15,6 +15,7 @@
     "flint_probe_test": { "requires": ["testing"], "role": "test" },
     "flint_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_dflash_ops_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_dflash_forward_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_drafter_probe": { "requires": ["testing"], "role": "test" }
   },
   "providers": [

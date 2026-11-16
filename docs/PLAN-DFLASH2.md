@@ -265,8 +265,8 @@ job with four units**, not a 50-line shim:
 | :-- | --: | :-- |
 | `src/families/qwen/kernels/dflash_kernels.{hpp,hip}` | 1,232 L | **done** — `src/gpu/dflash/`, compiles and passes `flint.dflash_ops` without weights |
 | `dflash_weights.{hpp,cpp}` | ~400 L | **done** — `src/gpu/dflash/`, host tier, rotary fallback + Q5_K |
-| forward + block workspace | ~600-700 L | `ForwardBlockBatch` / `BlockWorkspace` are methods of the executor; extract, do not copy the class |
-| target embedding + head | ~40 L | the drafter borrows the target's `token_embd` and `output`; the engine exposes neither today |
+| forward + block workspace | ~600-700 L | **done** — `src/gpu/dflash/dflash_forward.cpp`, the single-request path |
+| target embedding + head | ~40 L | **done** — `Model::Tied()` |
 | generic `Launch*` helpers | — | RMSNorm / RoPE / GEMM / embedding / residual-add: map onto the extension's vendored kernels instead of vendoring a second set |
 
 ### M1b unit 1 — draft kernels vendored  **[done]**
@@ -319,6 +319,45 @@ job with four units**, not a 50-line shim:
 - The diff earned its keep immediately: it caught a storage-class bug in the
   probe's own inventory check (a vector role compared with the matrix
   predicate, which accepts F32, so the check was inverted).
+
+### M1b unit 3 — block forward  **[done]**
+- `src/gpu/dflash/dflash_forward.{hpp,cpp}`: the single-request path of the
+  in-tree executor (`ForwardBlock` + `InjectTargetContext`), extracted so it
+  depends on nothing but the drafter weights, the engine's captured residuals
+  and the two borrowed target weights. `AppendContext` runs the feature-fusion
+  encoder and fills each layer's injected K/V ring; `Run` drafts one block.
+- **Op routing is the engine's, not the in-tree executor's.** The in-tree
+  helpers `LaunchBatchedQuantGEMMFp32` / `LaunchExactBf16GEMMFp32SmallBatch` are
+  declared in the vendored `ops/gemm.hpp` but their implementations are not part
+  of this extension. The forward routes the way `Session::Impl::Dense` already
+  does and therefore exercises code the engine validates every decode:
+  Q8_0 -> `flint_mmq_q8_0_dense`; every other K-quant (Q6_K, Q4_K, Q5_K) ->
+  `flint_mmq_moe_vec` with a single unselected expert, which reads the weights
+  **as stored** so a Q6_K drafter stays Q6_K; F32/BF16 -> the family's
+  `SmallGemm`.
+- Stages lay out exactly as the oracle traces them (`embedding`,
+  `layer.N.attn_norm` ... `layer.N.output`, `normalized`, `selector_hidden`,
+  `logits`), so one comparator serves both implementations.
+- **Known parity risk, isolated:** the oracle's fused QK-norm+RoPE kernel is not
+  in this extension, so `ApplyQkNormRope` composes the engine's per-head
+  `RmsNormRows` with the vendored NEOX `Rope`. Same math, different code, so Q
+  and K are the stages to look at first if parity drifts.
+- Gate: `flint.dflash_forward` (`tests/dflash_forward_test.cpp`) runs on
+  synthetic weights — no artifact, no target model. It covers upload and role
+  binding, the 256-row injection chunks and ring writes, block clamping, the
+  trace hook the parity harness reads (names, order, row counts), determinism
+  (a block is a pure function of the appended context), and the sampled path's
+  candidates and probabilities.
+- Two bugs the gate caught while it was being written: the context path shares
+  no buffer with the block workspace (a 40-row injection into an 8-row
+  workspace overran it), and `DflashBorrowed` must hold **device** pointers —
+  passing host memory faulted the embedding kernel.
+
+### M1b unit 4 — borrowed target weights  **[done]**
+- `Model::Tied()` returns the target's `token_embd` and `output` as device
+  pointers plus their storage types, which is everything
+  `DflashBorrowed` needs. No copy, no re-encode: the drafter reads the target's
+  own tables.
 
 ### M1b — Parity against the oracle (2 d, boxed)  **[kills or confirms the track]**
 - Instrument the oracle to dump the encoder output, block-0 output and lattice

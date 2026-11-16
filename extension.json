@@ -15,6 +15,7 @@
     "flint_probe_test": { "requires": ["testing"], "role": "test" },
     "flint_tool_template_test": { "requires": ["testing"], "role": "test" },
     "flint_tool_scan_test": { "requires": ["testing"], "role": "test" },
+    "flint_continuation_layout_test": { "requires": ["testing"], "role": "test" },
     "flint_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_dflash_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_dflash_forward_test": { "requires": ["hip", "testing"], "role": "test" },

@@ -140,6 +140,9 @@ struct DflashForward::Impl {
   std::vector<float*> injected_k, injected_v;
   std::uint32_t history_capacity{0};
   std::uint32_t injected_context_len{0};
+  // First row the ring was injected with. Rows below it were never fed (the
+  // context restarted at a frontier), so Run must not read them.
+  std::uint32_t history_begin{0};
 
   ~Impl() {
     if (stream != nullptr)
@@ -548,8 +551,9 @@ std::uint32_t DflashForward::ContextLength() const noexcept {
   return impl_->injected_context_len;
 }
 
-void DflashForward::ResetContext() noexcept {
-  impl_->injected_context_len = 0;
+void DflashForward::ResetContext(std::uint32_t frontier) noexcept {
+  impl_->injected_context_len = frontier;
+  impl_->history_begin = frontier;
 }
 
 std::uint32_t DflashForward::HistoryCapacity() const noexcept {
@@ -750,6 +754,15 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
     return false;
   }
   const std::uint32_t rows = draft_count + 1U;
+  // History the kernel reads is [window start, history_length). Its lower
+  // bound is the kernel's own (position + 1 - sliding_window), so the read is
+  // valid only when that bound is at or past history_begin. Otherwise the
+  // window would reach rows that were never injected; attend to none instead.
+  // With history_begin == 0 this is min(position, injected_context_len).
+  const std::uint32_t window_start =
+      position + 1U > c.sliding_window ? position + 1U - c.sliding_window : 0U;
+  const std::uint32_t history_length =
+      window_start >= s.history_begin ? s.injected_context_len : 0U;
   const auto emit = [&](std::string_view name, const float* data,
                         std::size_t width, std::uint32_t row_count) {
     s.Emit(trace, name, data, std::size_t{row_count} * width);
@@ -805,7 +818,7 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
 
     LaunchDFlashNonCausalAttention(
         s.query, s.injected_k[i], s.injected_v[i], s.key, s.value, s.attention,
-        position, std::min(position, s.injected_context_len), rows,
+        position, history_length, rows,
         c.sliding_window, c.num_attention_heads, c.num_key_value_heads, head_dim,
         scale, s.stream, s.history_capacity);
     stage("attention", s.attention, query);

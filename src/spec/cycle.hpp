@@ -62,11 +62,12 @@ class SpecCycle {
 
   /// Forgets the drafter context and any active cycle (new prompt). The draft
   /// policy's acceptance history is kept: it tunes speed, not output.
-  void Reset() noexcept;
+  void Reset() noexcept { Reset(0); }
 
-  /// Forgets a pending emitted row without caching it. Call when the target
-  /// session is repositioned externally (prefix reuse).
-  void DropPending() noexcept { pending_ = false; }
+  /// Restarts the drafter context at `frontier` (the target's cached position
+  /// after an external reposition, e.g. prefix reuse or snapshot restore). The
+  /// rows below it are not re-fed, so the drafter starts with no history there.
+  void Reset(std::uint32_t frontier) noexcept;
 
   /// Test hook (FLINT_SPEC=null): rewrites each proposal before verification.
   /// The rewritten block must still be verified like any other, so the cycle's

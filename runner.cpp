@@ -409,10 +409,11 @@ public:
     auto& flint = RequireFlintState(state);
     flint.set_position(position);
     flint.set_uncached(false);
-    // The reused prefix is cached through `position`; no cycle may resume a
-    // pending row from the previous request.
+    // The reused prefix is cached through `position`. The drafter's context
+    // cannot be re-fed from 0 (the hidden ring holds only recent rows), so it
+    // restarts at `position`; this also drops any pending row or active cycle.
     if (flint.cycle() != nullptr)
-      flint.cycle()->DropPending();
+      flint.cycle()->Reset(static_cast<std::uint32_t>(position));
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>

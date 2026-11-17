@@ -106,12 +106,13 @@ class DflashForward final {
   /// Positions the drafter can attend to: rows appended by AppendContext.
   [[nodiscard]] std::uint32_t ContextLength() const noexcept;
 
-  /// Forgets the injected context so the next AppendContext starts at 0. Call
-  /// it whenever the target session starts over (a new prompt in one process,
-  /// or a rewind before the drafter's context). Only the length is reset: ring
-  /// rows past ContextLength() are never read (Run attends to
-  /// min(position, ContextLength()) rows), so they need no clearing.
-  void ResetContext() noexcept;
+  /// Restarts the injected context at `frontier`: the next AppendContext must
+  /// start there. Rows below `frontier` were never injected (the target's
+  /// history is not re-fed), so Run attends to no history until rows at or
+  /// after the frontier fill the sliding window. ResetContext(0) is a fresh
+  /// prompt. Ring rows are not cleared; Run never reads rows below the
+  /// frontier.
+  void ResetContext(std::uint32_t frontier = 0) noexcept;
 
   /// Runs one block: the committed `anchor` at `position` plus `draft_count`
   /// proposals. `uniforms` supplies one draw per proposal when `temperature`

@@ -32,11 +32,11 @@ bool SpecCycle::SyncContext(std::uint32_t position, std::string* error_msg) {
   return true;
 }
 
-void SpecCycle::Reset() noexcept {
+void SpecCycle::Reset(std::uint32_t frontier) noexcept {
   End(false);
   pending_ = false;
-  drafter_.ResetContext();
-  injected_ = 0;
+  drafter_.ResetContext(frontier);
+  injected_ = frontier;
   stats_ = {};
 }
 

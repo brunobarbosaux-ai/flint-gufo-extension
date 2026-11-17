@@ -46,6 +46,11 @@ this repository only reads the format.
 
 ## Speculative decoding (DFlash2)
 
+**Context ceiling.** Verified serve startup: contexts up to **196608 (192k)
+load**; **262144 (256k) currently hangs in session setup** (pre-existing,
+unrelated to speculation — see `DEFERRED.md`). Advertise 192k until the
+higher ceiling is fixed.
+
 Flint can run DFlash2 speculative decoding: a small drafter proposes several
 tokens, and the target verifies them in one batched pass. Accepted tokens are
 emitted without extra target steps, so single-stream decode is faster. It is

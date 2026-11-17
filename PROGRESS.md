@@ -77,6 +77,7 @@ The true optimum is **k=3 at temp 0** and **k=2 at temp 1.0** — so the gate IS
 - **Settings honour**: top-k, top-p, min-p, repeat/frequency penalty all PASS (spec-on == spec-off, 12/12). Grammar FAILED 2/12 at 1024 tokens (9/12 at 192) — suspected token-budget truncation, not a real violation; re-check delegated.
 - **Depth curve**: adaptive >= fixed at every depth and both temps. Whole-request speedup < 1.0 at depth >= 8k because prefill (not speculated) dominates; decode-only speedup is the fair number (adaptive 1.07-1.20 at temp 0).
 - **Runtime bug found**: spec-on prompts > 2048 tokens fail with `captured residual for row 0 left the ring`. Root cause: `Session::CapturedHiddenDevice` (`src/gpu/engine.cpp`) has an off-by-one (`row + R <= position` should be `< position`), so the ring yields only `R-1` usable rows while the runner caps its prefill chunk at exactly `R` (2048). Short prompts never hit it, which is why M3 passed. Fix delegated (engine boundary + remove the gate workaround).
+- **Follow-up**: the engine boundary fix removed the ring error but GX still diverges at depth > 0 (1/12, 0/12, 1/12). Key clue: with a gate-side 1024-token prefill cap GX passed 12/12 at all depths; with the runner's own 2048 cap it fails. The boundary is between 1024 and 2048 (the ring size). Root-cause investigation delegated (debugger). Uncommitted: the engine boundary fix + the gate workaround removal.
 
 ## Log
 

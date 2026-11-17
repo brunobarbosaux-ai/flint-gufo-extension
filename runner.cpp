@@ -30,6 +30,7 @@
 #include "src/gpu/engine.hpp"
 #include "src/runtime/config.hpp"
 #include "src/spec/cycle.hpp"
+#include "src/spec/draft_policy.hpp"
 #include "src/spec/target_adapter.hpp"
 
 namespace gufo::models::flint {
@@ -129,6 +130,7 @@ public:
     position_ = 0;
     last_token_.reset();
     emitted_first_ = false;
+    uncached_ = false;
     if (cycle_)
       cycle_->Reset();
     (void)adapter_->Invalidate(*slot_);
@@ -151,6 +153,11 @@ public:
   // plain decode path samples the prompt's logits; the cycle starts after.
   [[nodiscard]] bool emitted_first() const noexcept { return emitted_first_; }
   void set_emitted_first(bool value) noexcept { emitted_first_ = value; }
+  // True when the last advanced token is committed but its row is not cached
+  // (the speculative cycle's pending emitted token). The session holds
+  // position()-1 rows until the next verify caches it.
+  [[nodiscard]] bool uncached() const noexcept { return uncached_; }
+  void set_uncached(bool value) noexcept { uncached_ = value; }
 
   // Speculative cycle bound to this slot's session; null when speculation is
   // off. Owned here so its target adapter lives as long as the session.
@@ -171,6 +178,7 @@ private:
   std::size_t position_{0};
   std::optional<std::int32_t> last_token_;
   bool emitted_first_{false};
+  bool uncached_{false};
   std::unique_ptr<spec::TargetAdapter> target_;
   std::unique_ptr<spec::SpecCycle> cycle_;
 };
@@ -220,7 +228,7 @@ public:
       std::string artifact_fingerprint, FlintSpecMode spec_mode,
       std::unique_ptr<gpu::dflash::DflashForward> drafter,
       std::vector<std::uint32_t> taps, std::uint32_t hidden_width,
-      std::uint32_t draft_count, std::uint32_t vocab_size)
+      spec::DraftPolicy draft_policy, std::uint32_t vocab_size)
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         stop_tokens_(std::move(stop_tokens)),
@@ -229,7 +237,7 @@ public:
         drafter_(std::move(drafter)),
         taps_(std::move(taps)),
         hidden_width_(hidden_width),
-        draft_count_(draft_count),
+        draft_policy_(draft_policy),
         vocab_size_(vocab_size) {
     // Durable caches require the validated artifact fingerprint; without it the
     // loaded model instance is the identity, as for the LFM3 continuation.
@@ -356,8 +364,10 @@ public:
                                                 hidden_width_, &error);
       if (!target)
         throw std::runtime_error("Flint target adapter failed: " + error);
+      // Each slot keeps its own acceptance history; the policy only changes
+      // speed, so per-slot state is enough.
       auto cycle = std::make_unique<spec::SpecCycle>(*target, *drafter_,
-                                                     draft_count_);
+                                                     draft_policy_);
       if (spec_mode_ == FlintSpecMode::kNull)
         cycle->set_draft_transform(&NullDraftTransform, vocab_size_);
       state->AttachCycle(std::move(target), std::move(cycle));
@@ -377,6 +387,11 @@ public:
                                std::size_t position) const override {
     auto& flint = RequireFlintState(state);
     flint.set_position(position);
+    flint.set_uncached(false);
+    // The reused prefix is cached through `position`; no cycle may resume a
+    // pending row from the previous request.
+    if (flint.cycle() != nullptr)
+      flint.cycle()->DropPending();
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
@@ -443,7 +458,7 @@ public:
       ext::TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override {
     auto& flint = RequireFlintState(state);
-    if (offset != flint.position())
+    if (offset != flint.position() || flint.uncached())
       throw std::logic_error("Flint prefill offset does not match state");
     if (offset >= prompt.size())
       throw std::logic_error("Flint prefill has no remaining input");
@@ -484,6 +499,9 @@ public:
     if (flint.position() >= max_context_)
       return {.stop = true, .piece = {}, .logprobs = std::nullopt};
     std::int32_t token = 0;
+    // A cycle Next below verifies the pending row, so the session covers the
+    // committed stream again.
+    flint.set_uncached(false);
     if (flint.cycle() != nullptr && flint.emitted_first()) {
       // Speculative path: the cycle draws the token from the verify rows (or
       // starts a cycle from the last committed token) with the same sampler.
@@ -521,16 +539,20 @@ public:
     auto& flint = RequireFlintState(state);
     const std::int32_t input = FlintEngineTokens({&token, 1}).front();
     // An accepted draft is already cached at its row: the verify pass wrote it.
-    // Only an emitted token the cycle did not cache (the first token, a
-    // mismatch, or the bonus after a full block) is appended here.
-    const bool cached = flint.cycle() != nullptr && flint.cycle()->active();
-    if (!cached) {
+    // After a cycle's natural end the emitted token's row is left pending: the
+    // next cycle's verify writes it as row 0. Only the first token after
+    // prefill (no cycle) is appended here.
+    const spec::SpecCycle* cycle = flint.cycle();
+    const bool cycle_cached = cycle != nullptr && cycle->active();
+    const bool deferred = cycle != nullptr && !cycle_cached && cycle->pending();
+    if (!cycle_cached && !deferred) {
       std::string error;
       if (!flint.session().Append({&input, 1}, &error)) {
         flint.Invalidate();
         throw std::runtime_error("Flint decode failed: " + error);
       }
     }
+    flint.set_uncached(deferred);
     flint.set_position(flint.position() + 1);
     flint.set_last_token(input);
     flint.set_emitted_first(true);
@@ -584,9 +606,11 @@ public:
 
   [[nodiscard]] std::size_t CheckpointPosition(
       const ext::TextRunnerState& state) const override {
-    // Abort any active cycle before the checkpoint reads the position; the
-    // host calls PrepareCancellation first on the cancel path.
-    return RequireFlintState(state).position();
+    // The checkpoint is the committed tokens whose rows the session holds. A
+    // deferred emitted token (uncached) is committed but not yet cached, so it
+    // is excluded; the snapshot payload records the same session position.
+    const auto& flint = RequireFlintState(state);
+    return flint.position() - (flint.uncached() ? 1 : 0);
   }
 
   void PrepareCancellation(ext::TextRunnerState& state) const override {
@@ -624,7 +648,7 @@ private:
   std::unique_ptr<gpu::dflash::DflashForward> drafter_;
   std::vector<std::uint32_t> taps_;
   std::uint32_t hidden_width_{0};
-  std::uint32_t draft_count_{0};
+  spec::DraftPolicy draft_policy_{ext::TextDFlashDraftPolicy::kAdaptive, 1, 1};
   std::uint32_t vocab_size_{0};
 };
 
@@ -747,7 +771,7 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
 
     std::unique_ptr<gpu::dflash::DflashForward> drafter;
     std::vector<std::uint32_t> taps;
-    std::uint32_t draft_count = 0;
+    std::optional<spec::DraftPolicy> draft_policy;
     if (spec_mode != FlintSpecMode::kOff) {
       std::string draft_path = options.speculative.draft_model_path;
       if (draft_path.empty()) {
@@ -771,11 +795,15 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
       }
       const auto& draft_config = weights->config;
       taps = draft_config.target_layer_ids;
-      draft_count = std::min<std::uint32_t>(
+      // max 0 means the drafter's full block. The policy clamps both bounds to
+      // 1..block_size-1 and orders min <= max.
+      const std::uint32_t block_max = draft_config.block_size - 1U;
+      const std::uint32_t max_draft =
           options.speculative.max_draft_tokens == 0
-              ? draft_config.block_size - 1U
-              : options.speculative.max_draft_tokens,
-          draft_config.block_size - 1U);
+              ? block_max
+              : std::min(options.speculative.max_draft_tokens, block_max);
+      draft_policy.emplace(options.speculative.dflash_policy,
+                           options.speculative.min_draft_tokens, max_draft);
       const gpu::TiedWeights tied = model->Tied();
       if (tied.token_embedding == nullptr || tied.output == nullptr) {
         if (error)
@@ -799,7 +827,9 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
     return std::make_shared<FlintTextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
         max_context, std::move(fingerprint), spec_mode, std::move(drafter),
-        std::move(taps), config->hidden_size, draft_count,
+        std::move(taps), config->hidden_size,
+        draft_policy.value_or(spec::DraftPolicy(
+            ext::TextDFlashDraftPolicy::kFixed, 1, 1)),
         config->vocab_size);
   } catch (const std::exception& e) {
     if (error)

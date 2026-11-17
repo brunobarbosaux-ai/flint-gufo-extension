@@ -7,11 +7,13 @@
 //   --mode gx       greedy spec-on (dflash) byte-identical to spec-off
 //   --mode null     FLINT_SPEC=null byte-identical to spec-off at each
 //                   temperature and seed
-//   --mode speed    tokens per cycle and speedup of dflash over spec-off
+//   --mode speed    tokens per cycle and speedup of dflash over spec-off,
+//                   once per --policies entry (fixed, adaptive)
 //
 // Usage: flint_spec_gate --target <target.gguf> --prompts <prompts.jsonl>
 //          --mode gx|null|speed [--max-tokens N] [--temps 0,0.6,1.0]
 //          [--seeds 1,2,3] [--prompts-limit N]
+//          [--policies fixed,adaptive] [--max-draft N] [--min-draft N]
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -57,6 +59,18 @@ struct Options {
   std::vector<float> temps{0.0F};
   std::vector<std::uint64_t> seeds{1};
   std::size_t prompts_limit{12};
+  // Speed mode: which draft policies to measure, and the draft bounds.
+  std::vector<ext::TextDFlashDraftPolicy> policies{
+      ext::TextDFlashDraftPolicy::kAdaptive};
+  std::uint32_t max_draft{7};
+  std::uint32_t min_draft{1};
+};
+
+// The policy the gate's dflash runs use; the spec-off runs ignore it.
+struct DraftSettings {
+  ext::TextDFlashDraftPolicy policy{ext::TextDFlashDraftPolicy::kAdaptive};
+  std::uint32_t max_draft{7};
+  std::uint32_t min_draft{1};
 };
 
 std::vector<std::string> Split(const std::string& text) {
@@ -92,6 +106,20 @@ Options ParseArgs(int argc, char** argv) {
       options.temps.clear();
       for (const auto& part : Split(next("--temps")))
         options.temps.push_back(std::stof(part));
+    } else if (arg == "--policies") {
+      options.policies.clear();
+      for (const auto& part : Split(next("--policies"))) {
+        if (part == "fixed")
+          options.policies.push_back(ext::TextDFlashDraftPolicy::kFixed);
+        else if (part == "adaptive")
+          options.policies.push_back(ext::TextDFlashDraftPolicy::kAdaptive);
+        else
+          Fail("--policies takes fixed and/or adaptive");
+      }
+    } else if (arg == "--max-draft") {
+      options.max_draft = std::stoul(next("--max-draft"));
+    } else if (arg == "--min-draft") {
+      options.min_draft = std::stoul(next("--min-draft"));
     } else if (arg == "--seeds") {
       options.seeds.clear();
       for (const auto& part : Split(next("--seeds")))
@@ -166,7 +194,8 @@ public:
 // One runner per configuration. FLINT_SPEC is read when the runner is created.
 class Harness {
 public:
-  explicit Harness(const std::string& spec_value, const std::string& target) {
+  explicit Harness(const std::string& spec_value, const std::string& target,
+                   const DraftSettings& draft) {
     if (spec_value.empty())
       unsetenv("FLINT_SPEC");
     else
@@ -174,6 +203,12 @@ public:
     ext::TextRunnerOptions options;
     options.model_path = target;
     options.max_context = 8192;
+    options.speculative.backend = spec_value == "dflash"
+                                      ? ext::TextSpeculativeBackend::kDFlash
+                                      : ext::TextSpeculativeBackend::kDisabled;
+    options.speculative.dflash_policy = draft.policy;
+    options.speculative.max_draft_tokens = draft.max_draft;
+    options.speculative.min_draft_tokens = draft.min_draft;
     std::string error;
     runner_ = model::CreateFlintTextRunner(options, &error);
     if (!runner_)
@@ -277,10 +312,11 @@ struct Job {
 // resident together: two 25 GB target models stall HIP allocation and upload.
 std::vector<RunResult> RunConfig(const char* spec_value, const Options& options,
                                  const std::vector<Job>& jobs,
-                                 std::size_t max_tokens) {
+                                 std::size_t max_tokens,
+                                 const DraftSettings& draft = {}) {
   std::vector<RunResult> results;
   results.reserve(jobs.size());
-  Harness harness(spec_value, options.target);
+  Harness harness(spec_value, options.target, draft);
   for (const auto& job : jobs)
     results.push_back(harness.Run(*job.prompt, job.config, max_tokens));
   return results;
@@ -341,6 +377,9 @@ int RunNull(const Options& options, const std::vector<Prompt>& prompts) {
   return failures == 0 ? 0 : 1;
 }
 
+void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
+                 const std::vector<RunResult>& ons);
+
 // Speedup and tokens per cycle at each temperature, over the prompt set.
 int RunSpeed(const Options& options, const std::vector<Prompt>& prompts) {
   std::vector<Job> jobs;
@@ -351,7 +390,22 @@ int RunSpeed(const Options& options, const std::vector<Prompt>& prompts) {
     }
   }
   const auto offs = RunConfig("off", options, jobs, options.max_tokens);
-  const auto ons = RunConfig("dflash", options, jobs, options.max_tokens);
+  for (const auto policy : options.policies) {
+    const DraftSettings draft{policy, options.max_draft, options.min_draft};
+    const auto ons = RunConfig("dflash", options, jobs, options.max_tokens,
+                               draft);
+    std::cout << "policy=" << ext::TextDFlashDraftPolicyName(policy)
+              << " max_draft=" << draft.max_draft
+              << " min_draft=" << draft.min_draft << "\n";
+    ReportSpeed(options, offs, ons);
+  }
+  return 0;
+}
+
+// Per-temperature summary of one policy's dflash run against spec-off.
+void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
+                 const std::vector<RunResult>& ons) {
+  const std::size_t prompts = offs.size() / options.temps.size();
   std::size_t index = 0;
   for (const float temperature : options.temps) {
     double off_seconds = 0.0;
@@ -361,7 +415,7 @@ int RunSpeed(const Options& options, const std::vector<Prompt>& prompts) {
     std::size_t rounds = 0;
     std::size_t drafted = 0;
     std::size_t accepted = 0;
-    for (std::size_t p = 0; p < prompts.size(); ++p, ++index) {
+    for (std::size_t p = 0; p < prompts; ++p, ++index) {
       const auto& reference = offs[index];
       const auto& spec = ons[index];
       off_seconds += reference.seconds;
@@ -384,9 +438,10 @@ int RunSpeed(const Options& options, const std::vector<Prompt>& prompts) {
               << " accept_rate="
               << (drafted == 0 ? 0.0
                                : static_cast<double>(accepted) / drafted)
+              << " mean_draft="
+              << (rounds == 0 ? 0.0 : static_cast<double>(drafted) / rounds)
               << "\n";
   }
-  return 0;
 }
 
 }  // namespace

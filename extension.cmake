@@ -41,6 +41,7 @@ gufo_extension_target(
     src/gpu/engine_stub.cpp
     src/spec/target_adapter.cpp
     src/spec/cycle.cpp
+    src/spec/draft_policy.cpp
     src/tokenizer_support.cpp
     hip/vendor/rocm/blaslt.cpp
     hip/vendor/qwen/tokenizer.cpp
@@ -216,6 +217,24 @@ endif()
 # ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
+# The draft policy (M4): pure host code, no device or weights.
+gufo_extension_target(
+  NAME flint_draft_policy_test
+  SOURCES
+    tests/draft_policy_test.cpp
+    src/spec/draft_policy.cpp
+  LINK_LIBRARIES
+    gufo_ext_runtime
+)
+
+if(TARGET flint_draft_policy_test)
+  target_include_directories(flint_draft_policy_test PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+  add_test(NAME flint.draft_policy COMMAND flint_draft_policy_test)
+  set_tests_properties(flint.draft_policy PROPERTIES LABELS "flint;cpu")
+endif()
+
 gufo_extension_target(
   NAME flint_config_test
   SOURCES

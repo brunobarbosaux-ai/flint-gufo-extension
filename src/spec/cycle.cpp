@@ -15,9 +15,8 @@ bool Fail(std::string* error_msg, std::string message) {
 }  // namespace
 
 SpecCycle::SpecCycle(TargetAdapter& target,
-                     gpu::dflash::DflashForward& drafter,
-                     std::uint32_t draft_count)
-    : target_(target), drafter_(drafter), draft_count_(draft_count) {}
+                     gpu::dflash::DflashForward& drafter, DraftPolicy policy)
+    : target_(target), drafter_(drafter), policy_(policy) {}
 
 bool SpecCycle::SyncContext(std::uint32_t position, std::string* error_msg) {
   if (position == injected_)
@@ -34,7 +33,8 @@ bool SpecCycle::SyncContext(std::uint32_t position, std::string* error_msg) {
 }
 
 void SpecCycle::Reset() noexcept {
-  End();
+  End(false);
+  pending_ = false;
   drafter_.ResetContext();
   injected_ = 0;
   stats_ = {};
@@ -42,14 +42,19 @@ void SpecCycle::Reset() noexcept {
 
 void SpecCycle::Abort() noexcept {
   if (active_)
-    End();
+    End(false);
 }
 
-void SpecCycle::End() noexcept {
+void SpecCycle::End(bool natural) noexcept {
   if (!active_)
     return;
-  // Keep the anchor (row 0's input) and every accepted draft.
+  // Keep the anchor (row 0's input) and every accepted draft. A natural end
+  // emits one more token whose row is not cached: it becomes the pending
+  // anchor, and the next verify writes its row. Abort leaves nothing pending.
   target_.Rewind(base_ + accepted_ + 1);
+  if (natural)
+    policy_.Observe(draft_k_, accepted_);
+  pending_ = natural;
   active_ = false;
   row_ = 0;
   accepted_ = 0;
@@ -57,25 +62,32 @@ void SpecCycle::End() noexcept {
 }
 
 bool SpecCycle::Start(std::uint32_t anchor, std::string* error_msg) {
-  // The anchor is the last committed token, cached at Position()-1. Rewind onto
-  // it so the verify pass re-appends the anchor as row 0. The drafter needs
-  // residuals for [0, base) only, so sync before the rewind to keep its
-  // context at or ahead of base.
+  // The anchor is the last committed token. After a natural end it is the
+  // pending emitted token, uncached at Position(), so base = Position(). The
+  // first cycle after prefill or a reused prefix has the anchor cached at
+  // Position()-1: rewind onto it so the verify pass re-appends it as row 0.
+  // The drafter needs residuals for [0, base) only, so sync before the rewind
+  // to keep its context at or ahead of base.
   if (target_.Position() == 0)
     return Fail(error_msg, "speculative cycle needs a committed token");
-  const std::uint32_t base = target_.Position() - 1;
-  if (base + draft_count_ + 1 > target_.Capacity())
+  const bool pending = pending_;
+  const std::uint32_t base = pending ? target_.Position()
+                                     : target_.Position() - 1;
+  // The policy picks this block's length from the cycle's target depth.
+  const std::uint32_t draft_count = policy_.Length(base);
+  if (base + draft_count + 1 > target_.Capacity())
     return Fail(error_msg,
                 "target session is too small for the next block; raise "
                 "its context");
   if (!SyncContext(base, error_msg))
     return false;
-  target_.Rewind(base);
+  if (!pending)
+    target_.Rewind(base);
 
   gpu::dflash::DflashDraft draft;
-  if (!drafter_.Run(anchor, base, draft_count_, 0.0F, {}, {}, &draft, error_msg))
+  if (!drafter_.Run(anchor, base, draft_count, 0.0F, {}, {}, &draft, error_msg))
     return false;
-  if (draft.tokens.size() != draft_count_)
+  if (draft.tokens.size() != draft_count)
     return Fail(error_msg, "draft block returned the wrong proposal count");
   if (draft_transform_ != nullptr)
     for (auto& token : draft.tokens)
@@ -83,21 +95,22 @@ bool SpecCycle::Start(std::uint32_t anchor, std::string* error_msg) {
 
   // [anchor, draft_0 .. draft_{k-1}]: row 0 is the distribution after the
   // anchor, row i the distribution after draft_{i-1}.
-  std::vector<std::int32_t> batch(draft_count_ + 1);
+  std::vector<std::int32_t> batch(draft_count + 1);
   batch[0] = static_cast<std::int32_t>(anchor);
-  for (std::uint32_t i = 0; i < draft_count_; ++i)
+  for (std::uint32_t i = 0; i < draft_count; ++i)
     batch[i + 1] = static_cast<std::int32_t>(draft.tokens[i]);
   if (!target_.VerifyRows(batch, error_msg))
     return false;
 
+  pending_ = false;
   drafts_ = draft.tokens;
   base_ = base;
-  draft_k_ = draft_count_;
+  draft_k_ = draft_count;
   row_ = 0;
   accepted_ = 0;
   active_ = true;
   stats_.draft_rounds += 1;
-  stats_.draft_tokens += draft_count_;
+  stats_.draft_tokens += draft_count;
   return true;
 }
 
@@ -127,8 +140,9 @@ bool SpecCycle::Next(std::uint32_t anchor, sampling::SamplerState& sampler,
   }
 
   // First mismatch, or the bonus row after all k drafts: emit and end. The
-  // cache keeps the anchor and the accepted drafts, not the emitted token.
-  End();
+  // cache keeps the anchor and the accepted drafts; the emitted token is
+  // pending until the next verify.
+  End(true);
   return true;
 }
 

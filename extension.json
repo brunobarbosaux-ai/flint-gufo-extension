@@ -17,6 +17,7 @@
     "flint_dflash_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_dflash_forward_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_target_adapter_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_draft_policy_test": { "requires": ["testing"], "role": "test" },
     "flint_drafter_probe": { "requires": ["testing"], "role": "test" },
     "flint_drafter_parity": { "requires": ["hip", "testing"], "role": "test" },
     "flint_spec_gate": { "requires": ["hip", "testing"], "role": "test" }

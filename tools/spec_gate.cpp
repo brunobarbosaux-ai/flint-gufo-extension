@@ -12,6 +12,9 @@
 //   --mode settings each sampler setting (top-k, top-p, min-p, repeat and
 //                   frequency penalty, JSON grammar): spec-on must equal
 //                   spec-off, and grammar output must parse and validate
+//                   --settings <substr> runs only the matching settings
+//   --mode memory   runner claim (resident + per-request) vs the device bytes
+//                   taken by runner + one slot + one bound state
 //
 // --depth N pads every chat prompt with deterministic filler so the prompt is
 // exactly N tokens (0 = unpadded). The filler is the same for spec-off and
@@ -34,6 +37,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <hip/hip_runtime.h>
 
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/json.hpp>
@@ -67,6 +72,8 @@ struct Options {
   std::vector<float> temps{0.0F};
   std::vector<std::uint64_t> seeds{1};
   std::size_t prompts_limit{12};
+  // Settings mode: run only settings whose name contains this (empty = all).
+  std::string settings_filter;
   // Speed mode: which draft policies to measure, and the draft bounds.
   std::vector<ext::TextDFlashDraftPolicy> policies{
       ext::TextDFlashDraftPolicy::kAdaptive};
@@ -136,12 +143,15 @@ Options ParseArgs(int argc, char** argv) {
         options.seeds.push_back(std::stoull(part));
     } else if (arg == "--depth") {
       options.depth = std::stoul(next("--depth"));
+    } else if (arg == "--settings") {
+      options.settings_filter = next("--settings");
     } else {
       Fail("unknown argument " + arg);
     }
   }
-  if (options.target.empty() || options.prompts.empty() ||
-      options.mode.empty())
+  // Memory mode builds no prompts, so --prompts is optional there.
+  if (options.target.empty() || options.mode.empty() ||
+      (options.prompts.empty() && options.mode != "memory"))
     Fail("--target, --prompts and --mode are required");
   return options;
 }
@@ -226,6 +236,9 @@ struct RunResult {
   std::size_t draft_rounds{0};
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
+  // True when the runner reported a stop (EOS or constraint complete); false
+  // when the loop ended at the --max-tokens budget.
+  bool stopped{false};
   double seconds{0.0};
   double decode_seconds{0.0};
 };
@@ -316,7 +329,11 @@ public:
       result.draft_rounds += decode.draft_rounds;
       result.draft_tokens += decode.draft_tokens;
       result.draft_accepted_tokens += decode.draft_accepted_tokens;
-      if (decode.stop || decode.selections.empty())
+      if (decode.stop) {
+        result.stopped = true;
+        break;
+      }
+      if (decode.selections.empty())
         break;
     }
     const auto finished = std::chrono::steady_clock::now();
@@ -330,6 +347,24 @@ public:
   std::shared_ptr<const sampling::TokenConstraint> Bind(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const {
     return runner_->BindConstraint(std::move(grammar));
+  }
+
+  // Binds the slot's request state (allocates the hidden ring when spec is
+  // on). The caller keeps it alive while measuring.
+  std::unique_ptr<ext::TextRunnerState> BindState() const {
+    return runner_->BindComponentState(*resources_->adapter, *slot_);
+  }
+
+  // A further slot on the same adapter, with its own bound state.
+  std::unique_ptr<cache::Slot> NewSlot() {
+    return resources_->adapter->CreateSlot(*guard_);
+  }
+  std::unique_ptr<ext::TextRunnerState> BindStateOn(cache::Slot& slot) const {
+    return runner_->BindComponentState(*resources_->adapter, slot);
+  }
+
+  [[nodiscard]] ext::TextRunnerResourceClaim Claim() const {
+    return runner_->ResourceClaim();
   }
 
 private:
@@ -528,6 +563,19 @@ int RunSettings(const Options& options, const std::vector<Prompt>& prompts,
   }
   settings.push_back({"grammar answer-object temp=0", Greedy(), AnswerGrammar()});
 
+  // Settings filter: keep only the settings whose name contains the substring.
+  if (!options.settings_filter.empty()) {
+    settings.erase(std::remove_if(settings.begin(), settings.end(),
+                                  [&](const Setting& setting) {
+                                    return setting.name.find(
+                                               options.settings_filter) ==
+                                           std::string::npos;
+                                  }),
+                   settings.end());
+    if (settings.empty())
+      Fail("--settings matches no setting: " + options.settings_filter);
+  }
+
   // Plain greedy (no settings) is the reference for equals_greedy and penalty.
   std::vector<Job> jobs;
   for (const auto& setting : settings)
@@ -546,6 +594,7 @@ int RunSettings(const Options& options, const std::vector<Prompt>& prompts,
     const auto& setting = settings[s];
     std::size_t identical = 0;
     std::size_t violations = 0;
+    std::size_t not_evaluated = 0;
     std::size_t greedy_mismatch = 0;
     std::size_t differs_from_plain = 0;
     for (std::size_t p = 0; p < n; ++p) {
@@ -555,11 +604,21 @@ int RunSettings(const Options& options, const std::vector<Prompt>& prompts,
       if (SameTokens(reference, spec))
         ++identical;
       if (setting.grammar && !ValidAnswer(tokenizer.Decode(reference.tokens))) {
-        if (violations == 0)
-          std::cout << "  sample_violation " << prompts[p].id << ": "
-                    << tokenizer.Decode(reference.tokens).substr(0, 160)
-                    << "\n";
-        ++violations;
+        // End reason: no runner stop means the output was cut by --max-tokens.
+        const bool budget = !reference.stopped;
+        const std::string text = tokenizer.Decode(reference.tokens);
+        const std::string tail =
+            text.size() > 80 ? text.substr(text.size() - 80) : text;
+        // D1: a budget-cut output is not a grammar violation; it is not evaluated.
+        std::cout << "  " << (budget ? "not_evaluated " : "violation ")
+                  << prompts[p].id
+                  << " ended_by=" << (budget ? "budget" : "stop")
+                  << " tokens=" << reference.tokens.size()
+                  << " tail=" << std::quoted(tail) << "\n";
+        if (budget)
+          ++not_evaluated;
+        else
+          ++violations;
       }
       if (!SameTokens(offs[plain + p], reference)) {
         if (setting.equals_greedy)
@@ -574,7 +633,8 @@ int RunSettings(const Options& options, const std::vector<Prompt>& prompts,
     std::cout << (pass ? "PASS " : "FAIL ") << "settings " << setting.name
               << " identical=" << identical << "/" << n;
     if (setting.grammar)
-      std::cout << " violations=" << violations << "/" << n;
+      std::cout << " violations=" << violations << "/" << n
+                << " not_evaluated=" << not_evaluated << "/" << n;
     if (setting.equals_greedy)
       std::cout << " differs_from_greedy=" << greedy_mismatch << "/" << n;
     if (setting.penalty)
@@ -583,6 +643,68 @@ int RunSettings(const Options& options, const std::vector<Prompt>& prompts,
   }
   std::cout << "settings: " << (settings.size() - failures) << "/"
             << settings.size() << " pass\n";
+  return failures == 0 ? 0 : 1;
+}
+
+// Memory accounting: for each mode, the runner's claim (resident + per-request)
+// against the device memory actually taken by runner creation, one slot, and
+// one bound request state (hipMemGetInfo before and after each step).
+int RunMemory(const Options& options) {
+  struct Mode {
+    const char* label;
+    const char* spec;
+  };
+  const Mode modes[] = {{"spec-off", "off"}, {"spec-on", "dflash"}};
+  const auto context = static_cast<std::uint32_t>(
+      ContextFor(options.depth, options.max_tokens));
+  const auto free_now = [] {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
+      Fail("hipMemGetInfo failed");
+    return free_bytes;
+  };
+  // One-time device costs (HIP context, kernel module load, MMQ scratch) would
+  // otherwise land in whichever mode runs first. Prime them with a throwaway
+  // runner so both measured deltas cover only that mode's allocations.
+  { Harness prime("off", options.target, DraftSettings{}, context); }
+  // The host sizes concurrency from per_request_state_bytes, so the gate
+  // checks the incremental cost of a session. The first-slot total includes
+  // one-time process overhead and is reported for information only.
+  std::size_t failures = 0;
+  for (const auto& mode : modes) {
+    const std::size_t before = free_now();
+    Harness harness(mode.spec, options.target, DraftSettings{}, context);
+    const std::size_t after_harness = free_now();
+    const auto state1 = harness.BindState();
+    const std::size_t slot1_free = free_now();
+    const auto claim = harness.Claim();
+    const std::size_t resident_claim = claim.resident_weights_bytes.value_or(0);
+    const std::size_t per_request_claim =
+        claim.per_request_state_bytes.value_or(0);
+    const std::size_t first_slot_total = before - slot1_free;
+
+    // Declared after the harness so they are destroyed before it.
+    auto slot2 = harness.NewSlot();
+    const auto state2 = harness.BindStateOn(*slot2);
+    const std::size_t slot2_free = free_now();
+    const std::size_t per_request_measured = slot1_free - slot2_free;
+
+    const bool pass = per_request_claim >= per_request_measured;
+    if (!pass)
+      ++failures;
+    std::cout << (pass ? "PASS " : "FAIL ") << "memory " << mode.label
+              << " per_request_claimed=" << per_request_claim
+              << " per_request_measured=" << per_request_measured
+              << " (second slot)\n"
+              << "  info " << mode.label
+              << " resident_weights_claimed=" << resident_claim
+              << " first_slot_total_delta=" << first_slot_total
+              << " (includes one-time overhead; harness="
+              << before - after_harness
+              << " bind=" << after_harness - slot1_free << ")\n";
+  }
+  std::cout << "memory: " << (2 - failures) << "/2 pass\n";
   return failures == 0 ? 0 : 1;
 }
 
@@ -672,6 +794,8 @@ int main(int argc, char** argv) {
     auto tokenizer = qwen::QwenTokenizer::CreateFromGguf(*reader, &error);
     if (!tokenizer)
       Fail("tokenizer: " + error);
+    if (options.mode == "memory")
+      return RunMemory(options);
     const auto prompts = ReadPrompts(options.prompts, *tokenizer,
                                      options.prompts_limit, options.depth);
     if (options.mode == "gx")
@@ -682,7 +806,7 @@ int main(int argc, char** argv) {
       return RunSpeed(options, prompts);
     if (options.mode == "settings")
       return RunSettings(options, prompts, *tokenizer);
-    Fail("--mode must be gx, null, speed or settings");
+    Fail("--mode must be gx, null, speed, settings or memory");
   } catch (const std::exception& failure) {
     std::cerr << "flint_spec_gate: " << failure.what() << "\n";
     return 2;

@@ -10,7 +10,7 @@ Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`
 | M3 | Cycle + runner integration | COMPLETE | | `src/spec/cycle.{hpp,cpp}`, `FLINT_SPEC=dflash\|off\|null`; GX 12/12 + null 108/108 byte-identical; speedup 0.77/0.69/0.65 at temp 0/0.6/1.0 (see §1 note) |
 | M4 | Draft policy | COMPLETE | d2680fb | adaptive + fixed; honours max/min/policy; deferred emitted-token row (append removed). GX 12/12, null 72/72; adaptive 1.185/0.970/0.970 vs fixed 1.024/0.850/0.827 at temp 0/0.7/1.0. Temp-1.0 parity within noise (fixed-k ceiling ~1.00x) |
 | M5 | Gates | COMPLETE | 8d7d82f | Smoke tier. GX 12/12 @ 0/8k/32k/131k; null 72/72; settings 8/8 (grammar via D1: violations=0, not_evaluated=2); quants Q6_K/Q4_K_M/BF16 GX 3/3, accept 0.42-0.44; no-regression 70.96/63.56/51.05/28.18 vs 71/63/50/28 (existing logs); memory: ring+drafter accounted (measured growth = 320 MiB ring exactly); cost+concurrency deferred to M6 docs. Pre-existing ~660 MiB SessionBytes undercount in DEFERRED.md |
-| M6 | Release | NOT STARTED | | QUALITY.md, extension.json 0.3.0, registry PR, llama-swap, issue #1 |
+| M6 | Release | IN PROGRESS | 79f744f | 0.3.0 + speculative_defaults committed/pushed; QUALITY/README/LLAMA-SWAP/REGISTRY-PR docs + evidence; registry PR gufo-org/gufo-extension#17 (check PASS, digest of 79f744f); issue #1 answered with measured table. Open: `gufo serve --speculative dflash2` host-side load check stalled (serve-only path); unattended release batch before ship |
 
 ## M2 findings (carried into M3)
 

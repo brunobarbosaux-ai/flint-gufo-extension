@@ -53,8 +53,10 @@ public:
   // available. The ring is not part of a snapshot: a restored session must
   // re-prime it from fresh appends before a drafter can read past positions.
 
-  /// Positions the ring covers; covers the drafter's 2048-token window.
-  static constexpr std::uint32_t kHiddenRingRows = 2048;
+  /// Positions the ring covers; sized to a whole prefill chunk (8192) so that
+  /// speculation prefills in the same chunks as spec-off. The drafter's own
+  /// context ring keeps its 2048-token sliding window separately.
+  static constexpr std::uint32_t kHiddenRingRows = 8192;
   /// Taps one ring can hold; the drafter uses five.
   static constexpr std::uint32_t kMaxHiddenTaps = 16;
 

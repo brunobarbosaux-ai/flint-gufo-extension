@@ -462,11 +462,12 @@ public:
       throw std::logic_error("Flint prefill offset does not match state");
     if (offset >= prompt.size())
       throw std::logic_error("Flint prefill has no remaining input");
-    // With speculation, a chunk may not exceed the hidden ring: the drafter
-    // must take each chunk's residuals before a later chunk pushes them out.
-    std::size_t limit = kPrefillChunk;
-    if (flint.cycle() != nullptr)
-      limit = std::min<std::size_t>(limit, FlintSession::kHiddenRingRows);
+    // Same chunking with and without speculation: the multi-token prefill
+    // result depends on chunk size, so spec-on must not chunk differently.
+    static_assert(
+        FlintSession::kHiddenRingRows >= kPrefillChunk,
+        "hidden ring must hold a whole prefill chunk when speculation is on");
+    const std::size_t limit = kPrefillChunk;
     const std::size_t consumed = std::min<std::size_t>(
         {max_input_tokens, prompt.size() - offset, limit});
     const auto chunk = FlintEngineTokens(prompt.subspan(offset, consumed));

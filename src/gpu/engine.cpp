@@ -1348,7 +1348,7 @@ const float* Session::CapturedHiddenDevice(std::uint32_t row,
     return nullptr;
   // Only positions at or after the ring start, and before the next token, are
   // still in the ring.
-  if (row >= s.position || row + s.hidden_ring_rows <= s.position)
+  if (row >= s.position || row + s.hidden_ring_rows < s.position)
     return nullptr;
   const std::size_t hidden = s.model->config.hidden_size;
   const std::size_t slot = row % s.hidden_ring_rows;

@@ -9,10 +9,17 @@
 //                   temperature and seed
 //   --mode speed    tokens per cycle and speedup of dflash over spec-off,
 //                   once per --policies entry (fixed, adaptive)
+//   --mode settings each sampler setting (top-k, top-p, min-p, repeat and
+//                   frequency penalty, JSON grammar): spec-on must equal
+//                   spec-off, and grammar output must parse and validate
+//
+// --depth N pads every chat prompt with deterministic filler so the prompt is
+// exactly N tokens (0 = unpadded). The filler is the same for spec-off and
+// spec-on. Decode throughput excludes prefill.
 //
 // Usage: flint_spec_gate --target <target.gguf> --prompts <prompts.jsonl>
-//          --mode gx|null|speed [--max-tokens N] [--temps 0,0.6,1.0]
-//          [--seeds 1,2,3] [--prompts-limit N]
+//          --mode gx|null|speed|settings [--depth N] [--max-tokens N]
+//          [--temps 0,0.6,1.0] [--seeds 1,2,3] [--prompts-limit N]
 //          [--policies fixed,adaptive] [--max-draft N] [--min-draft N]
 #include <algorithm>
 #include <chrono>
@@ -20,6 +27,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -64,6 +72,8 @@ struct Options {
       ext::TextDFlashDraftPolicy::kAdaptive};
   std::uint32_t max_draft{7};
   std::uint32_t min_draft{1};
+  // Prompt depth in tokens (0 = unpadded). Sets the runner's max_context.
+  std::size_t depth{0};
 };
 
 // The policy the gate's dflash runs use; the spec-off runs ignore it.
@@ -124,6 +134,8 @@ Options ParseArgs(int argc, char** argv) {
       options.seeds.clear();
       for (const auto& part : Split(next("--seeds")))
         options.seeds.push_back(std::stoull(part));
+    } else if (arg == "--depth") {
+      options.depth = std::stoul(next("--depth"));
     } else {
       Fail("unknown argument " + arg);
     }
@@ -139,11 +151,38 @@ struct Prompt {
   std::vector<std::uint32_t> tokens;
 };
 
+// Deterministic filler: a fixed-seed word stream, encoded block by block, cut
+// to exactly `count` tokens. Identical for every run at a given count.
+std::vector<std::uint32_t> FillerTokens(const qwen::QwenTokenizer& tokenizer,
+                                        std::size_t count) {
+  static constexpr const char* kWords[] = {
+      "river", "lantern", "copper", "harbor", "signal", "meadow", "garden",
+      "engine", "thread", "compass", "orchard", "ledger", "beacon", "fabric",
+      "window", "bridge", "marble", "quarry", "saddle", "tunnel", "violet",
+      "pepper", "cinder", "anchor"};
+  constexpr std::size_t kWordCount = sizeof(kWords) / sizeof(kWords[0]);
+  std::vector<std::uint32_t> tokens;
+  std::uint64_t state = 0x9E3779B97F4A7C15ULL;
+  while (tokens.size() < count) {
+    std::string text;
+    for (int word = 0; word < 256; ++word) {
+      state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+      text += kWords[(state >> 33) % kWordCount];
+      text += ' ';
+    }
+    const auto ids = tokenizer.Encode(text);
+    tokens.insert(tokens.end(), ids.begin(), ids.end());
+  }
+  tokens.resize(count);
+  return tokens;
+}
+
 // Chat prompts through the chat template with thinking disabled, the same
-// encoding the acceptance workload was measured with.
+// encoding the acceptance workload was measured with. With depth > 0 the
+// filler is prepended so every prompt is exactly `depth` tokens.
 std::vector<Prompt> ReadPrompts(const std::string& path,
                                 const qwen::QwenTokenizer& tokenizer,
-                                std::size_t limit) {
+                                std::size_t limit, std::size_t depth) {
   std::ifstream input(path, std::ios::binary);
   if (!input)
     Fail("cannot read " + path);
@@ -165,9 +204,16 @@ std::vector<Prompt> ReadPrompts(const std::string& path,
                 {"user", spec.member_str("text"), ""}},
             template_options),
         encode_options);
+    if (ids.size() > depth && depth > 0)
+      Fail("prompt " + spec.member_str("id") + " is longer than --depth");
     Prompt prompt;
     prompt.id = spec.member_str("id");
-    prompt.tokens.assign(ids.begin(), ids.end());
+    if (depth > 0) {
+      prompt.tokens = FillerTokens(tokenizer, depth - ids.size());
+      prompt.tokens.insert(prompt.tokens.end(), ids.begin(), ids.end());
+    } else {
+      prompt.tokens.assign(ids.begin(), ids.end());
+    }
     prompts.push_back(std::move(prompt));
   }
   if (prompts.empty())
@@ -181,6 +227,7 @@ struct RunResult {
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
   double seconds{0.0};
+  double decode_seconds{0.0};
 };
 
 // The gate runs one request at a time and never restores a snapshot, so the
@@ -195,14 +242,14 @@ public:
 class Harness {
 public:
   explicit Harness(const std::string& spec_value, const std::string& target,
-                   const DraftSettings& draft) {
+                   const DraftSettings& draft, std::uint32_t max_context) {
     if (spec_value.empty())
       unsetenv("FLINT_SPEC");
     else
       setenv("FLINT_SPEC", spec_value.c_str(), 1);
     ext::TextRunnerOptions options;
     options.model_path = target;
-    options.max_context = 8192;
+    options.max_context = max_context;
     options.speculative.backend = spec_value == "dflash"
                                       ? ext::TextSpeculativeBackend::kDFlash
                                       : ext::TextSpeculativeBackend::kDisabled;
@@ -244,11 +291,14 @@ public:
     const auto started = std::chrono::steady_clock::now();
     std::size_t offset = 0;
     for (;;) {
-      const auto step = runner_->Prefill(*state, tokens, offset, tokens.size());
+      // No gate-side cap: the runner's own limits pick the chunk size.
+      const auto step = runner_->Prefill(
+          *state, tokens, offset, std::numeric_limits<std::size_t>::max());
       offset += step.consumed_tokens;
       if (step.decode_ready)
         break;
     }
+    const auto decode_started = std::chrono::steady_clock::now();
 
     // The host previews the first token on a copy of the sampler and requires
     // the real first decode to repeat it. The gate checks the same thing.
@@ -269,10 +319,17 @@ public:
       if (decode.stop || decode.selections.empty())
         break;
     }
-    result.seconds = std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - started)
-                         .count();
+    const auto finished = std::chrono::steady_clock::now();
+    result.seconds = std::chrono::duration<double>(finished - started).count();
+    result.decode_seconds =
+        std::chrono::duration<double>(finished - decode_started).count();
     return result;
+  }
+
+  // Binds a grammar the way the host does: through the runner's vocabulary.
+  std::shared_ptr<const sampling::TokenConstraint> Bind(
+      std::shared_ptr<const sampling::JsonConstraint> grammar) const {
+    return runner_->BindConstraint(std::move(grammar));
   }
 
 private:
@@ -306,7 +363,17 @@ void Report(const std::string& label, const std::string& id,
 struct Job {
   const Prompt* prompt;
   sampling::SamplingConfig config;
+  // Optional structured-output grammar, bound per runner by RunConfig.
+  std::shared_ptr<const sampling::JsonConstraint> grammar;
 };
+
+// Context for a prompt of `depth` tokens: the prompt, the generated tokens and
+// a margin. Depth 0 keeps the historical 8192 so existing numbers hold.
+std::uint32_t ContextFor(std::size_t depth, std::size_t max_tokens) {
+  if (depth == 0)
+    return 8192;
+  return static_cast<std::uint32_t>(depth + max_tokens + 256);
+}
 
 // Runs every job on one harness, then destroys it. OFF and ON are never
 // resident together: two 25 GB target models stall HIP allocation and upload.
@@ -316,9 +383,14 @@ std::vector<RunResult> RunConfig(const char* spec_value, const Options& options,
                                  const DraftSettings& draft = {}) {
   std::vector<RunResult> results;
   results.reserve(jobs.size());
-  Harness harness(spec_value, options.target, draft);
-  for (const auto& job : jobs)
-    results.push_back(harness.Run(*job.prompt, job.config, max_tokens));
+  Harness harness(spec_value, options.target, draft,
+                  ContextFor(options.depth, max_tokens));
+  for (const auto& job : jobs) {
+    auto config = job.config;
+    if (job.grammar)
+      config.constraint = harness.Bind(job.grammar);
+    results.push_back(harness.Run(*job.prompt, config, max_tokens));
+  }
   return results;
 }
 
@@ -326,7 +398,7 @@ std::vector<RunResult> RunConfig(const char* spec_value, const Options& options,
 int RunGx(const Options& options, const std::vector<Prompt>& prompts) {
   std::vector<Job> jobs;
   for (const auto& prompt : prompts)
-    jobs.push_back({&prompt, Greedy()});
+    jobs.push_back({&prompt, Greedy(), nullptr});
   const auto offs = RunConfig("off", options, jobs, options.max_tokens);
   const auto ons = RunConfig("dflash", options, jobs, options.max_tokens);
   std::size_t failures = 0;
@@ -351,7 +423,8 @@ int RunNull(const Options& options, const std::vector<Prompt>& prompts) {
       for (const auto& prompt : prompts) {
         jobs.push_back({&prompt, temperature == 0.0F
                                      ? Greedy()
-                                     : Sampled(temperature, seed)});
+                                     : Sampled(temperature, seed),
+                        nullptr});
       }
     }
   }
@@ -380,13 +453,147 @@ int RunNull(const Options& options, const std::vector<Prompt>& prompts) {
 void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
                  const std::vector<RunResult>& ons);
 
+// One sampler setting: the job config it applies, and the check it must pass.
+// `equals_greedy` settings must also match plain greedy output; `penalty`
+// settings report how often they change it, as evidence the penalty applies.
+struct Setting {
+  std::string name;
+  sampling::SamplingConfig config;
+  std::shared_ptr<const sampling::JsonConstraint> grammar;
+  bool equals_greedy{false};
+  bool penalty{false};
+};
+
+// Grammar: a JSON object with one required string member "answer".
+std::shared_ptr<const sampling::JsonConstraint> AnswerGrammar() {
+  const auto schema = gufo::json::parse(
+      R"({"type":"object","properties":{"answer":{"type":"string"}},)"
+      R"("required":["answer"],"additionalProperties":false})");
+  return sampling::JsonConstraint::Compile(schema, true);
+}
+
+// True when the text parses as a JSON object whose only member is "answer".
+bool ValidAnswer(const std::string& text) {
+  try {
+    const auto value = gufo::json::parse(text);
+    return value.is_object() && value.contains("answer") &&
+           value.members().size() == 1;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// Settings honour. Each setting runs spec-on and spec-off with the same
+// sampler config. Identity is required for every setting. top-k 1 and a tiny
+// top-p at temperature 0.7 must reproduce plain greedy, which shows the filter
+// is applied and not merely equal on both sides. The grammar output must
+// parse and validate.
+int RunSettings(const Options& options, const std::vector<Prompt>& prompts,
+                const qwen::QwenTokenizer& tokenizer) {
+  std::vector<Setting> settings;
+  {
+    Setting s{"top_k=40 temp=0.7", Sampled(0.7F, 1), nullptr};
+    s.config.top_k = 40;
+    settings.push_back(s);
+  }
+  {
+    Setting s{"top_k=1 temp=0.7", Sampled(0.7F, 1), nullptr, true};
+    s.config.top_k = 1;
+    settings.push_back(s);
+  }
+  {
+    Setting s{"top_p=0.9 temp=0.7", Sampled(0.7F, 1), nullptr};
+    s.config.top_p = 0.9F;
+    settings.push_back(s);
+  }
+  {
+    Setting s{"top_p=1e-6 temp=0.7", Sampled(0.7F, 1), nullptr, true};
+    s.config.top_p = 1e-6F;
+    settings.push_back(s);
+  }
+  {
+    Setting s{"min_p=0.05 temp=0.7", Sampled(0.7F, 1), nullptr};
+    s.config.min_p = 0.05F;
+    settings.push_back(s);
+  }
+  {
+    Setting s{"repeat_penalty=1.15 temp=0", Greedy(), nullptr, false, true};
+    s.config.repeat_penalty = 1.15F;
+    settings.push_back(s);
+  }
+  {
+    Setting s{"frequency_penalty=0.5 temp=0", Greedy(), nullptr, false, true};
+    s.config.frequency_penalty = 0.5F;
+    settings.push_back(s);
+  }
+  settings.push_back({"grammar answer-object temp=0", Greedy(), AnswerGrammar()});
+
+  // Plain greedy (no settings) is the reference for equals_greedy and penalty.
+  std::vector<Job> jobs;
+  for (const auto& setting : settings)
+    for (const auto& prompt : prompts)
+      jobs.push_back({&prompt, setting.config, setting.grammar});
+  for (const auto& prompt : prompts)
+    jobs.push_back({&prompt, Greedy(), nullptr});
+
+  const auto offs = RunConfig("off", options, jobs, options.max_tokens);
+  const auto ons = RunConfig("dflash", options, jobs, options.max_tokens);
+
+  const std::size_t n = prompts.size();
+  const std::size_t plain = settings.size() * n;
+  std::size_t failures = 0;
+  for (std::size_t s = 0; s < settings.size(); ++s) {
+    const auto& setting = settings[s];
+    std::size_t identical = 0;
+    std::size_t violations = 0;
+    std::size_t greedy_mismatch = 0;
+    std::size_t differs_from_plain = 0;
+    for (std::size_t p = 0; p < n; ++p) {
+      const std::size_t i = s * n + p;
+      const auto& reference = offs[i];
+      const auto& spec = ons[i];
+      if (SameTokens(reference, spec))
+        ++identical;
+      if (setting.grammar && !ValidAnswer(tokenizer.Decode(reference.tokens))) {
+        if (violations == 0)
+          std::cout << "  sample_violation " << prompts[p].id << ": "
+                    << tokenizer.Decode(reference.tokens).substr(0, 160)
+                    << "\n";
+        ++violations;
+      }
+      if (!SameTokens(offs[plain + p], reference)) {
+        if (setting.equals_greedy)
+          ++greedy_mismatch;
+        ++differs_from_plain;
+      }
+    }
+    const bool pass = identical == n && violations == 0 &&
+                      greedy_mismatch == 0;
+    if (!pass)
+      ++failures;
+    std::cout << (pass ? "PASS " : "FAIL ") << "settings " << setting.name
+              << " identical=" << identical << "/" << n;
+    if (setting.grammar)
+      std::cout << " violations=" << violations << "/" << n;
+    if (setting.equals_greedy)
+      std::cout << " differs_from_greedy=" << greedy_mismatch << "/" << n;
+    if (setting.penalty)
+      std::cout << " differs_from_plain=" << differs_from_plain << "/" << n;
+    std::cout << "\n";
+  }
+  std::cout << "settings: " << (settings.size() - failures) << "/"
+            << settings.size() << " pass\n";
+  return failures == 0 ? 0 : 1;
+}
+
 // Speedup and tokens per cycle at each temperature, over the prompt set.
 int RunSpeed(const Options& options, const std::vector<Prompt>& prompts) {
   std::vector<Job> jobs;
   for (const float temperature : options.temps) {
     for (const auto& prompt : prompts) {
       jobs.push_back({&prompt, temperature == 0.0F ? Greedy()
-                                                   : Sampled(temperature, 1)});
+                                                   : Sampled(temperature, 1),
+                      nullptr});
     }
   }
   const auto offs = RunConfig("off", options, jobs, options.max_tokens);
@@ -410,6 +617,8 @@ void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
   for (const float temperature : options.temps) {
     double off_seconds = 0.0;
     double on_seconds = 0.0;
+    double off_decode = 0.0;
+    double on_decode = 0.0;
     std::size_t off_tokens = 0;
     std::size_t on_tokens = 0;
     std::size_t rounds = 0;
@@ -420,6 +629,8 @@ void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
       const auto& spec = ons[index];
       off_seconds += reference.seconds;
       on_seconds += spec.seconds;
+      off_decode += reference.decode_seconds;
+      on_decode += spec.decode_seconds;
       off_tokens += reference.tokens.size();
       on_tokens += spec.tokens.size();
       rounds += spec.draft_rounds;
@@ -429,9 +640,14 @@ void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
     const double off_rate = off_tokens / off_seconds;
     const double on_rate = on_tokens / on_seconds;
     std::cout << std::fixed << std::setprecision(3)
-              << "speed temp=" << temperature << " tokens_off=" << off_tokens
+              << "speed temp=" << temperature << " depth=" << options.depth
+              << " tokens_off=" << off_tokens
               << " tokens_on=" << on_tokens << " tps_off=" << off_rate
               << " tps_on=" << on_rate << " speedup=" << on_rate / off_rate
+              << " decode_tps_off=" << off_tokens / off_decode
+              << " decode_tps_on=" << on_tokens / on_decode
+              << " decode_speedup=" << (on_tokens / on_decode) /
+                                           (off_tokens / off_decode)
               << " cycles=" << rounds << " tokens_per_cycle="
               << (rounds == 0 ? 0.0
                               : static_cast<double>(on_tokens) / rounds)
@@ -456,15 +672,17 @@ int main(int argc, char** argv) {
     auto tokenizer = qwen::QwenTokenizer::CreateFromGguf(*reader, &error);
     if (!tokenizer)
       Fail("tokenizer: " + error);
-    const auto prompts =
-        ReadPrompts(options.prompts, *tokenizer, options.prompts_limit);
+    const auto prompts = ReadPrompts(options.prompts, *tokenizer,
+                                     options.prompts_limit, options.depth);
     if (options.mode == "gx")
       return RunGx(options, prompts);
     if (options.mode == "null")
       return RunNull(options, prompts);
     if (options.mode == "speed")
       return RunSpeed(options, prompts);
-    Fail("--mode must be gx, null or speed");
+    if (options.mode == "settings")
+      return RunSettings(options, prompts, *tokenizer);
+    Fail("--mode must be gx, null, speed or settings");
   } catch (const std::exception& failure) {
     std::cerr << "flint_spec_gate: " << failure.what() << "\n";
     return 2;

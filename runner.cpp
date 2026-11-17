@@ -321,11 +321,32 @@ public:
     std::optional<std::size_t> capacity;
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
       capacity = free_bytes;
+    // Sessions are created at max_context_ (continuation_adapter.cpp); the
+    // verify padding is only in the KV estimate below, as before.
+    std::size_t resident = model_->ResidentBytes();
+    std::size_t per_request =
+        model_->SessionBytes(max_context_ + FlintSession::kMaxVerifyRows);
+    if (drafter_) {
+      // Speculation: the hidden ring is per session. The drafter is one object
+      // per runner and holds one context ring; the plan is serial, so it is
+      // counted once, as per-request state (conservative). Its weights and
+      // block workspace are resident.
+      const auto& draft = drafter_->config();
+      const std::size_t kv = draft.KvSize();
+      const std::size_t context_ring =
+          std::size_t{draft.num_layers} * 2 * drafter_->HistoryCapacity() * kv *
+          sizeof(float);
+      const std::size_t hidden_ring =
+          std::size_t{std::min(FlintSession::kHiddenRingRows, max_context_)} *
+          taps_.size() * hidden_width_ * sizeof(float);
+      resident += drafter_->AllocatedBytes() - context_ring;
+      per_request += hidden_ring + context_ring +
+                     drafter_->ContextScratchBytes();
+    }
     return {
-        .resident_weights_bytes = model_->ResidentBytes(),
+        .resident_weights_bytes = resident,
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes =
-            model_->SessionBytes(max_context_ + FlintSession::kMaxVerifyRows),
+        .per_request_state_bytes = per_request,
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes(),

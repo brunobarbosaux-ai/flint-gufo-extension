@@ -128,6 +128,16 @@ class DflashForward final {
   /// Rows the injected ring holds.
   [[nodiscard]] std::uint32_t HistoryCapacity() const noexcept;
 
+  /// Rows the context-injection scratch is sized for. AppendContext allocates
+  /// that scratch on first use, in chunks of at most this many rows.
+  static constexpr std::uint32_t kContextChunkRows = 256;
+  /// Device bytes of the context-injection scratch, derived from config. It is
+  /// allocated lazily, so this reports what the first AppendContext will take.
+  [[nodiscard]] std::size_t ContextScratchBytes() const noexcept;
+  /// Device bytes this drafter has allocated so far: weights, block workspace
+  /// and the injected context ring (and the scratch once it exists).
+  [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+
  private:
   DflashForward();
   struct Impl;

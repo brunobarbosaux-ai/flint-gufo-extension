@@ -134,6 +134,7 @@ struct DflashForward::Impl {
     trace(name, trace_host.data(), count);
   }
   std::vector<void*> allocations;
+  std::size_t allocated_bytes{0};
 
   // Injected target context: one K/V ring per draft layer.
   std::vector<float*> injected_k, injected_v;
@@ -155,6 +156,7 @@ struct DflashForward::Impl {
         pointer == nullptr)
       return nullptr;
     allocations.push_back(pointer);
+    allocated_bytes += bytes;
     return pointer;
   }
 
@@ -554,6 +556,20 @@ std::uint32_t DflashForward::HistoryCapacity() const noexcept {
   return impl_->history_capacity;
 }
 
+std::size_t DflashForward::ContextScratchBytes() const noexcept {
+  const DflashConfig& c = impl_->config;
+  const std::size_t hidden = c.hidden_size;
+  const std::size_t kv = c.KvSize();
+  const std::size_t row = c.target_layer_ids.size() * hidden;
+  // Mirrors AppendContext: features, hidden, normed, key and value scratch.
+  return std::size_t{kContextChunkRows} *
+         (row + 2 * hidden + 2 * kv) * sizeof(float);
+}
+
+std::size_t DflashForward::AllocatedBytes() const noexcept {
+  return impl_->allocated_bytes;
+}
+
 const float* DflashForward::InjectedKey(std::uint32_t layer) const noexcept {
   return layer < impl_->injected_k.size() ? impl_->injected_k[layer] : nullptr;
 }
@@ -582,7 +598,6 @@ bool DflashForward::AppendContext(std::span<const float> features,
   }
   // The oracle chunks the injection at 256 rows; the batch boundaries decide
   // which GEMM route each chunk takes, so keep them.
-  constexpr std::uint32_t kContextChunkRows = 256;
   const std::uint32_t chunk_rows = std::min(kContextChunkRows, count);
   if (s.context_features == nullptr) {
     // Scratch is sized for the cap, not this call's chunk: a later call with

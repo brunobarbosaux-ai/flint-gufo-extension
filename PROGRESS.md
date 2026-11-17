@@ -53,6 +53,22 @@ Consequence: the fixed per-cycle cost (drafter + append = 1.48 decodes) exceeds 
 
 **Decision (user, 2026-11-16): remove the per-cycle append.** The emitted token's row is written by the next cycle's verify instead of a separate decode. Delegated; must keep GX/null byte-identical and keep the session consistent at any checkpoint.
 
+**Append removal verified (orchestrator, 2026-11-16).** GX 12/12, null 72/72 byte-identical; ctest 5 pass + 2 known SDK-drift fails. Speed (adaptive): 1.172 / 0.959 / 0.939 at temp 0 / 0.7 / 1.0 (fixed: 1.024 / 0.851 / 0.825). Temp 1.0 rose 0.702 -> 0.939 but still fails the gate.
+
+**Root cause of the residual gap: the controller over-drafts.** Measured fixed-k speedup curves (12 prompts, 192 tokens):
+
+| k | temp 0 | temp 1.0 |
+|---|---|---|
+| 1 | — | 0.951 |
+| 2 | 1.188 | **1.003** |
+| 3 | **1.243** | 0.972 |
+| 4 | 1.131 | 0.910 |
+| 5 | 1.085 | — |
+| 6 | 1.067 | — |
+| 7 | 1.019 | 0.825 |
+
+The true optimum is **k=3 at temp 0** and **k=2 at temp 1.0** — so the gate IS achievable (fixed k=2 = 1.003x). The adaptive controller picks mean 4.6 / 4.1 and lands at 1.172 / 0.939. Two bugs in `src/spec/draft_policy.cpp`: (1) the cost model still adds the removed append (`+ 1.0`, line 65); (2) `kVerifyRatio` underestimates the measured cycle cost (by ~0.1-0.3 decodes, growing with width). Fix delegated: remove the stale term and calibrate the verify ratios to the measured cycle cost.
+
 ## Log
 
 - M2 delegated, verified (`flint.target_adapter` passes), committed `50d9189`.

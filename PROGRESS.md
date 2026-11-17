@@ -9,7 +9,7 @@ Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`
 | M2 | Target adapter | COMPLETE | 50d9189 | `src/spec/target_adapter.{hpp,cpp}`; `flint.target_adapter` passes (rows bit-identical widths 1..8, features bit-identical, rewind matches a fresh session) |
 | M3 | Cycle + runner integration | COMPLETE | | `src/spec/cycle.{hpp,cpp}`, `FLINT_SPEC=dflash\|off\|null`; GX 12/12 + null 108/108 byte-identical; speedup 0.77/0.69/0.65 at temp 0/0.6/1.0 (see §1 note) |
 | M4 | Draft policy | COMPLETE | d2680fb | adaptive + fixed; honours max/min/policy; deferred emitted-token row (append removed). GX 12/12, null 72/72; adaptive 1.185/0.970/0.970 vs fixed 1.024/0.850/0.827 at temp 0/0.7/1.0. Temp-1.0 parity within noise (fixed-k ceiling ~1.00x) |
-| M5 | Gates | NOT STARTED | | GX, null drafter, settings honour, quant, depth curve, no regression, cost, memory, concurrency |
+| M5 | Gates | IN PROGRESS | | M5a (tooling: depth + settings modes; GX@depths, settings honour, depth curve) delegated; M5b (quant, no-regression, cost, memory, concurrency) pending |
 | M6 | Release | NOT STARTED | | QUALITY.md, extension.json 0.3.0, registry PR, llama-swap, issue #1 |
 
 ## M2 findings (carried into M3)

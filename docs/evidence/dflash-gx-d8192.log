@@ -1,0 +1,15 @@
+[flint] event=warmup_completed tokens=8512 elapsed_s=3.191235
+[flint] event=warmup_completed tokens=8512 elapsed_s=3.169696
+PASS gx code-1 tokens=192/192
+PASS gx code-2 tokens=192/192
+PASS gx code-3 tokens=192/192
+PASS gx code-4 tokens=192/192
+PASS gx json-1 tokens=192/192
+PASS gx json-2 tokens=192/192
+PASS gx json-3 tokens=192/192
+PASS gx json-4 tokens=192/192
+PASS gx prose-1 tokens=192/192
+PASS gx prose-2 tokens=192/192
+PASS gx prose-3 tokens=192/192
+PASS gx prose-4 tokens=192/192
+gx: 12/12 byte-identical

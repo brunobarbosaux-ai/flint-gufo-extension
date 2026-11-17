@@ -1,0 +1,8 @@
+[flint] event=warmup_completed tokens=8064 elapsed_s=3.080573
+[flint] event=warmup_completed tokens=8064 elapsed_s=3.023671
+[flint] event=warmup_completed tokens=8064 elapsed_s=3.008552
+FAIL memory spec-off per_request_claimed=1527529472 per_request_measured=2225848320 (second slot)
+  info spec-off resident_weights_claimed=25591331968 first_slot_total_delta=30423736320 (includes one-time overhead; harness=30423736320 bind=0)
+FAIL memory spec-on per_request_claimed=1963737088 per_request_measured=2561392640 (second slot)
+  info spec-on resident_weights_claimed=26044029076 first_slot_total_delta=33530327040 (includes one-time overhead; harness=33194782720 bind=335544320)
+memory: 0/2 pass

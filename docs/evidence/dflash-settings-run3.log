@@ -1,0 +1,14 @@
+[flint] event=warmup_completed tokens=8064 elapsed_s=2.898212
+[flint] event=warmup_completed tokens=8064 elapsed_s=2.914491
+PASS settings top_k=40 temp=0.7 identical=12/12
+PASS settings top_k=1 temp=0.7 identical=12/12 differs_from_greedy=0/12
+PASS settings top_p=0.9 temp=0.7 identical=12/12
+PASS settings top_p=1e-6 temp=0.7 identical=12/12 differs_from_greedy=0/12
+PASS settings min_p=0.05 temp=0.7 identical=12/12
+PASS settings repeat_penalty=1.15 temp=0 identical=12/12 differs_from_plain=11/12
+PASS settings frequency_penalty=0.5 temp=0 identical=12/12 differs_from_plain=12/12
+  sample_violation code-2: {
+  "answer": "We need to implement a small thread-safe LRU cache in Go with methods Get(key string) (int, bool) and Put(key string, value int). Capacity is set
+FAIL settings grammar answer-object temp=0 identical=12/12 violations=2/12
+settings: 7/8 pass
+EXIT 1

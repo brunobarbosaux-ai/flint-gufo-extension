@@ -1,0 +1,4 @@
+PASS gx code-1 tokens=128/128
+PASS gx code-2 tokens=128/128
+PASS gx code-3 tokens=128/128
+gx: 3/3 byte-identical

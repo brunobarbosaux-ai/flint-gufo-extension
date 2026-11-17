@@ -1,0 +1,2 @@
+policy=adaptive max_draft=7 min_draft=1
+speed temp=0.000 depth=0 tokens_off=384 tokens_on=384 tps_off=66.462 tps_on=87.073 speedup=1.310 decode_tps_off=70.172 decode_tps_on=94.387 decode_speedup=1.345 cycles=116 tokens_per_cycle=3.310 accept_rate=0.436 mean_draft=5.259

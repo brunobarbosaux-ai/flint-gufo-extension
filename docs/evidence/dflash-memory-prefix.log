@@ -1,0 +1,3 @@
+FAIL memory spec-off resident_claim=25591331968 per_request_claim=1527529472 claimed=27118861440 measured=44458004480 (harness=44458004480 bind=0)
+FAIL memory spec-on resident_claim=25591331968 per_request_claim=1527529472 claimed=27118861440 measured=45075034112 (harness=44739489792 bind=335544320)
+memory: 0/2 pass

@@ -22,5 +22,10 @@ void flint_provider_register(gufo::ext::Registry& registry) {
       .prompt_driver = &gufo::models::flint::RunFlintPrompt,
       .chat_driver = &gufo::models::flint::RunFlintChat,
       .sampling_defaults = &gufo::models::flint::FlintTextSamplingDefaults,
+      .speculative_defaults = {{.backend = "dflash2",
+                                .max_draft_tokens = 7,
+                                .min_draft_tokens = 1,
+                                .draft_policy = "adaptive",
+                                .draft_policies = {"fixed", "adaptive"}}},
   });
 }

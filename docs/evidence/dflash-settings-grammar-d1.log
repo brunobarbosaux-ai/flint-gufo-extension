@@ -1,0 +1,4 @@
+  not_evaluated code-2 ended_by=budget tokens=1024 tail="e test or usage example, but not required.\\n\\nThe answer should be in code block"
+  not_evaluated code-3 ended_by=budget tokens=1024 tail=".\\n\\nAlternatively, we can use find ... -exec du -h {} + but du -h is not POSIX?"
+PASS settings grammar answer-object temp=0 identical=12/12 violations=0/12 not_evaluated=2/12
+settings: 1/1 pass

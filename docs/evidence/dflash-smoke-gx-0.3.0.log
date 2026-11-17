@@ -1,0 +1,5 @@
+[flint] event=warmup_completed tokens=8064 elapsed_s=3.070364
+[flint] event=warmup_completed tokens=8064 elapsed_s=3.017808
+PASS gx code-1 tokens=64/64
+PASS gx code-2 tokens=64/64
+gx: 2/2 byte-identical

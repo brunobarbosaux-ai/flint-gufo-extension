@@ -280,3 +280,68 @@ Evidence logs live in `docs/evidence/` (digests, sha256):
 Raw capture JSONs (`g4-oracle-fresh.json` 12 MB, `g5-*-fresh.json`,
 `gx-ours-final-*.json`) stay out of the repository; sha256 digests for the
 2026-11-07 run are committed in `fresh-run-digests.sha256`.
+
+## DFlash2 speculative decoding (0.3.0)
+
+Speculation is **opt-in**: `FLINT_SPEC=dflash` (default off). Greedy output is
+byte-identical to spec-off; sampled output is not guaranteed identical (see
+caveat below).
+
+- Environment: extension `0.3.0` (this revision, pending the M6 commit);
+  Gufo pin `c40862ff` (v0.32.0), which carries `TextProvider::speculative_defaults`
+  (commit `49380168`, API revision 0.2.15). The README's `6cc8a42` pin predates
+  that field and cannot build the provider wiring. GPU: gfx1151, ROCm 7.2.1.
+  Target `flint-UD-Q4_K_XL.gguf`; drafter `Flint-DFlash2-Q6_K.gguf` unless noted.
+
+### Passing checks
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| GX (greedy byte-identity, spec-on vs spec-off), depths 0 / 8k / 32k / 131k | 12/12 at each depth | `evidence/dflash-gx-d0.log`, `dflash-gx-d8192.log`, `dflash-gx-d32768.log`, `dflash-gx-d131072.log` |
+| Null drafter (no-op speculation, any seed) | 72/72 | `evidence/dflash-null-72of72.log` |
+| Settings matrix (sampler knobs, D1 grammar) | 8/8: the 7 sampler/penalty settings identical in the settings run (`dflash-settings-run3.log`); the grammar case passes under the D1 criterion (budget-cut outputs are not evaluated): `violations=0`, `not_evaluated=2` | `evidence/dflash-settings-grammar-d1.log` (grammar rerun, `settings: 1/1 pass`); `evidence/dflash-settings-run3.log` (7 sampler settings pass; the grammar case in that run failed with `violations=2/12` before the D1 fix) |
+| Drafter quants, GX 3/3 each | Q6_K 3/3, Q4_K_M 3/3, BF16 3/3 | `evidence/dflash-quant-gx-{Q6_K,Q4_K_M,BF16}.log` |
+| Drafter quants, speed (depth 0, temp 0, adaptive, 3 prompts) | accept 0.42-0.44; decode speedup Q6_K 1.263, Q4_K_M 1.345, BF16 1.241 (range 1.24-1.35) | `evidence/dflash-quant-speed-*.log` |
+| No regression, spec-off decode | 70.96 / 63.56 / 51.05 / 28.18 t/s at 0 / 8k / 32k / 131k (plan: 71 / 63 / 50 / 28) | `evidence/dflash-speed-d{0,8192,32768,131072}.log` (`decode_tps_off`) |
+| Depth curve, adaptive, temp 0 (decode-only speedup) | 1.195 (d0), 1.145 (8k), 1.140 (32k), 1.067 (131k); accept 0.42-0.60 | `evidence/dflash-speed-d*.log` |
+| Build + drafter-policy unit test | `flint.draft_policy` pass; gate builds | `ctest -R "^flint.draft_policy$"` |
+| Smoke after speculative_defaults wiring (0.3.0) | GX 2/2 byte-identical, 64 tokens | `evidence/dflash-smoke-gx-0.3.0.log` |
+| M4 draft policy, temp 0 / 0.7 / 1.0 (depth 0, 192 tokens) | adaptive 1.185 / 0.970 / 0.970 vs fixed 1.024 / 0.850 / 0.827 | PROGRESS.md (M4) |
+
+Adaptive is at least as fast as fixed at every depth and temperature measured.
+
+### Memory
+
+- The hidden ring (~320 MiB) and the drafter weights (Q6_K 336 MB, Q4_K_M 240 MB,
+  BF16 811 MB) are in `ResourceClaim` when speculation is on. The per-session
+  claim grows by 436 MB (decimal, 1963737088 - 1527529472 bytes); the measured
+  second-session growth is the 320 MiB ring.
+- **Not passing as an absolute check:** `memory2.log` fails both absolute claimed
+  vs measured comparisons (spec-off per-request claim 1527529472 B vs measured 2225848320 B;
+  spec-on 1963737088 B vs 2561392640 B). This is the pre-existing base-session undercount
+  (~600-666 MiB), not a DFlash2 regression. See `DEFERRED.md`.
+  Evidence: `evidence/dflash-memory-postfix.log`, `dflash-memory-prefix.log`.
+
+### Open items
+
+- **Sampled-mode field validation.** Temp > 0 has been measured here only in the
+  gate; field use is not validated. At temp 1.0 the M4/M4-follow-up
+  adaptive numbers are 0.970 and 0.939, below 1.0x. PROGRESS.md (M4 economics)
+  records that the per-cycle append and drafter cost make no fixed draft length
+  reach 1.0x at temp 1.0. The plan's "never slower at temp 1.0" acceptance is
+  **not met**; temp 1.0 is a documented slowdown of about 3-6%.
+- **Cost-ratio table** deferred (drafter vs verify cost per depth).
+- **Base-session VRAM undercount** (~600-666 MiB, pre-existing): tracked in
+  `DEFERRED.md`, to be audited before release.
+- **Depth curve** was measured before the chunking fix (`9506b32`). A post-fix
+  spot check at 8192 gives decode speedup 1.26, accept 0.495. A full re-run is not
+  done. Whole-request speedup is below 1.0 at depth >= 8k because prefill dominates.
+
+### Opt-in and seed reproducibility
+
+Greedy (`temp 0`) output is byte-identical to spec-off. Sampled output (`temp > 0`)
+is **not guaranteed** identical with speculation on: accept/reject resampling
+consumes RNG draws differently, so the same seed can produce a different stream.
+The sampler distribution is preserved in design (one `Sample` per token), but
+exact per-seed reproduction across spec on/off is not promised. Keep speculation
+off where seed reproducibility is required.

@@ -69,6 +69,15 @@ Consequence: the fixed per-cycle cost (drafter + append = 1.48 decodes) exceeds 
 
 The true optimum is **k=3 at temp 0** and **k=2 at temp 1.0** — so the gate IS achievable (fixed k=2 = 1.003x). The adaptive controller picks mean 4.6 / 4.1 and lands at 1.172 / 0.939. Two bugs in `src/spec/draft_policy.cpp`: (1) the cost model still adds the removed append (`+ 1.0`, line 65); (2) `kVerifyRatio` underestimates the measured cycle cost (by ~0.1-0.3 decodes, growing with width). Fix delegated: remove the stale term and calibrate the verify ratios to the measured cycle cost.
 
+## M5 findings
+
+### M5a (gate tooling + correctness gates)
+
+- **GX PASS at 0 / 8k / 32k / 131k** (12/12 byte-identical each).
+- **Settings honour**: top-k, top-p, min-p, repeat/frequency penalty all PASS (spec-on == spec-off, 12/12). Grammar FAILED 2/12 at 1024 tokens (9/12 at 192) — suspected token-budget truncation, not a real violation; re-check delegated.
+- **Depth curve**: adaptive >= fixed at every depth and both temps. Whole-request speedup < 1.0 at depth >= 8k because prefill (not speculated) dominates; decode-only speedup is the fair number (adaptive 1.07-1.20 at temp 0).
+- **Runtime bug found**: spec-on prompts > 2048 tokens fail with `captured residual for row 0 left the ring`. Root cause: `Session::CapturedHiddenDevice` (`src/gpu/engine.cpp`) has an off-by-one (`row + R <= position` should be `< position`), so the ring yields only `R-1` usable rows while the runner caps its prefill chunk at exactly `R` (2048). Short prompts never hit it, which is why M3 passed. Fix delegated (engine boundary + remove the gate workaround).
+
 ## Log
 
 - M2 delegated, verified (`flint.target_adapter` passes), committed `50d9189`.

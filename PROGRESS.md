@@ -51,6 +51,8 @@ At temp 0, k=7: 0.48 + 2.21 + 1.0 = 3.69 decodes for 2.89 tokens = 0.78x (measur
 
 Consequence: the fixed per-cycle cost (drafter + append = 1.48 decodes) exceeds the marginal tokens at every draft length, so **no `k` reaches 1.0x at temperature 1.0** (best ≈ 0.75x). M4's acceptance "never slower than spec-off at temperature 1.0" therefore cannot be met by a draft policy alone. Candidate fixes (NOT yet authorised): (a) let the adaptive controller fall back to plain decode (draft 0) when speculation is unprofitable; (b) remove the per-cycle append (position-only advance / fold it into the next verify) — an engine/cycle change that risks the GX/null gates and the snapshot contract. Escalate to the user before implementing either.
 
+**Decision (user, 2026-11-16): remove the per-cycle append.** The emitted token's row is written by the next cycle's verify instead of a separate decode. Delegated; must keep GX/null byte-identical and keep the session consistent at any checkpoint.
+
 ## Log
 
 - M2 delegated, verified (`flint.target_adapter` passes), committed `50d9189`.

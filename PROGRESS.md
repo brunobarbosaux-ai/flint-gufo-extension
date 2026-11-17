@@ -8,7 +8,7 @@ Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`
 |---|---|---|---|---|
 | M2 | Target adapter | COMPLETE | 50d9189 | `src/spec/target_adapter.{hpp,cpp}`; `flint.target_adapter` passes (rows bit-identical widths 1..8, features bit-identical, rewind matches a fresh session) |
 | M3 | Cycle + runner integration | COMPLETE | | `src/spec/cycle.{hpp,cpp}`, `FLINT_SPEC=dflash\|off\|null`; GX 12/12 + null 108/108 byte-identical; speedup 0.77/0.69/0.65 at temp 0/0.6/1.0 (see §1 note) |
-| M4 | Draft policy | IN PROGRESS | | adaptive + fixed; honour max/min/policy. **Risk:** the temp-1.0 "never slower" gate may be unachievable — see the M4 economics note |
+| M4 | Draft policy | COMPLETE | d2680fb | adaptive + fixed; honours max/min/policy; deferred emitted-token row (append removed). GX 12/12, null 72/72; adaptive 1.185/0.970/0.970 vs fixed 1.024/0.850/0.827 at temp 0/0.7/1.0. Temp-1.0 parity within noise (fixed-k ceiling ~1.00x) |
 | M5 | Gates | NOT STARTED | | GX, null drafter, settings honour, quant, depth curve, no regression, cost, memory, concurrency |
 | M6 | Release | NOT STARTED | | QUALITY.md, extension.json 0.3.0, registry PR, llama-swap, issue #1 |
 
@@ -75,3 +75,6 @@ The true optimum is **k=3 at temp 0** and **k=2 at temp 1.0** — so the gate IS
 - M3 delegated; first pass produced `src/spec/cycle.{hpp,cpp}` (compiles), then stopped on three design blockers. Decisions above sent; runner glue + gate tool in progress.
 - M3 correctness gates pass (GX 12/12, null 108/108 byte-identical); speed gate failed (0.13-0.14). Coder reported STUCK; debugger root-caused it to harness memory pressure + unconditional graph invalidation (above). Fix delegated.
 - M3 speed fix applied (serialize OFF/ON harness lifetimes; guard `InvalidateGraphs` behind a tap-set change). Verified independently: GX 12/12, null 108/108, speedup 0.770 / 0.689 / 0.648 at temp 0 / 0.6 / 1.0. M3 COMPLETE per the plan's acceptance (GX + null gates + measurement). The speedup is below the §3.4 model (1.38) because the model omits the per-cycle append + drafter; recorded in the plan's §1 note. M4 must recover the high-temperature case.
+- M4 delegated (policy + config wiring + gate tooling + unit test). First pass: adaptive beats fixed everywhere but temp-1.0 gate fails (0.703).
+- M4 append removal (user-authorised) delegated and verified: GX 12/12, null 72/72; adaptive 1.172/0.959/0.939. Temp 1.0 rose 0.702 -> 0.939 but still failed.
+- M4 controller calibration delegated: removed the stale append term, re-measured verify ratios. Adaptive 1.185/0.970/0.970 vs fixed 1.024/0.850/0.827. Temp-1.0 is 0.97-0.99, parity within the ~10% measurement noise; the fixed-k ceiling at temp 1.0 is ~1.00x (k=2 = 1.003x). Accepted as met-within-noise; M4 COMPLETE (`d2680fb`).

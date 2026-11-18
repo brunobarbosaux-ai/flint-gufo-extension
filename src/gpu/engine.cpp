@@ -417,6 +417,48 @@ std::uint32_t tile_capacity_for(std::size_t slots, std::uint32_t experts) {
       experts + 1);
 }
 
+/// Device bytes of every tile-scratch buffer that Session::Impl::Init allocates
+/// (all of it except the KV caches, block-sparse key bounds, hidden ring and
+/// pinned host staging). Model::SessionBytes uses this same function so the
+/// reported footprint follows the allocations; keep the two in step.
+std::size_t SessionScratchBytes(const Config& c, std::uint32_t tile) {
+  const std::size_t T = tile;
+  const std::size_t H = c.hidden_size;
+  const std::size_t Q = std::size_t{c.num_heads} * c.head_dim;
+  const std::size_t KV = std::size_t{c.num_kv} * c.head_dim;
+  const std::size_t E = c.expert_ff;
+  const std::size_t slots = T * c.expert_used;
+  const std::size_t rows = gufo::vendor::qwen38_flash_next::rocm::RoutedCompactRows(
+      slots, c.expert_count);
+  const std::size_t tiles = tile_capacity_for(slots, c.expert_count);
+  const std::size_t q8_bytes = flint_mmq_q8_1_bytes(kVecBatch, kQ8MaxK);
+  const std::size_t tiled_bytes =
+      gufo::vendor::qwen38_flash_next::rocm::Q8TiledBytes(tile, kQ8MaxK);
+  const std::size_t f4 = sizeof(float);
+  const std::size_t h2 = sizeof(__half);
+  const std::size_t i4 = sizeof(std::int32_t);
+  const std::size_t u4 = sizeof(std::uint32_t);
+  return
+      // tokens, zero_ids, pos
+      2 * T * i4 + std::size_t{kVecBatch} * i4 + 2 * u4 +
+      // hidden states, attention, QKV, router
+      2 * T * H * f4 + T * Q * f4 + 2 * T * KV * f4 + T * (Q + 2 * KV) * f4 +
+      T * Q * f4 + T * H * f4 + T * std::size_t{c.expert_count} * f4 +
+      // routed experts: gate/up/down, routing bank, compaction, tiles
+      2 * slots * E * f4 + slots * H * f4 + slots * (i4 + f4) +
+      std::size_t{kMaxExperts} * u4 + (std::size_t{kMaxExperts} + 1) * i4 +
+      std::size_t{kMaxExperts} * i4 + 2 * rows * i4 + 2 * tiles * i4 +
+      slots * E * h2 + T * Q * h2 + slots * f4 + slots * f4 + T * f4 +
+      // shared and dense FFN, final norm, logits, global attention partials
+      2 * T * std::size_t{c.shared_ff} * f4 + T * H * f4 +
+      2 * T * std::size_t{c.dense_ff} * f4 + H * f4 +
+      std::size_t{Session::kMaxVerifyRows} * c.vocab_size * f4 +
+      std::size_t{kVecBatch} * c.num_heads * kGlobalSplits * (c.head_dim + 2) *
+          f4 +
+      // quantized activations: tiled W8A8, F16 copies, Q8_1 scratch
+      tiled_bytes + T * H * h2 + T * kQ8MaxK * h2 + 2 * q8_bytes;
+}
+
 bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
   const Config& c = model->config;
   if (c.expert_used > kMaxTopK || c.expert_count > kMaxExperts) {
@@ -526,6 +568,26 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
                      2 * sizeof(std::uint32_t)) == hipSuccess;
   if (!ok)
     return Fail(error_msg, "Flint: session allocation failed");
+  {
+    // Drift guard: the buffers above must total what SessionScratchBytes
+    // reports, which is what Model::SessionBytes uses for admission.
+    const std::size_t allocated =
+        tokens.bytes() + zero_ids.bytes() + pos.bytes() + x.bytes() +
+        xn.bytes() + q.bytes() + k.bytes() + v.bytes() + qkv.bytes() +
+        attn.bytes() + o.bytes() + router.bytes() + gate_e.bytes() +
+        up_e.bytes() + down_e.bytes() + rb.ids.bytes() + rb.topk.bytes() +
+        rb.counts.bytes() + route_bounds.bytes() + route_cursors.bytes() +
+        rows_token.bytes() + rows_slot.bytes() + tiles_pair.bytes() +
+        tiles_down.bytes() + act_half.bytes() + q_half.bytes() +
+        expert_scale.bytes() + shared_scale.bytes() + expert_const.bytes() +
+        sh_gate.bytes() + sh_up.bytes() + sh_out.bytes() + dense_gate.bytes() +
+        dense_up.bytes() + last.bytes() + d_logits.bytes() +
+        attn_part.bytes() + tiled_bytes +
+        std::size_t{tile} * c.hidden_size * sizeof(__half) +
+        std::size_t{tile} * kQ8MaxK * sizeof(__half) + 2 * q8_bytes;
+    if (allocated != SessionScratchBytes(c, tile))
+      return Fail(error_msg, "Flint: session scratch size mismatch");
+  }
   SetBank();
   {
     const std::vector<float> efill(slots, kRoutedActScale);
@@ -1414,15 +1476,25 @@ std::size_t Model::SnapshotBytes(std::uint32_t tokens) const noexcept {
 std::size_t Model::SessionBytes(std::uint32_t max_context) const noexcept {
   const Config& c = state_->config;
   const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
-  const std::uint32_t tile = state_->options.prefill_tile;
-  const std::size_t q_row = std::size_t{c.num_heads} * c.head_dim;
-  // KV caches plus the prefill scratch that scales with the tile.
-  return std::size_t{c.num_layers} * 2 * max_context * kv_row * sizeof(__half) +
-         std::size_t{tile} *
-             (4 * std::size_t{c.hidden_size} * sizeof(float) +
-              (3 * q_row + 2 * kv_row) * sizeof(float) +
-              std::size_t{c.expert_used} * (3 * c.expert_ff + c.hidden_size) *
-                  sizeof(float));
+  const std::uint32_t tile = std::max<std::uint32_t>(1, state_->options.prefill_tile);
+  // Each session runs its warmup forward in CreateSession, which materializes
+  // a private MMQ scratch arena: qfn_stack_pool::reserve starts each
+  // (device, stream) arena at 256 MiB, and every session owns its own stream.
+  // Nothing releases it (flint_mmq_release_stream is never called).
+  constexpr std::size_t kMmqScratchArenaBytes = std::size_t{256} << 20;
+  // hipGraphInstantiate for the decode step graph (fixed, independent of
+  // context).
+  constexpr std::size_t kSessionGraphBytes = std::size_t{64} << 20;
+  // Each KV buffer is one hipMalloc. The HIP allocator hands out 2 MiB-granule
+  // device blocks (measured with hipMemGetInfo: a 1 MiB request costs 2 MiB, a
+  // 2 MiB request costs 2 MiB), so each buffer is charged its rounded-up size.
+  constexpr std::size_t kDeviceGranule = std::size_t{2} << 20;
+  const std::size_t kv_buffer = std::size_t{max_context} * kv_row * sizeof(__half);
+  const std::size_t kv_rounded =
+      (kv_buffer + kDeviceGranule - 1) / kDeviceGranule * kDeviceGranule;
+  return std::size_t{c.num_layers} * 2 * kv_rounded +
+         SessionScratchBytes(c, tile) + kMmqScratchArenaBytes +
+         kSessionGraphBytes;
 }
 
 void Session::Reset() noexcept {
@@ -1577,7 +1649,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   if (!session->impl_->Init(max_context, error_msg))
     return nullptr;
   // First use of each path sizes the quantized kernels' scratch pools; do it
-  // before the first request instead of inside its prefill.
+  // before the first request instead of inside its prefill. This warmup forward
+  // is also what materializes this session's private MMQ scratch arena (256 MiB,
+  // keyed by the session's own stream), which Model::SessionBytes accounts for.
   const std::int32_t warm[kWarmTokens] = {};
   for (const std::uint32_t width : {1U, kWarmTokens}) {
     if (width > max_context)

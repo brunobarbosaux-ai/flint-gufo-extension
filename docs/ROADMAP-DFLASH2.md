@@ -98,8 +98,15 @@ two saved binaries. A 40-minute gap between runs on this machine moved numbers
       verify a draft block, i.e. the same multi-row verification foundation
       as DFlash2. Not a standalone quick win.
 - [x] Document sparse-attention results in QUALITY.md — done 2026-11-14.
-- [ ] Decide whether sparse ships as v0.3.0 with prompt-lookup deferred, or
-      waits for the full v0.4.0 (decision pending).
+- [x] Decide whether sparse ships as v0.3.0 or waits for v0.4.0 — **DECIDED
+      2026-11-17: deferred to v0.4.0.** Rationale: sparse is approximate beyond
+      ~19k tokens, which breaks the byte-identical spec-on == spec-off guarantee
+      the 0.3.0 gates are built on; DFlash2's exactness story ships first.
+      v0.4.0 scope: sparse attention as a documented opt-in for long-context
+      prefill (2.6x at 131k, QUALITY.md table), with the approximation boundary
+      stated, plus the spec-on prefill gap (drafter `SyncContext` work during
+      prefill chunks, 20-25% — see PROGRESS.md curve table) as the exactness
+      preserving complement.
 
 ## Phase 1 — Drafter study (go/no-go decision gate)  **[status: DONE — gate FAILED at 1.31x]**
 

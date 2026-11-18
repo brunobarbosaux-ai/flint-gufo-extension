@@ -14,6 +14,12 @@ namespace gufo::models::flint {
 std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
     const ext::TextRunnerOptions& options, std::string* error);
 
+// Test tooling only (flint_spec_gate). Same as CreateFlintTextRunner, but the
+// drafter is the `null` stub whose proposals are always wrong. Not reachable
+// from the serve path, which never calls it.
+std::shared_ptr<ext::TextModelRunner> CreateFlintNullDrafterRunnerForTest(
+    const ext::TextRunnerOptions& options, std::string* error);
+
 // Sampling defaults the prompt and chat drivers recommend for Flint, used by
 // both TextProvider::sampling_defaults and TextRunnerDescriptor. Always set:
 // Flint has no published preset to defer to.

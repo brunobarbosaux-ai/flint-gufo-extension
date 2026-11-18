@@ -69,7 +69,7 @@ class SpecCycle {
   /// rows below it are not re-fed, so the drafter starts with no history there.
   void Reset(std::uint32_t frontier) noexcept;
 
-  /// Test hook (FLINT_SPEC=null): rewrites each proposal before verification.
+  /// Test hook (null drafter, flint_spec_gate only): rewrites each proposal before verification.
   /// The rewritten block must still be verified like any other, so the cycle's
   /// accept/reject and sampling path is exercised with nothing accepted.
   using DraftTransform = std::uint32_t (*)(std::uint32_t token,

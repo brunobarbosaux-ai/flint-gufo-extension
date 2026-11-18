@@ -32,7 +32,7 @@ Add a release at the top of `releases`. The existing entries stay. Replace
 +      {
 +        "api_version": ">= 0.2.15",
 +        "digest": "sha256:<DIGEST>",
-+        "notes": "DFlash2 speculative decoding (opt-in, FLINT_SPEC=dflash): drafter-proposed tokens verified in one batched pass; greedy output byte-identical to spec-off; decode speedup 1.24-1.35 at depth 0, temp 0. Declares speculative_defaults (max 7, min 1, adaptive).",
++        "notes": "DFlash2 speculative decoding (opt-in, --speculative dflash2 --dflash-model <gguf>): drafter-proposed tokens verified in one batched pass; greedy output byte-identical to spec-off; decode speedup 1.24-1.35 at depth 0, temp 0. Declares speculative_defaults (max 7, min 1, adaptive).",
 +        "platforms": [
 +          "linux"
 +        ],
@@ -65,11 +65,12 @@ and `description` are already correct for this repo.
 - Gufo build: `c40862ff` (v0.32.0); `api_version >= 0.2.15`
 
 ## What is new since 0.2.0
-- DFlash2 speculative decoding, **opt-in** (`FLINT_SPEC=dflash`, default off).
+- DFlash2 speculative decoding, **opt-in** (`--speculative dflash2`, default off).
   A drafter proposes tokens and the target verifies them in one batched pass.
 - Provider declares `speculative_defaults` (dflash2: max 7, min 1, adaptive;
   policies fixed and adaptive).
-- Drafter file selected with `FLINT_DRAFT` (default `Flint-DFlash2-Q6_K.gguf`).
+- Drafter file passed with `--dflash-model <gguf>`; required when speculation
+  is on, no default path.
 
 ## Evidence (see `docs/QUALITY.md`, section "DFlash2 speculative decoding (0.3.0)")
 - Greedy byte-identity, spec-on vs spec-off: 12/12 at depths 0, 8k, 32k, 131k.

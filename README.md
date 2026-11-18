@@ -56,19 +56,25 @@ tokens, and the target verifies them in one batched pass. Accepted tokens are
 emitted without extra target steps, so single-stream decode is faster. It is
 **opt-in and off by default**.
 
-Enable it on the process that loads the model (Gufo or llama-swap env):
+Enable it with CLI options on `gufo serve`. The drafter must be passed
+explicitly; there is no default path:
 
 ```sh
-FLINT_SPEC=dflash                                   # dflash | off | null (null = test mode)
-FLINT_DRAFT=/path/to/Flint-DFlash2-Q6_K.gguf        # drafter; default name Flint-DFlash2-Q6_K.gguf
+gufo serve llm -m flint-UD-Q4_K_XL.gguf \
+  --speculative dflash2 \
+  --dflash-model /path/to/Flint-DFlash2-Q6_K.gguf
 ```
 
-Drafter files (the default is Q6_K; the names are the published DFlash2 drafter
-GGUFs, and the path is whatever you point `FLINT_DRAFT` at):
+Speculation is on only when `--speculative dflash2` is set, and it then requires
+`--dflash-model`. The runner fails at startup with a clear error if the drafter
+is missing. No environment variable turns speculation on or off.
+
+Drafter files (the names are the published DFlash2 drafter GGUFs; pass the path
+of the quant you want with `--dflash-model`):
 
 | File | Size | Notes |
 | --- | --- | --- |
-| `Flint-DFlash2-Q6_K.gguf` | 336 MB | default; GX 3/3 |
+| `Flint-DFlash2-Q6_K.gguf` | 336 MB | GX 3/3 |
 | `Flint-DFlash2-Q4_K_M.gguf` | 240 MB | smallest; GX 3/3 |
 | `Flint-DFlash2-BF16.gguf` | 811 MB | reference precision; GX 3/3 |
 
@@ -95,7 +101,7 @@ counted in `ResourceClaim`; the pre-existing base-session undercount is in
 The extension declares these defaults with `speculative_defaults` in
 `provider.cpp`; a value given on the command line overrides them.
 
-**When off, output is unchanged.** With `FLINT_SPEC` unset or `off`, no drafter
+**When off, output is unchanged.** Without `--speculative dflash2`, no drafter
 is loaded and no speculative cycle runs. The null drafter gate (72/72) confirms
 the cycle itself does not change output.
 

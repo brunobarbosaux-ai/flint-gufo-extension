@@ -1,11 +1,11 @@
 // M3 gates for the DFlash2 speculative cycle, driven through the runner's own
 // text-runner contract (the calls the host makes): CreateFlintTextRunner ->
 // CreateComponentCacheResources -> CreateSlot -> BindComponentState -> Prefill
-// -> DecodeStep. Speculation is selected by FLINT_SPEC, read when the runner
-// is created, so each configuration gets its own runner.
+// -> DecodeStep. Speculation is selected per configuration by the gate's own
+// options (backend and drafter path), so each configuration gets its own runner.
 //
 //   --mode gx       greedy spec-on (dflash) byte-identical to spec-off
-//   --mode null     FLINT_SPEC=null byte-identical to spec-off at each
+//   --mode null     null drafter (test-only entry point) byte-identical to spec-off at each
 //                   temperature and seed
 //   --mode speed    tokens per cycle and speedup of dflash over spec-off,
 //                   once per --policies entry (fixed, adaptive)
@@ -24,6 +24,7 @@
 // spec-on. Decode throughput excludes prefill.
 //
 // Usage: flint_spec_gate --target <target.gguf> --prompts <prompts.jsonl>
+//          [--dflash-model <drafter.gguf>]
 //          --mode gx|null|speed|settings|curve [--depth N] [--depths N,N,...]
 //          [--max-tokens N] [--temps 0,0.6,1.0] [--seeds 1,2,3]
 //          [--prompts-limit N] [--policies fixed,adaptive] [--max-draft N]
@@ -68,8 +69,14 @@ namespace {
   throw std::runtime_error(message);
 }
 
+// Developer-machine drafter, used only when --dflash-model is not given. The
+// product runner has no default; this convenience lives in the test tool.
+constexpr const char* kGateDefaultDrafter =
+    "/home/bruno/AI/GGUF/mtp/Flint-DFlash2-Q6_K.gguf";
+
 struct Options {
   std::string target;
+  std::string drafter{kGateDefaultDrafter};
   std::string prompts;
   std::string mode;
   std::size_t max_tokens{192};
@@ -117,6 +124,8 @@ Options ParseArgs(int argc, char** argv) {
     };
     if (arg == "--target") {
       options.target = next("--target");
+    } else if (arg == "--dflash-model") {
+      options.drafter = next("--dflash-model");
     } else if (arg == "--prompts") {
       options.prompts = next("--prompts");
     } else if (arg == "--mode") {
@@ -262,26 +271,28 @@ public:
   void BeforeRelease(cache::ComponentId, cache::Rows, cache::Rows) noexcept override {}
 };
 
-// One runner per configuration. FLINT_SPEC is read when the runner is created.
+// One runner per configuration. `spec_value` is "off", "dflash" or "null"
+// ("null" uses the test-only null drafter). The drafter path comes from
+// --dflash-model (default: the gate's developer-machine drafter).
 class Harness {
 public:
   explicit Harness(const std::string& spec_value, const std::string& target,
-                   const DraftSettings& draft, std::uint32_t max_context) {
-    if (spec_value.empty())
-      unsetenv("FLINT_SPEC");
-    else
-      setenv("FLINT_SPEC", spec_value.c_str(), 1);
+                   const std::string& drafter, const DraftSettings& draft,
+                   std::uint32_t max_context) {
     ext::TextRunnerOptions options;
     options.model_path = target;
     options.max_context = max_context;
-    options.speculative.backend = spec_value == "dflash"
-                                      ? ext::TextSpeculativeBackend::kDFlash
-                                      : ext::TextSpeculativeBackend::kDisabled;
+    options.speculative.backend = spec_value == "off"
+                                      ? ext::TextSpeculativeBackend::kDisabled
+                                      : ext::TextSpeculativeBackend::kDFlash;
+    options.speculative.draft_model_path = drafter;
     options.speculative.dflash_policy = draft.policy;
     options.speculative.max_draft_tokens = draft.max_draft;
     options.speculative.min_draft_tokens = draft.min_draft;
     std::string error;
-    runner_ = model::CreateFlintTextRunner(options, &error);
+    runner_ = spec_value == "null"
+                  ? model::CreateFlintNullDrafterRunnerForTest(options, &error)
+                  : model::CreateFlintTextRunner(options, &error);
     if (!runner_)
       Fail("runner creation failed: " + error);
     // The ledger is sized from the runner's own claim, as the serve layer
@@ -432,7 +443,7 @@ std::vector<RunResult> RunConfig(const char* spec_value, const Options& options,
                                  const DraftSettings& draft = {}) {
   std::vector<RunResult> results;
   results.reserve(jobs.size());
-  Harness harness(spec_value, options.target, draft,
+  Harness harness(spec_value, options.target, options.drafter, draft,
                   ContextFor(options.depth, max_tokens));
   for (const auto& job : jobs) {
     auto config = job.config;
@@ -681,14 +692,15 @@ int RunMemory(const Options& options) {
   // One-time device costs (HIP context, kernel module load, MMQ scratch) would
   // otherwise land in whichever mode runs first. Prime them with a throwaway
   // runner so both measured deltas cover only that mode's allocations.
-  { Harness prime("off", options.target, DraftSettings{}, context); }
+  { Harness prime("off", options.target, options.drafter, DraftSettings{}, context); }
   // The host sizes concurrency from per_request_state_bytes, so the gate
   // checks the incremental cost of a session. The first-slot total includes
   // one-time process overhead and is reported for information only.
   std::size_t failures = 0;
   for (const auto& mode : modes) {
     const std::size_t before = free_now();
-    Harness harness(mode.spec, options.target, DraftSettings{}, context);
+    Harness harness(mode.spec, options.target, options.drafter, DraftSettings{},
+                    context);
     const std::size_t after_harness = free_now();
     const auto state1 = harness.BindState();
     const std::size_t slot1_free = free_now();

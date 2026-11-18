@@ -283,7 +283,8 @@ Raw capture JSONs (`g4-oracle-fresh.json` 12 MB, `g5-*-fresh.json`,
 
 ## DFlash2 speculative decoding (0.3.0)
 
-Speculation is **opt-in**: `FLINT_SPEC=dflash` (default off). Greedy output is
+Speculation is **opt-in**: `--speculative dflash2 --dflash-model <gguf>` (default
+off; the drafter has no default path). Greedy output is
 byte-identical to spec-off; sampled output is not guaranteed identical (see
 caveat below).
 
@@ -291,7 +292,8 @@ caveat below).
   Gufo pin `c40862ff` (v0.32.0), which carries `TextProvider::speculative_defaults`
   (commit `49380168`, API revision 0.2.15). The README's `6cc8a42` pin predates
   that field and cannot build the provider wiring. GPU: gfx1151, ROCm 7.2.1.
-  Target `flint-UD-Q4_K_XL.gguf`; drafter `Flint-DFlash2-Q6_K.gguf` unless noted.
+  Target `flint-UD-Q4_K_XL.gguf`; drafter `Flint-DFlash2-Q6_K.gguf` unless noted
+  (passed as `--dflash-model` to serve, or `--dflash-model` to `flint_spec_gate`).
 
 ### Passing checks
 

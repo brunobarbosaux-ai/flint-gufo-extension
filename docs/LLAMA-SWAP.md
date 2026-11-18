@@ -1,24 +1,25 @@
 # Running Flint with speculation under llama-swap
 
-Flint's DFlash2 speculative decoding is opt-in. Enable it with environment
-variables on the **process that runs Gufo**. Under llama-swap that process is
-the `cmd:` of a model entry, so the variables go on that command.
+Flint's DFlash2 speculative decoding is opt-in. Enable it with CLI options on
+`gufo serve`. Under llama-swap, those options go on the `cmd:` of a model entry.
 
 ## Settings
 
-| Variable | Default | Meaning |
+| Option | Default | Meaning |
 | --- | --- | --- |
-| `FLINT_SPEC` | off | `dflash` enables DFlash2; `off` or unset disables; `null` is a test mode (no-op drafter) |
-| `FLINT_DRAFT` | `Flint-DFlash2-Q6_K.gguf` | path to the drafter GGUF, inside the process's filesystem |
+| `--speculative dflash2` | off | enables DFlash2 for the process |
+| `--dflash-model PATH` | none | path to the drafter GGUF, inside the process's filesystem. **Required** when `--speculative dflash2` is set; the server fails at startup without it |
 
-The backend is also selectable per request with `--speculative dflash2`
-(`gufo serve`), and `--draft-tokens`, `--min-draft-tokens` and `--draft-policy`
-(`fixed` or `adaptive`, default `adaptive`) tune it. See `README.md`.
+Speculation is set only by these options. No environment variable enables,
+disables, or configures it.
+
+The `--draft-tokens`, `--min-draft-tokens` and `--draft-policy` options (`fixed`
+or `adaptive`, default `adaptive`) tune it. See `README.md`.
 
 ## Example llama-swap entry (Docker, official runtime image)
 
 This is the shape of the existing `flint-ext` entry with speculation enabled.
-The drafter must be mounted into the container, because `FLINT_DRAFT` is read
+The drafter must be mounted into the container, because `--dflash-model` is read
 inside it:
 
 ```yaml
@@ -29,8 +30,6 @@ inside it:
       --device=/dev/kfd --device=/dev/dri
       --group-add 992
       --ulimit memlock=-1
-      -e FLINT_SPEC=dflash
-      -e FLINT_DRAFT=/models/mtp/Flint-DFlash2-Q6_K.gguf
       -p ${PORT}:8080
       -v gufo-extensions:/home/gufo/.local/share/gufo/extensions
       -v /home/bruno/AI/GGUF:/models:ro
@@ -40,11 +39,10 @@ inside it:
       --served-model-name flint-ext-spec
       -j 1
       -c 262144
+      --speculative dflash2
+      --dflash-model /models/mtp/Flint-DFlash2-Q6_K.gguf
     cmdStop: docker rm -f ${MODEL_ID}
 ```
-
-Set `-e` flags on `docker run`, not on llama-swap itself: llama-swap only
-launches the child, and the child is what reads `FLINT_SPEC`.
 
 Keep `-j 1`. Flint serializes concurrent requests (`physical_width 1`), so
 speculation targets single-stream latency. That matches llama-swap's one-model-
@@ -65,8 +63,9 @@ waits for the first.
 
 ## Mounting the drafter
 
-Copy or mount a drafter GGUF where the process can read it. Here the drafter
-lives in the local `mtp/` folder, mounted at `/models/mtp` in the example.
+Copy or mount a drafter GGUF where the process can read it, and pass its path
+with `--dflash-model`. Here the drafter lives in the local `mtp/` folder,
+mounted at `/models/mtp` in the example.
 The Q4_K_M drafter saves about 96 MB of VRAM versus Q6_K, and it measured
 slightly faster (decode speedup 1.345 vs 1.263 at depth 0). The GX gate passes
 for all three quants.

@@ -8,7 +8,7 @@ M3 — Cycle + runner integration (M2 done)
 - Never loosen gates (1e-4 stage, 5e-6 selector, 95% level-2).
 - One GPU model process at a time.
 - Cycle hook: `SelectNext`/`Advance` (plan §3.2), not `DecodeStep`; keeps the sampler's history updated between rows.
-- `FLINT_SPEC=off` is the default; `dflash` and `null` are opt-in.
+- Speculation is off by default; `--speculative dflash2 --dflash-model <gguf>` opts in (no env vars).
 
 ## Environment
 - Extension repo: /home/bruno/Projects/flint-gufo-extension

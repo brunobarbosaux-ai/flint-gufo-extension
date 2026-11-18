@@ -41,9 +41,6 @@ using FlintSession = gpu::Session;
 using ext::TextRunnerToken;
 
 constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v1";
-// Default DFlash2 drafter when neither the options nor FLINT_DRAFT name one.
-constexpr const char* kDefaultDraftPath =
-    "/home/bruno/AI/GGUF/mtp/Flint-DFlash2-Q6_K.gguf";
 
 void Log(const std::string& line) {
   std::fprintf(stderr, "[flint] %s\n", line.c_str());
@@ -112,9 +109,9 @@ sampling::TextSamplingDefaults FlintSamplingDefaults() {
   return {unspecified, thinking_on, thinking_off};
 }
 
-// Speculation mode, from FLINT_SPEC or the options. `null` is a test mode: the
-// drafter is a stub whose proposals are deliberately wrong, so the cycle runs
-// and nothing is ever accepted.
+// Speculation mode, from the options only. `null` is a test-only mode (see
+// CreateFlintNullDrafterRunnerForTest): the drafter is a stub whose proposals
+// are deliberately wrong, so the cycle runs and nothing is ever accepted.
 enum class FlintSpecMode { kOff, kDFlash, kNull };
 
 class FlintTextRunnerState final : public ext::TextRunnerState {
@@ -682,36 +679,37 @@ std::optional<sampling::TextSamplingDefaults> FlintTextSamplingDefaults(
   return FlintSamplingDefaults();
 }
 
-std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
-    const ext::TextRunnerOptions& options, std::string* error) {
+namespace {
+
+// Shared factory body. `null_drafter` is set only by the test entry point.
+std::shared_ptr<ext::TextModelRunner> CreateFlintRunner(
+    const ext::TextRunnerOptions& options, bool null_drafter,
+    std::string* error) {
   try {
     if (options.model_path.empty()) {
       if (error)
         *error = "Flint requires a model path";
       return nullptr;
     }
-    // Speculation: FLINT_SPEC=dflash|off|null, read from the environment. An
-    // explicit DFlash2 backend in the options also turns it on.
+    // Speculation comes only from the options: the host's speculative backend.
     FlintSpecMode spec_mode = FlintSpecMode::kOff;
-    if (const char* env = std::getenv("FLINT_SPEC")) {
-      const std::string value = env;
-      if (value == "dflash")
-        spec_mode = FlintSpecMode::kDFlash;
-      else if (value == "null")
-        spec_mode = FlintSpecMode::kNull;
-      else if (value != "off" && !value.empty()) {
-        if (error)
-          *error = "FLINT_SPEC must be dflash, off or null";
-        return nullptr;
-      }
-    }
-    if (options.speculative.backend == ext::TextSpeculativeBackend::kDFlash &&
-        spec_mode == FlintSpecMode::kOff)
+    if (null_drafter) {
+      spec_mode = FlintSpecMode::kNull;
+    } else if (options.speculative.backend ==
+               ext::TextSpeculativeBackend::kDFlash) {
       spec_mode = FlintSpecMode::kDFlash;
-    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled &&
-        options.speculative.backend != ext::TextSpeculativeBackend::kDFlash) {
+    } else if (options.speculative.backend !=
+               ext::TextSpeculativeBackend::kDisabled) {
       if (error)
         *error = "Flint supports only the DFlash2 speculative backend";
+      return nullptr;
+    }
+    if (spec_mode != FlintSpecMode::kOff &&
+        options.speculative.draft_model_path.empty()) {
+      if (error)
+        *error =
+            "speculation enabled but no drafter given: pass --dflash-model "
+            "<gguf>";
       return nullptr;
     }
     if (!options.vision_model_path.empty()) {
@@ -796,13 +794,7 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
     std::vector<std::uint32_t> taps;
     std::optional<spec::DraftPolicy> draft_policy;
     if (spec_mode != FlintSpecMode::kOff) {
-      std::string draft_path = options.speculative.draft_model_path;
-      if (draft_path.empty()) {
-        if (const char* env = std::getenv("FLINT_DRAFT"))
-          draft_path = env;
-      }
-      if (draft_path.empty())
-        draft_path = kDefaultDraftPath;
+      const std::string& draft_path = options.speculative.draft_model_path;
       auto draft_reader = core::GgufReader::OpenFile(draft_path, &open_error);
       if (!draft_reader) {
         if (error)
@@ -859,6 +851,18 @@ std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
       *error = std::string("Flint runner creation failed: ") + e.what();
     return nullptr;
   }
+}
+
+}  // namespace
+
+std::shared_ptr<ext::TextModelRunner> CreateFlintTextRunner(
+    const ext::TextRunnerOptions& options, std::string* error) {
+  return CreateFlintRunner(options, /*null_drafter=*/false, error);
+}
+
+std::shared_ptr<ext::TextModelRunner> CreateFlintNullDrafterRunnerForTest(
+    const ext::TextRunnerOptions& options, std::string* error) {
+  return CreateFlintRunner(options, /*null_drafter=*/true, error);
 }
 
 }  // namespace gufo::models::flint

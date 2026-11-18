@@ -191,7 +191,7 @@ if(TARGET flint_drafter_parity)
 endif()
 
 # ---------------------------------------------------------------------------
-# Speculation gates (M3): drives the runner's text contract with FLINT_SPEC
+# Speculation gates (M3): drives the runner's text contract with the gate's own speculative options
 # off / dflash / null and checks greedy identity, null-drafter identity and
 # the cycle's tokens per cycle and speedup.
 # ---------------------------------------------------------------------------

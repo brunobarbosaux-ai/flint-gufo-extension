@@ -309,6 +309,14 @@ public:
                 .prefix_reuse = true,
             },
         .sampling_defaults = FlintSamplingDefaults(),
+        // API 0.3: required. Flint prefills in unsplit kPrefillChunk passes
+        // and ignores SetPrefillYield (allowed).
+        .scheduling =
+            ext::TextSchedulingProfile{
+                .pass_tokens = kPrefillChunk,
+                .max_layer_groups = 1,
+                .max_yield_decode_width = 1,
+            },
     };
   }
 

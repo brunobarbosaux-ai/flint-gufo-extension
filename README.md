@@ -17,10 +17,11 @@ adapted to the external extension contract. See `THIRD_PARTY_NOTICES.md`.
 - Gufo pin: `c40862ffd740832f47187b23f615be5c5b750415` (v0.32.0). The earlier
   `6cc8a42` (v0.31.0) pin predates `TextProvider::speculative_defaults` and
   cannot build 0.3.0.
-- Gufo API floor: `>= 0.2.15`. Derived from the upstream change records this
+- Gufo API floor: `>= 0.3.0`. Derived from the upstream change records this
   extension relies on: the series-0.2 component-cache-only continuation baseline
   (`0.2.0`), reasoning delimiters (`0.2.5`), provider-defined text sampling
-  defaults (`0.2.7`) and provider-declared speculative defaults (`0.2.15`).
+  defaults (`0.2.7`), provider-declared speculative defaults (`0.2.15`) and the
+  required text scheduling profile (`0.3.0`, `TextRunnerDescriptor::scheduling`).
 - Platforms: Linux
 
 ## Build

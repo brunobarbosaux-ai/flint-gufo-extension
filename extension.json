@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "flint",
-  "api_version": ">= 0.2.15",
+  "api_version": ">= 0.3.0",
   "version": "0.3.0",
   "depends": [],
   "platforms": ["linux"],

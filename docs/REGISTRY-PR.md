@@ -12,8 +12,10 @@ PR until the 0.3.0 commit exists and the digest is computed.
       from the registry repo; not available in this tree). It must match the tree
       at `revision`.
 - [ ] Confirm the Gufo build revision used for validation: `c40862ff` (v0.32.0).
-- [ ] The entry's `api_version` is `>= 0.2.15`. `speculative_defaults` was added
-      in API revision 0.2.15 (commit `49380168`). Do not claim an older floor.
+- [ ] The entry's `api_version` is `>= 0.3.0`. `speculative_defaults` was added
+      in API revision 0.2.15 (commit `49380168`); the required text scheduling
+      profile (`TextRunnerDescriptor::scheduling`) was added in 0.3.0. Do not
+      claim an older floor.
 
 ## Manifest diff (`index.json`, `extensions.flint`)
 
@@ -30,7 +32,7 @@ Add a release at the top of `releases`. The existing entries stay. Replace
      ],
      "releases": [
 +      {
-+        "api_version": ">= 0.2.15",
++        "api_version": ">= 0.3.0",
 +        "digest": "sha256:<DIGEST>",
 +        "notes": "DFlash2 speculative decoding (opt-in, --speculative dflash2 --dflash-model <gguf>): drafter-proposed tokens verified in one batched pass; greedy output byte-identical to spec-off; decode speedup 1.24-1.35 at depth 0, temp 0. Declares speculative_defaults (max 7, min 1, adaptive).",
 +        "platforms": [
@@ -62,7 +64,7 @@ and `description` are already correct for this repo.
 - License: MIT (`LICENSE`, `THIRD_PARTY_NOTICES.md`)
 - Maintainer: @brunobarbosaux-ai
 - Platforms: linux (gfx1151, ROCm 7.2.1)
-- Gufo build: `c40862ff` (v0.32.0); `api_version >= 0.2.15`
+- Gufo build: `390639b3` (main, API 0.3.27, version 0.35.0+); `api_version >= 0.3.0`
 
 ## What is new since 0.2.0
 - DFlash2 speculative decoding, **opt-in** (`--speculative dflash2`, default off).

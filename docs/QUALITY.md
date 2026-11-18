@@ -288,6 +288,10 @@ off; the drafter has no default path). Greedy output is
 byte-identical to spec-off; sampled output is not guaranteed identical (see
 caveat below).
 
+- Validation target (API 0.3): Gufo main `390639b3`, API 0.3.27 (version
+  0.35.0+). The 0.3 port adds the required `TextRunnerDescriptor::scheduling`
+  profile (`pass_tokens` 8192, `max_layer_groups` 1, `max_yield_decode_width` 1)
+  and sets `api_version >= 0.3.0`.
 - Environment: extension `0.3.0` (this revision, pending the M6 commit);
   Gufo pin `c40862ff` (v0.32.0), which carries `TextProvider::speculative_defaults`
   (commit `49380168`, API revision 0.2.15). The README's `6cc8a42` pin predates

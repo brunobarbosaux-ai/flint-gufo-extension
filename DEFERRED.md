@@ -9,3 +9,8 @@
 - `gufo serve -c 262144` never completes the `sessions` load phase (11+ min, killed), with AND without `--speculative`. Blocked in KFD GPU memory allocation; GTT climbs past 55 GB while the session cap is 2. Verified boundary (2026-11-17): 196608 loads (~62 s), 262144 hangs; boundary between them not bisected.
 - Practical ceiling today: **196608 (192k)**. Documented in the README; the model's native 262144 remains unsupported at serve startup.
 - Action: audit the host session pre-allocation path (queue budget / `ResourceClaim`-driven sizing) at 256k; likely fix is capping pre-allocated sessions by free VRAM.
+
+### Serve draft counters report zero (root-caused 2026-11-18; not a logging bug)
+- Serve drives Flint via `SelectNext()`/`Advance()` (per PLAN-DFLASH2: sampler-history correctness), so the counter-copying `DecodeStep` hook (`runner.cpp:612`) is never called; `Descriptor().multi_token_decode` is false and the host's `StepDecode` path never reads `SpecCycle::stats()`.
+- Speculation itself demonstrably runs in serve: decode 74.3 t/s at 8k ≈ spec-on (74.7) vs spec-off (63.6). A same-request A/B tps comparison (serve with vs without `--speculative dflash2`) is the accepted proof for 0.3.0 — no code change.
+- Fix options deferred to v0.4.0: (A) flip `multi_token_decode` capability — extension-only but changes the serve scheduling path (needs full re-verification); (B) host-side counter channel on `TextRunnerState` — touches Gufo core, out of extension scope.

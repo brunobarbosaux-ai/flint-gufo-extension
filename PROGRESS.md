@@ -79,7 +79,16 @@ The true optimum is **k=3 at temp 0** and **k=2 at temp 1.0** — so the gate IS
 - **Runtime bug found**: spec-on prompts > 2048 tokens fail with `captured residual for row 0 left the ring`. Root cause: `Session::CapturedHiddenDevice` (`src/gpu/engine.cpp`) has an off-by-one (`row + R <= position` should be `< position`), so the ring yields only `R-1` usable rows while the runner caps its prefill chunk at exactly `R` (2048). Short prompts never hit it, which is why M3 passed. Fix delegated (engine boundary + remove the gate workaround).
 - **Root cause found and fixed**: spec-off prefilled in 8192-token chunks while spec-on capped at the 2048-row hidden ring; multi-token prefill depends on chunk size (M2), so KV caches differed and greedy decode diverged. Debugger confirmed with a boundary sweep (2048 pass / 4096 fail) and a decisive test (kPrefillChunk=2048 makes depth 4096+ pass). Fix (`9506b32`): `kHiddenRingRows` 2048->8192, spec-only Prefill cap removed, `static_assert` invariant, plus the `CapturedHiddenDevice` boundary fix (`row + R < position`). Verified independently: GX 12/12 at 0/8k/32k/131k with no workaround; decode-only speedup at 8k = 1.26 (accept 0.495). Ring now ~320 MiB when capture is on; ResourceClaim accounting is M5b scope. Stale "2048" comments remain in PROGRESS.md/PLAN-M1C/target_adapter.hpp/drafter_parity.cpp (cosmetic).
 
-### Serve-mode findings (post-M5)
+### Depth-curve speed comparison (`--mode curve`, added post-batch `4e8e7f4`)
+Measured temp 0, 12 prompts, 192 tokens (see `/tmp/opencode/release-batch/curve.log`):
+| depth | prefill off/on tps | decode off/on tps | whole spd | decode spd | accept |
+|---|---|---|---|---|---|
+| 2048 | 2884 / 2076 | 67.1 / 75.9 | 1.016 | 1.131 | 0.428 |
+| 8192 | 2811 / 2192 | 62.7 / 73.1 | 0.939 | 1.165 | 0.458 |
+| 32768 | 2236 / 1929 | 50.4 / 57.1 | 0.907 | 1.132 | 0.517 |
+| 131072 | 1216 / 1135 | 28.0 / 30.9 | 0.941 | 1.104 | 0.595 |
+- Decode: speculation wins 10-17% at every depth; acceptance rises with depth (0.43 -> 0.60).
+- **Spec-on prefill is 20-25% slower at every depth** (drafter context injection / hidden capture during prefill) — this is why whole-request speedup falls below 1.0 from 8k up (prefill is ~50% of wall at 8k, ~94% at 128k). Optimization target for post-0.3.0: skip or defer SyncContext work during prefill chunks.
 - **262k-context serve startup hangs in `phase=sessions` with AND without speculation** (control run killed after 11 min; KFD GPU alloc, GTT >55 GB). Pre-existing host/extension issue at max context, not DFlash2. At `-c 8192` serve loads in ~66 s.
 - **Prefix-reuse desync fixed** (`e9dc61c`): the second serve request failed with "DFlash2 context rows are not contiguous" — `ReconcileComponentState` restored the session without re-syncing the drafter. Fix: `cycle Reset(frontier)` adopts the restored position; drafter history gated to post-frontier rows. Verified: 3 sequential serve requests all 200 with cache hits; GX 3/3, null 2/2.
 - Caveat: after a restore the drafter attends to no history until the 2048 sliding window passes the frontier (acceptance dip, greedy unaffected). Serve-mode draft-cycle counters not yet confirmed (coverage gap — gates cover the spec path).

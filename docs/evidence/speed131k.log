@@ -1,0 +1,9 @@
+[flint] event=warmup_completed tokens=9000 elapsed_s=3.317996
+[flint] event=warmup_completed tokens=9000 elapsed_s=3.411762
+policy=fixed max_draft=7 min_draft=1
+speed temp=0.000 depth=131072 tokens_off=2304 tokens_on=2304 tps_off=1.699 tps_on=1.576 speedup=0.928 decode_tps_off=28.468 decode_tps_on=23.336 decode_speedup=0.820 cycles=617 tokens_per_cycle=3.734 accept_rate=0.389 mean_draft=7.000
+speed temp=0.700 depth=131072 tokens_off=2304 tokens_on=2304 tps_off=1.686 tps_on=1.560 speedup=0.925 decode_tps_off=25.466 decode_tps_on=20.179 decode_speedup=0.792 cycles=664 tokens_per_cycle=3.470 accept_rate=0.352 mean_draft=7.000
+[flint] event=warmup_completed tokens=9000 elapsed_s=3.279885
+policy=adaptive max_draft=7 min_draft=1
+speed temp=0.000 depth=131072 tokens_off=2304 tokens_on=2304 tps_off=1.699 tps_on=1.603 speedup=0.944 decode_tps_off=28.468 decode_tps_on=31.091 decode_speedup=1.092 cycles=832 tokens_per_cycle=2.769 accept_rate=0.595 mean_draft=2.962
+speed temp=0.700 depth=131072 tokens_off=2304 tokens_on=2304 tps_off=1.686 tps_on=1.591 speedup=0.944 decode_tps_off=25.466 decode_tps_on=26.996 decode_speedup=1.060 cycles=888 tokens_per_cycle=2.595 accept_rate=0.565 mean_draft=2.806

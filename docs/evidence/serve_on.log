@@ -1,0 +1,16 @@
+Warning: extension strycast_generic_spike is not built for this gufo; run 'gufo extension update strycast_generic_spike'
+2026-11-18 05:00:15 [INFO] [gpu] event=queue_budget kind=llm observed=0 budget=8 expected_max=3 cap=2
+2026-11-18 05:00:15 [INFO] [loader] event=load_started kind=text artifact=/home/bruno/AI/GGUF/flint-UD-Q4_K_XL.gguf rss_mib=130 host_available_mib=115034
+[flint] event=warmup_completed tokens=8064 elapsed_s=2.811999
+2026-11-18 05:00:21 [INFO] [loader] event=load_phase phase=sessions rss_mib=24177 host_available_mib=88530
+2026-11-18 05:00:22 [INFO] [cache] schema=component-cache-v1 event=configured sessions=1 snapshot_entries=128 capacity_bytes=34359738368 staging_capacity_bytes=0 automatic_bytes=34359738368 max_bytes=76260417536 disk_capacity_bytes=0 slot_pinned_bytes=0 ram_cache=on disk_backing_bytes=0
+2026-11-18 05:00:22 [INFO] [loader] event=structured_output_prepared vocabulary_tokens=150144 prepare_ms=16.9 rss_delta_kib=9136 rss_mib=27256 host_available_mib=83000
+2026-11-18 05:00:22 [INFO] [sampling] event=defaults thinking=auto temperature=0.6 top_k=0 top_p=0.95 min_p=0 min_keep=0 seed=-1 repeat_penalty=1 repeat_last_n=64 frequency_penalty=0 presence_penalty=0
+2026-11-18 05:00:22 [INFO] [loader] event=load_completed kind=text elapsed_ms=6926 monotonic_us=34574941873 model=flint-spec sessions=1 context_tokens=8192 speculative=dflash2 draft_limit=7 draft_policy=adaptive disk_cache=off rss_mib=27245 host_available_mib=83000 gpu_device_used_mib=45967 gpu_device_total_mib=114688
+2026-11-18 05:00:22 [INFO] [server] event=listening monotonic_us=34574942338 address=http://127.0.0.1:8095 max_connections=16 max_body_bytes=8388608
+2026-11-18 05:00:23 [INFO] [http] request=r1 event=received method=POST path=/v1/chat/completions body_bytes=135
+2026-11-18 05:00:23 [INFO] [cache] schema=component-cache-v1 event=acquire reuse=none selected_tokens=0 restored_bytes=0
+2026-11-18 05:00:29 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=9 purpose=2 rank=3 unique_bytes_freed=0 ledger_bytes=3680433986
+2026-11-18 05:00:29 [INFO] [http] request=r1 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=5743.0 outcome=completed prompt_tokens=9 prefill_tokens=9 generated_tokens=512 finish=length cache=miss cached_tokens=0 cache_restore_ms=0.0 queue_depth=1 resident_at_admission=1 queue_ms=14.4 shared_prefix_wait_ms=0.0 ttft_ms=75.6 prefill_tps=147.2 decode_tps=91.2 batch_width=1 plan=serial-c1 draft_accepted=0 draft_proposed=0 draft_rounds=0 cache_schema=component-cache-v1 cache_reuse=none cache_captures=1 cache_captured_capacity_bytes=822738944 cache_global_ledger_bytes=3680438740 cache_snapshot_bytes=822684216 cache_miss_reason=no_checkpoint common_prefix_tokens=0 nearest_checkpoint_tokens=0 rss_mib=27259 host_available_mib=82368
+2026-11-18 05:00:30 [INFO] [server] event=shutdown_requested signal=15
+2026-11-18 05:00:30 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=9 purpose=2 rank=3 unique_bytes_freed=1166 ledger_bytes=3680423336

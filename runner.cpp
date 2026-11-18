@@ -324,21 +324,14 @@ public:
     std::size_t per_request =
         model_->SessionBytes(max_context_ + FlintSession::kMaxVerifyRows);
     if (drafter_) {
-      // Speculation: the hidden ring is per session. The drafter is one object
-      // per runner and holds one context ring; the plan is serial, so it is
-      // counted once, as per-request state (conservative). Its weights and
-      // block workspace are resident.
-      const auto& draft = drafter_->config();
-      const std::size_t kv = draft.KvSize();
-      const std::size_t context_ring =
-          std::size_t{draft.num_layers} * 2 * drafter_->HistoryCapacity() * kv *
-          sizeof(float);
+      // Speculation. Per session: the hidden ring and the drafter's K/V ring
+      // (each slot's DflashContext). Resident, shared by all sessions: the
+      // drafter's weights and block workspace, and the injection scratch.
       const std::size_t hidden_ring =
           std::size_t{std::min(FlintSession::kHiddenRingRows, max_context_)} *
           taps_.size() * hidden_width_ * sizeof(float);
-      resident += drafter_->AllocatedBytes() - context_ring;
-      per_request += hidden_ring + context_ring +
-                     drafter_->ContextScratchBytes();
+      resident += drafter_->AllocatedBytes() + drafter_->ContextScratchPendingBytes();
+      per_request += hidden_ring + drafter_->ContextRingBytes();
     }
     return {
         .resident_weights_bytes = resident,
@@ -382,10 +375,16 @@ public:
                                                 hidden_width_, &error);
       if (!target)
         throw std::runtime_error("Flint target adapter failed: " + error);
-      // Each slot keeps its own acceptance history; the policy only changes
-      // speed, so per-slot state is enough.
-      auto cycle = std::make_unique<spec::SpecCycle>(*target, *drafter_,
-                                                     draft_policy_);
+      // Each slot owns its drafter context (K/V ring and frontier) and its own
+      // acceptance history, so sessions never see each other's target context.
+      // The drafter's weights and block workspace stay shared.
+      std::string context_error;
+      auto context = drafter_->CreateContext(&context_error);
+      if (!context)
+        throw std::runtime_error("Flint drafter context failed: " +
+                                 context_error);
+      auto cycle = std::make_unique<spec::SpecCycle>(
+          *target, *drafter_, std::move(context), draft_policy_);
       if (spec_mode_ == FlintSpecMode::kNull)
         cycle->set_draft_transform(&NullDraftTransform, vocab_size_);
       state->AttachCycle(std::move(target), std::move(cycle));
@@ -663,8 +662,8 @@ private:
   std::uint32_t max_context_;
   cache::Identity component_identity_;
   FlintSpecMode spec_mode_{FlintSpecMode::kOff};
-  // One drafter per runner. Serial execution (one request at a time) makes it
-  // safe to share; each prompt resets its context in Prefill.
+  // One drafter per runner: weights and block workspace, shared. Each bound
+  // session owns its DflashContext (see BindComponentState).
   std::unique_ptr<gpu::dflash::DflashForward> drafter_;
   std::vector<std::uint32_t> taps_;
   std::uint32_t hidden_width_{0};

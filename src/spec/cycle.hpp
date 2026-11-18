@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,8 +41,10 @@ struct CycleStats {
 class SpecCycle {
  public:
   /// `policy` picks each block's length (see DraftPolicy). Borrows `target`
-  /// and `drafter`; both must outlive it.
+  /// and `drafter`; both must outlive it. `context` is this cycle's own
+  /// drafter context (one per session), so sessions never share a ring.
   SpecCycle(TargetAdapter& target, gpu::dflash::DflashForward& drafter,
+            std::unique_ptr<gpu::dflash::DflashContext> context,
             DraftPolicy policy);
 
   /// Returns the next token drawn from `sampler`. When no cycle is active,
@@ -96,6 +99,7 @@ class SpecCycle {
 
   TargetAdapter& target_;
   gpu::dflash::DflashForward& drafter_;
+  std::unique_ptr<gpu::dflash::DflashContext> context_;
   DraftPolicy policy_;
   std::uint32_t injected_{0};
   std::vector<float> features_;

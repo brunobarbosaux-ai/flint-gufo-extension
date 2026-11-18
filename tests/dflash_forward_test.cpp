@@ -190,13 +190,16 @@ void TestUploadAndConfig() {
       config.num_layers != fixture.config.num_layers ||
       config.target_layer_ids != fixture.config.target_layer_ids)
     throw std::runtime_error("config did not survive Create");
-  if (forward->HistoryCapacity() != fixture.config.sliding_window)
+  auto context = forward->CreateContext(&error);
+  if (context == nullptr)
+    throw std::runtime_error("CreateContext failed: " + error);
+  if (context->HistoryCapacity() != fixture.config.sliding_window)
     throw std::runtime_error("context ring is not the attention window");
-  if (forward->ContextLength() != 0)
+  if (context->ContextLength() != 0)
     throw std::runtime_error("a fresh drafter has context");
   for (std::uint32_t layer = 0; layer < config.num_layers; ++layer) {
-    if (forward->InjectedKey(layer) == nullptr ||
-        forward->InjectedValue(layer) == nullptr)
+    if (context->InjectedKey(layer) == nullptr ||
+        context->InjectedValue(layer) == nullptr)
       throw std::runtime_error("injected rings are missing");
   }
 }
@@ -205,13 +208,16 @@ void TestContextAndBlock() {
   Fixture fixture;
   std::string error;
   auto forward = MakeForward(fixture, &error);
+  auto ctx = forward->CreateContext(&error);
+  if (ctx == nullptr)
+    throw std::runtime_error("CreateContext failed: " + error);
 
   // Two chunks of rows, so the injection loop runs more than once.
   constexpr std::uint32_t kRows = 40;
   const auto features = fixture.Features(kRows);
-  if (!forward->AppendContext(features, 0, kRows, &error))
+  if (!forward->AppendContext(*ctx, features, 0, kRows, &error))
     throw std::runtime_error("AppendContext failed: " + error);
-  if (forward->ContextLength() != kRows)
+  if (ctx->ContextLength() != kRows)
     throw std::runtime_error("context length did not advance");
 
   std::vector<std::string> stages;
@@ -223,7 +229,7 @@ void TestContextAndBlock() {
   };
 
   dflash::DflashDraft draft;
-  if (!forward->Run(/*anchor=*/5, /*position=*/kRows, /*draft_count=*/7, 0.0F,
+  if (!forward->Run(*ctx, /*anchor=*/5, /*position=*/kRows, /*draft_count=*/7, 0.0F,
                     {}, trace, &draft, &error))
     throw std::runtime_error("Run failed: " + error);
   if (draft.tokens.size() != 7)
@@ -259,11 +265,11 @@ void TestContextAndBlock() {
   // A block is a pure function of the state appended so far: nothing in it is
   // committed, so a second identical call must return the same proposals.
   dflash::DflashDraft again;
-  if (!forward->Run(5, kRows, 7, 0.0F, {}, {}, &again, &error))
+  if (!forward->Run(*ctx, 5, kRows, 7, 0.0F, {}, {}, &again, &error))
     throw std::runtime_error("second Run failed: " + error);
   if (again.tokens != draft.tokens)
     throw std::runtime_error("a block is not deterministic");
-  if (forward->ContextLength() != kRows)
+  if (ctx->ContextLength() != kRows)
     throw std::runtime_error("Run mutated the injected context");
 }
 
@@ -271,40 +277,79 @@ void TestResetContext() {
   Fixture fixture;
   std::string error;
   auto forward = MakeForward(fixture, &error);
+  auto ctx = forward->CreateContext(&error);
+  if (ctx == nullptr)
+    throw std::runtime_error("CreateContext failed: " + error);
   constexpr std::uint32_t kRows = 40;
   const auto features = fixture.Features(kRows);
-  if (!forward->AppendContext(features, 0, kRows, &error))
+  if (!forward->AppendContext(*ctx, features, 0, kRows, &error))
     throw std::runtime_error("AppendContext failed: " + error);
   dflash::DflashDraft first;
-  if (!forward->Run(5, kRows, 7, 0.0F, {}, {}, &first, &error))
+  if (!forward->Run(*ctx, 5, kRows, 7, 0.0F, {}, {}, &first, &error))
     throw std::runtime_error("Run failed: " + error);
 
   // A new prompt starts over: the length goes back to zero, and the same rows
   // re-injected from position zero give the same block.
-  forward->ResetContext();
-  if (forward->ContextLength() != 0)
+  ctx->ResetContext();
+  if (ctx->ContextLength() != 0)
     throw std::runtime_error("ResetContext did not clear the context length");
-  if (!forward->AppendContext(features, 0, kRows, &error))
+  if (!forward->AppendContext(*ctx, features, 0, kRows, &error))
     throw std::runtime_error("re-injection failed: " + error);
   dflash::DflashDraft second;
-  if (!forward->Run(5, kRows, 7, 0.0F, {}, {}, &second, &error))
+  if (!forward->Run(*ctx, 5, kRows, 7, 0.0F, {}, {}, &second, &error))
     throw std::runtime_error("Run after reset failed: " + error);
   if (second.tokens != first.tokens)
     throw std::runtime_error("proposals changed after ResetContext");
+}
+
+// Sessions share one drafter but not its context: a second context must not
+// see the first one's rows, and resetting one must not touch the other.
+void TestContextsAreIndependent() {
+  Fixture fixture;
+  std::string error;
+  auto forward = MakeForward(fixture, &error);
+  constexpr std::uint32_t kRows = 24;
+  const auto features = fixture.Features(kRows);
+  auto first = forward->CreateContext(&error);
+  auto second = forward->CreateContext(&error);
+  if (first == nullptr || second == nullptr)
+    throw std::runtime_error("CreateContext failed: " + error);
+  if (!forward->AppendContext(*first, features, 0, kRows, &error))
+    throw std::runtime_error("AppendContext failed: " + error);
+  if (second->ContextLength() != 0)
+    throw std::runtime_error("a second context saw the first one's rows");
+  if (first->InjectedKey(0) == second->InjectedKey(0))
+    throw std::runtime_error("two contexts share a K ring");
+
+  dflash::DflashDraft before;
+  if (!forward->Run(*first, 5, kRows, 7, 0.0F, {}, {}, &before, &error))
+    throw std::runtime_error("Run failed: " + error);
+  // Another session's reset and prompt must leave this session's block alone.
+  second->ResetContext(0);
+  if (!forward->AppendContext(*second, fixture.Features(8), 0, 8, &error))
+    throw std::runtime_error("second AppendContext failed: " + error);
+  dflash::DflashDraft after;
+  if (!forward->Run(*first, 5, kRows, 7, 0.0F, {}, {}, &after, &error))
+    throw std::runtime_error("Run after other session failed: " + error);
+  if (after.tokens != before.tokens)
+    throw std::runtime_error("another session's context changed this block");
 }
 
 void TestSampledDraft() {
   Fixture fixture;
   std::string error;
   auto forward = MakeForward(fixture, &error);
+  auto ctx = forward->CreateContext(&error);
+  if (ctx == nullptr)
+    throw std::runtime_error("CreateContext failed: " + error);
   constexpr std::uint32_t kRows = 20;
   const auto features = fixture.Features(kRows);
-  if (!forward->AppendContext(features, 0, kRows, &error))
+  if (!forward->AppendContext(*ctx, features, 0, kRows, &error))
     throw std::runtime_error("AppendContext failed: " + error);
 
   const std::vector<float> uniforms{0.05F, 0.25F, 0.5F, 0.75F, 0.95F};
   dflash::DflashDraft draft;
-  if (!forward->Run(3, kRows, 5, 0.8F, uniforms, {}, &draft, &error))
+  if (!forward->Run(*ctx, 3, kRows, 5, 0.8F, uniforms, {}, &draft, &error))
     throw std::runtime_error("sampled Run failed: " + error);
   const std::size_t expected =
       std::size_t{5} * fixture.config.selector_top_k;
@@ -333,13 +378,16 @@ void TestClampedBlock() {
   Fixture fixture;
   std::string error;
   auto forward = MakeForward(fixture, &error);
+  auto ctx = forward->CreateContext(&error);
+  if (ctx == nullptr)
+    throw std::runtime_error("CreateContext failed: " + error);
   constexpr std::uint32_t kRows = 8;
   const auto features = fixture.Features(kRows);
-  if (!forward->AppendContext(features, 0, kRows, &error))
+  if (!forward->AppendContext(*ctx, features, 0, kRows, &error))
     throw std::runtime_error("AppendContext failed: " + error);
   dflash::DflashDraft draft;
   // One more proposal than a full block can hold is clamped, not rejected.
-  if (!forward->Run(1, kRows, fixture.config.block_size, 0.0F, {}, {}, &draft,
+  if (!forward->Run(*ctx, 1, kRows, fixture.config.block_size, 0.0F, {}, {}, &draft,
                     &error))
     throw std::runtime_error("clamped Run failed: " + error);
   if (draft.tokens.size() != fixture.config.block_size - 1U)
@@ -358,6 +406,7 @@ int main() {
     TestUploadAndConfig();
     TestContextAndBlock();
     TestResetContext();
+    TestContextsAreIndependent();
     TestSampledDraft();
     TestClampedBlock();
   } catch (const std::exception& error) {

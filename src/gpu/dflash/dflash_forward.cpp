@@ -135,14 +135,8 @@ struct DflashForward::Impl {
   }
   std::vector<void*> allocations;
   std::size_t allocated_bytes{0};
-
-  // Injected target context: one K/V ring per draft layer.
-  std::vector<float*> injected_k, injected_v;
-  std::uint32_t history_capacity{0};
-  std::uint32_t injected_context_len{0};
-  // First row the ring was injected with. Rows below it were never fed (the
-  // context restarted at a frontier), so Run must not read them.
-  std::uint32_t history_begin{0};
+  // Ring rows each context gets: the attention window, capped at max_context.
+  std::uint32_t context_capacity{0};
 
   ~Impl() {
     if (stream != nullptr)
@@ -397,6 +391,50 @@ struct DflashForward::Impl {
 };
 
 DflashForward::DflashForward() : impl_(std::make_unique<Impl>()) {}
+// Per-session context: the K/V ring Run attends to and the frontier that says
+// which rows were injected. The ring is allocated by the forward (same device,
+// same stream), and freed here, so a context can outlive nothing but its
+// forward.
+struct DflashContext::Impl {
+  std::vector<void*> allocations;
+  std::size_t ring_bytes{0};
+  std::vector<float*> injected_k, injected_v;
+  std::uint32_t history_capacity{0};
+  std::uint32_t injected_context_len{0};
+  // First row the ring was injected with. Rows below it were never fed (the
+  // context restarted at a frontier), so Run must not read them.
+  std::uint32_t history_begin{0};
+
+  ~Impl() {
+    for (void* allocation : allocations)
+      (void)hipFree(allocation);
+  }
+};
+
+DflashContext::DflashContext() : impl_(std::make_unique<Impl>()) {}
+DflashContext::~DflashContext() = default;
+
+std::uint32_t DflashContext::ContextLength() const noexcept {
+  return impl_->injected_context_len;
+}
+
+void DflashContext::ResetContext(std::uint32_t frontier) noexcept {
+  impl_->injected_context_len = frontier;
+  impl_->history_begin = frontier;
+}
+
+std::uint32_t DflashContext::HistoryCapacity() const noexcept {
+  return impl_->history_capacity;
+}
+
+const float* DflashContext::InjectedKey(std::uint32_t layer) const noexcept {
+  return layer < impl_->injected_k.size() ? impl_->injected_k[layer] : nullptr;
+}
+
+const float* DflashContext::InjectedValue(std::uint32_t layer) const noexcept {
+  return layer < impl_->injected_v.size() ? impl_->injected_v[layer] : nullptr;
+}
+
 DflashForward::~DflashForward() = default;
 
 std::unique_ptr<DflashForward> DflashForward::Create(
@@ -473,18 +511,11 @@ std::unique_ptr<DflashForward> DflashForward::Create(
         error_msg, "id set initialization failed");
 
   // Context ring: the attention window is all the drafter ever reads.
-  s.history_capacity = std::max(std::uint32_t{1},
+  // Each context ring holds the attention window, capped at max_context.
+  s.context_capacity = std::max(std::uint32_t{1},
                                 std::min(max_context == 0 ? c.sliding_window
                                                           : max_context,
                                          c.sliding_window));
-  s.injected_k.resize(c.num_layers);
-  s.injected_v.resize(c.num_layers);
-  for (std::uint32_t i = 0; i < c.num_layers; ++i) {
-    s.injected_k[i] = s.AllocateFloats(std::size_t{s.history_capacity} * kv,
-                                       error_msg);
-    s.injected_v[i] = s.AllocateFloats(std::size_t{s.history_capacity} * kv,
-                                       error_msg);
-  }
 
   std::string error;
   bool ok =
@@ -547,20 +578,40 @@ const DflashConfig& DflashForward::config() const noexcept {
   return impl_->config;
 }
 
-std::uint32_t DflashForward::ContextLength() const noexcept {
-  return impl_->injected_context_len;
+std::unique_ptr<DflashContext> DflashForward::CreateContext(
+    std::string* error_msg) const {
+  const Impl& s = *impl_;
+  const DflashConfig& c = s.config;
+  auto context = std::unique_ptr<DflashContext>(new DflashContext());
+  DflashContext::Impl& ctx = *context->impl_;
+  ctx.history_capacity = s.context_capacity;
+  const std::size_t kv = c.KvSize();
+  const std::size_t bytes = std::size_t{ctx.history_capacity} * kv * sizeof(float);
+  ctx.injected_k.resize(c.num_layers);
+  ctx.injected_v.resize(c.num_layers);
+  for (std::uint32_t i = 0; i < c.num_layers; ++i) {
+    for (auto* ring : {&ctx.injected_k, &ctx.injected_v}) {
+      void* pointer = nullptr;
+      if (Check(hipMalloc(&pointer, bytes), error_msg, "context ring allocation failed");
+          pointer == nullptr)
+        return nullptr;
+      ctx.allocations.push_back(pointer);
+      ctx.ring_bytes += bytes;
+      (*ring)[i] = static_cast<float*>(pointer);
+    }
+  }
+  return context;
 }
 
-void DflashForward::ResetContext(std::uint32_t frontier) noexcept {
-  impl_->injected_context_len = frontier;
-  impl_->history_begin = frontier;
+std::size_t DflashForward::ContextRingBytes() const noexcept {
+  const DflashConfig& c = impl_->config;
+  return std::size_t{c.num_layers} * 2 * impl_->context_capacity * c.KvSize() *
+         sizeof(float);
 }
 
-std::uint32_t DflashForward::HistoryCapacity() const noexcept {
-  return impl_->history_capacity;
-}
-
-std::size_t DflashForward::ContextScratchBytes() const noexcept {
+std::size_t DflashForward::ContextScratchPendingBytes() const noexcept {
+  if (impl_->context_features != nullptr)
+    return 0;
   const DflashConfig& c = impl_->config;
   const std::size_t hidden = c.hidden_size;
   const std::size_t kv = c.KvSize();
@@ -574,25 +625,19 @@ std::size_t DflashForward::AllocatedBytes() const noexcept {
   return impl_->allocated_bytes;
 }
 
-const float* DflashForward::InjectedKey(std::uint32_t layer) const noexcept {
-  return layer < impl_->injected_k.size() ? impl_->injected_k[layer] : nullptr;
-}
-
-const float* DflashForward::InjectedValue(std::uint32_t layer) const noexcept {
-  return layer < impl_->injected_v.size() ? impl_->injected_v[layer] : nullptr;
-}
-
-bool DflashForward::AppendContext(std::span<const float> features,
+bool DflashForward::AppendContext(DflashContext& context,
+                                  std::span<const float> features,
                                   std::uint32_t position, std::uint32_t count,
                                   std::string* error_msg,
                                   const DflashTrace& trace) {
   Impl& s = *impl_;
+  DflashContext::Impl& ctx = *context.impl_;
   const DflashConfig& c = s.config;
   const std::uint32_t hidden = c.hidden_size;
   const std::uint32_t kv = c.KvSize();
   const std::uint32_t row = static_cast<std::uint32_t>(
       std::size_t{c.target_layer_ids.size()} * hidden);
-  if (position != s.injected_context_len || count == 0) {
+  if (position != ctx.injected_context_len || count == 0) {
     SetError(error_msg, "DFlash2 context rows are not contiguous");
     return false;
   }
@@ -642,7 +687,7 @@ bool DflashForward::AppendContext(std::span<const float> features,
   }
   // A chunk the ring would overwrite before anything reads it is skipped; the
   // surviving rows keep their absolute positions and batch boundaries.
-  const auto expired = count > s.history_capacity ? count - s.history_capacity
+  const auto expired = count > ctx.history_capacity ? count - ctx.history_capacity
                                                   : std::uint32_t{0};
   // A traced run must fill the whole context tensor the harness compares, so it
   // cannot skip the rows the ring would overwrite; an untraced run can.
@@ -682,15 +727,15 @@ bool DflashForward::AppendContext(std::span<const float> features,
       }
       // Split a write that crosses the physical end of the ring.
       for (std::uint32_t written = 0; written < batch;) {
-        const auto slot = (position + offset + written) % s.history_capacity;
+        const auto slot = (position + offset + written) % ctx.history_capacity;
         const auto run =
-            std::min(batch - written, s.history_capacity - slot);
+            std::min(batch - written, ctx.history_capacity - slot);
         const std::size_t bytes = std::size_t{run} * kv * sizeof(float);
-        Check(hipMemcpyAsync(s.injected_k[i] + std::size_t{slot} * kv,
+        Check(hipMemcpyAsync(ctx.injected_k[i] + std::size_t{slot} * kv,
                              s.ctx_key + std::size_t{written} * kv, bytes,
                              hipMemcpyDeviceToDevice, s.stream),
               error_msg, "context key write failed");
-        Check(hipMemcpyAsync(s.injected_v[i] + std::size_t{slot} * kv,
+        Check(hipMemcpyAsync(ctx.injected_v[i] + std::size_t{slot} * kv,
                              s.ctx_value + std::size_t{written} * kv, bytes,
                              hipMemcpyDeviceToDevice, s.stream),
               error_msg, "context value write failed");
@@ -715,16 +760,17 @@ bool DflashForward::AppendContext(std::span<const float> features,
       s.Emit(trace, prefix + "v", s.trace_value[i], std::size_t{count} * kv);
     }
   }
-  s.injected_context_len = std::max(s.injected_context_len, position + count);
+  ctx.injected_context_len = std::max(ctx.injected_context_len, position + count);
   return true;
 }
 
-bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
-                        std::uint32_t draft_count, float temperature,
-                        std::span<const float> uniforms,
+bool DflashForward::Run(const DflashContext& context, std::uint32_t anchor,
+                        std::uint32_t position, std::uint32_t draft_count,
+                        float temperature, std::span<const float> uniforms,
                         const DflashTrace& trace, DflashDraft* draft,
                         std::string* error_msg) {
   Impl& s = *impl_;
+  const DflashContext::Impl& ctx = *context.impl_;
   const DflashConfig& c = s.config;
   const std::uint32_t hidden = c.hidden_size;
   const std::uint32_t intermediate = c.intermediate_size;
@@ -744,7 +790,7 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
              "DFlash2 anchor or mask token is outside the vocabulary");
     return false;
   }
-  if (position != s.injected_context_len) {
+  if (position != ctx.injected_context_len) {
     SetError(error_msg,
              "DFlash2 block position is ahead of the injected context");
     return false;
@@ -762,7 +808,7 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
   const std::uint32_t window_start =
       position + 1U > c.sliding_window ? position + 1U - c.sliding_window : 0U;
   const std::uint32_t history_length =
-      window_start >= s.history_begin ? s.injected_context_len : 0U;
+      window_start >= ctx.history_begin ? ctx.injected_context_len : 0U;
   const auto emit = [&](std::string_view name, const float* data,
                         std::size_t width, std::uint32_t row_count) {
     s.Emit(trace, name, data, std::size_t{row_count} * width);
@@ -817,10 +863,10 @@ bool DflashForward::Run(std::uint32_t anchor, std::uint32_t position,
     stage("v", s.value, kv);
 
     LaunchDFlashNonCausalAttention(
-        s.query, s.injected_k[i], s.injected_v[i], s.key, s.value, s.attention,
+        s.query, ctx.injected_k[i], ctx.injected_v[i], s.key, s.value, s.attention,
         position, history_length, rows,
         c.sliding_window, c.num_attention_heads, c.num_key_value_heads, head_dim,
-        scale, s.stream, s.history_capacity);
+        scale, s.stream, ctx.history_capacity);
     stage("attention", s.attention, query);
 
     s.Project(layer.attn_output, s.attention, s.projected, rows, hidden, query);

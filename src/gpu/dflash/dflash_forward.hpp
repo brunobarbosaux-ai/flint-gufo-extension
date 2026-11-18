@@ -70,41 +70,23 @@ enum class DflashHeadRoute {
   kFp32,
 };
 
-/// A drafter resident in device memory, with its own block workspace and the
-/// ring that holds the target context it attends to.
-class DflashForward final {
+/// The per-session drafter state: the target-context K/V ring the block
+/// attends to, and the position bookkeeping that goes with it. Each session
+/// owns one; the weights and block workspace of the DflashForward that made it
+/// are shared. Only the forward that created a context may use it.
+class DflashContext final {
  public:
-  ~DflashForward();
-  DflashForward(const DflashForward&) = delete;
-  DflashForward& operator=(const DflashForward&) = delete;
-
-  /// Uploads `weights` and allocates the context ring for `max_context`
-  /// positions (the drafter only ever reads the last `sliding_window`).
-  /// `head_route` selects `kFp32` only for parity runs; it costs a full F32
-  /// copy of the target's head.
-  [[nodiscard]] static std::unique_ptr<DflashForward> Create(
-      const DflashWeights& weights, const DflashBorrowed& borrowed,
-      std::uint32_t max_context, std::string* error_msg = nullptr,
-      DflashHeadRoute head_route = DflashHeadRoute::kNative);
-
-  const DflashConfig& config() const noexcept;
-
-  /// Appends `count` target-context rows starting at `position`. `features` is
-  /// `count * taps * hidden` floats, row-major by position and then by tap in
-  /// the order of `config().target_layer_ids` -- exactly the layout the
-  /// drafter's `fc.weight` expects.
-  /// When `trace` is set it also emits `context.0.normalized` and, per layer,
-  /// `context.0.<layer>.k` / `.v` for every appended row — the stages the
-  /// parity harness compares. Tracing allocates buffers for the whole context,
-  /// so it is a diagnostic path, not the shipped one.
-  [[nodiscard]] bool AppendContext(std::span<const float> features,
-                                   std::uint32_t position,
-                                   std::uint32_t count,
-                                   std::string* error_msg = nullptr,
-                                   const DflashTrace& trace = {});
+  ~DflashContext();
+  DflashContext(const DflashContext&) = delete;
+  DflashContext& operator=(const DflashContext&) = delete;
 
   /// Positions the drafter can attend to: rows appended by AppendContext.
   [[nodiscard]] std::uint32_t ContextLength() const noexcept;
+  /// Rows the injected ring holds.
+  [[nodiscard]] std::uint32_t HistoryCapacity() const noexcept;
+  /// Device pointer to layer `layer`'s injected key/value ring, for tests.
+  [[nodiscard]] const float* InjectedKey(std::uint32_t layer) const noexcept;
+  [[nodiscard]] const float* InjectedValue(std::uint32_t layer) const noexcept;
 
   /// Restarts the injected context at `frontier`: the next AppendContext must
   /// start there. Rows below `frontier` were never injected (the target's
@@ -114,29 +96,75 @@ class DflashForward final {
   /// frontier.
   void ResetContext(std::uint32_t frontier = 0) noexcept;
 
-  /// Runs one block: the committed `anchor` at `position` plus `draft_count`
-  /// proposals. `uniforms` supplies one draw per proposal when `temperature`
-  /// is positive.
-  [[nodiscard]] bool Run(std::uint32_t anchor, std::uint32_t position,
-                         std::uint32_t draft_count, float temperature,
-                         std::span<const float> uniforms,
+ private:
+  friend class DflashForward;
+  DflashContext();
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+/// A drafter resident in device memory: read-only weights and the block
+/// workspace, shared by every session. The per-session K/V ring lives in a
+/// DflashContext from CreateContext(). Calls are not thread-safe; the host
+/// serializes device work (requires_device_runtime_lock).
+class DflashForward final {
+ public:
+  ~DflashForward();
+  DflashForward(const DflashForward&) = delete;
+  DflashForward& operator=(const DflashForward&) = delete;
+
+  /// Uploads `weights`. `max_context` bounds each context ring: a ring holds
+  /// at most `min(max_context, sliding_window)` rows (the drafter only ever
+  /// reads the last `sliding_window`). `head_route` selects `kFp32` only for
+  /// parity runs; it costs a full F32 copy of the target's head.
+  [[nodiscard]] static std::unique_ptr<DflashForward> Create(
+      const DflashWeights& weights, const DflashBorrowed& borrowed,
+      std::uint32_t max_context, std::string* error_msg = nullptr,
+      DflashHeadRoute head_route = DflashHeadRoute::kNative);
+
+  const DflashConfig& config() const noexcept;
+
+  /// A fresh, empty context for one session. Allocates its K/V ring now, so
+  /// the cost is known when a session is bound. Returns nullptr on failure.
+  [[nodiscard]] std::unique_ptr<DflashContext> CreateContext(
+      std::string* error_msg = nullptr) const;
+
+  /// Appends `count` target-context rows starting at `position` to `context`.
+  /// `features` is `count * taps * hidden` floats, row-major by position and
+  /// then by tap in the order of `config().target_layer_ids` -- exactly the
+  /// layout the drafter's `fc.weight` expects.
+  /// When `trace` is set it also emits `context.0.normalized` and, per layer,
+  /// `context.0.<layer>.k` / `.v` for every appended row — the stages the
+  /// parity harness compares. Tracing allocates buffers for the whole context,
+  /// so it is a diagnostic path, not the shipped one.
+  [[nodiscard]] bool AppendContext(DflashContext& context,
+                                   std::span<const float> features,
+                                   std::uint32_t position,
+                                   std::uint32_t count,
+                                   std::string* error_msg = nullptr,
+                                   const DflashTrace& trace = {});
+
+  /// Runs one block against `context`: the committed `anchor` at `position`
+  /// plus `draft_count` proposals. `uniforms` supplies one draw per proposal
+  /// when `temperature` is positive.
+  [[nodiscard]] bool Run(const DflashContext& context, std::uint32_t anchor,
+                         std::uint32_t position, std::uint32_t draft_count,
+                         float temperature, std::span<const float> uniforms,
                          const DflashTrace& trace, DflashDraft* draft,
                          std::string* error_msg = nullptr);
-
-  /// Device pointer to layer `layer`'s injected key/value ring, for tests.
-  [[nodiscard]] const float* InjectedKey(std::uint32_t layer) const noexcept;
-  [[nodiscard]] const float* InjectedValue(std::uint32_t layer) const noexcept;
-  /// Rows the injected ring holds.
-  [[nodiscard]] std::uint32_t HistoryCapacity() const noexcept;
 
   /// Rows the context-injection scratch is sized for. AppendContext allocates
   /// that scratch on first use, in chunks of at most this many rows.
   static constexpr std::uint32_t kContextChunkRows = 256;
-  /// Device bytes of the context-injection scratch, derived from config. It is
-  /// allocated lazily, so this reports what the first AppendContext will take.
-  [[nodiscard]] std::size_t ContextScratchBytes() const noexcept;
-  /// Device bytes this drafter has allocated so far: weights, block workspace
-  /// and the injected context ring (and the scratch once it exists).
+  /// Device bytes of the context-injection scratch not yet allocated: the full
+  /// scratch before the first AppendContext, zero after. The scratch is shared
+  /// by all contexts, so this is resident cost, counted once.
+  [[nodiscard]] std::size_t ContextScratchPendingBytes() const noexcept;
+  /// Device bytes of one context's K/V ring (all layers, keys and values), as
+  /// CreateContext allocates it.
+  [[nodiscard]] std::size_t ContextRingBytes() const noexcept;
+  /// Device bytes this drafter has allocated so far: shared weights and block
+  /// workspace (contexts made by CreateContext are not included).
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
 
  private:

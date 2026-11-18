@@ -1,5 +1,6 @@
 #include "src/spec/cycle.hpp"
 
+#include <memory>
 #include <utility>
 
 namespace gufo::models::flint::spec {
@@ -15,8 +16,13 @@ bool Fail(std::string* error_msg, std::string message) {
 }  // namespace
 
 SpecCycle::SpecCycle(TargetAdapter& target,
-                     gpu::dflash::DflashForward& drafter, DraftPolicy policy)
-    : target_(target), drafter_(drafter), policy_(policy) {}
+                     gpu::dflash::DflashForward& drafter,
+                     std::unique_ptr<gpu::dflash::DflashContext> context,
+                     DraftPolicy policy)
+    : target_(target),
+      drafter_(drafter),
+      context_(std::move(context)),
+      policy_(policy) {}
 
 bool SpecCycle::SyncContext(std::uint32_t position, std::string* error_msg) {
   if (position == injected_)
@@ -26,7 +32,8 @@ bool SpecCycle::SyncContext(std::uint32_t position, std::string* error_msg) {
   const std::uint32_t count = position - injected_;
   if (!target_.Features(injected_, count, &features_, error_msg))
     return false;
-  if (!drafter_.AppendContext(features_, injected_, count, error_msg))
+  if (!drafter_.AppendContext(*context_, features_, injected_, count,
+                              error_msg))
     return false;
   injected_ = position;
   return true;
@@ -35,7 +42,7 @@ bool SpecCycle::SyncContext(std::uint32_t position, std::string* error_msg) {
 void SpecCycle::Reset(std::uint32_t frontier) noexcept {
   End(false);
   pending_ = false;
-  drafter_.ResetContext(frontier);
+  context_->ResetContext(frontier);
   injected_ = frontier;
   stats_ = {};
 }
@@ -85,7 +92,8 @@ bool SpecCycle::Start(std::uint32_t anchor, std::string* error_msg) {
     target_.Rewind(base);
 
   gpu::dflash::DflashDraft draft;
-  if (!drafter_.Run(anchor, base, draft_count, 0.0F, {}, {}, &draft, error_msg))
+  if (!drafter_.Run(*context_, anchor, base, draft_count, 0.0F, {}, {}, &draft,
+                    error_msg))
     return false;
   if (draft.tokens.size() != draft_count)
     return Fail(error_msg, "draft block returned the wrong proposal count");

@@ -703,13 +703,24 @@ struct BlockSpec {
 
 // ---------------------------------------------------------------------------
 // One traced block, shared by --out and --positions.
+/// The one drafter context a tool run drives (one session per run).
+[[nodiscard]] std::unique_ptr<dflash::DflashContext> MakeContext(
+    dflash::DflashForward& forward) {
+  std::string error;
+  auto context = forward.CreateContext(&error);
+  if (context == nullptr)
+    Fail("drafter context: " + error);
+  return context;
+}
+
 // ---------------------------------------------------------------------------
 /// Rebuilds the drafter context from `features` (rows 0..position-1), drafts
 /// one traced block and writes every trace file for it into `trace`. Returns
 /// the proposals. Two passes when sampling: the first finds the block, the
 /// second redraws it with uniforms that agree with the returned distribution.
 [[nodiscard]] dflash::DflashDraft TraceBlock(
-    dflash::DflashForward& forward, const dflash::DflashConfig& config,
+    dflash::DflashForward& forward, dflash::DflashContext& ctx,
+    const dflash::DflashConfig& config,
     std::uint32_t num_layers, core::GgmlType head_type, const TraceDir& trace,
     const BlockSpec& spec, std::span<const float> features,
     const std::vector<std::uint32_t>& prompt_ids) {
@@ -719,23 +730,23 @@ struct BlockSpec {
 
   // A block is a pure function of the injected context, so the second pass
   // returns the same proposals.
-  forward.ResetContext();
-  if (!forward.AppendContext(features, 0, spec.position, &error, hook))
+  ctx.ResetContext();
+  if (!forward.AppendContext(ctx, features, 0, spec.position, &error, hook))
     Fail("context injection: " + error);
 
   dflash::DflashDraft draft;
   std::vector<float> uniforms(spec.draft_count, 0.5F);
   if (spec.temperature > 0.0F) {
-    if (!forward.Run(spec.anchor, spec.position, spec.draft_count,
+    if (!forward.Run(ctx, spec.anchor, spec.position, spec.draft_count,
                      spec.temperature, uniforms, {}, &draft, &error))
       Fail("draft block: " + error);
     uniforms = DrawsFromProbabilities(draft, config.selector_top_k);
     draft = {};
-    if (!forward.Run(spec.anchor, spec.position, spec.draft_count,
+    if (!forward.Run(ctx, spec.anchor, spec.position, spec.draft_count,
                      spec.temperature, uniforms, hook, &draft, &error))
       Fail("draft block: " + error);
   } else {
-    if (!forward.Run(spec.anchor, spec.position, spec.draft_count, 0.0F, {},
+    if (!forward.Run(ctx, spec.anchor, spec.position, spec.draft_count, 0.0F, {},
                      hook, &draft, &error))
       Fail("draft block: " + error);
   }
@@ -835,6 +846,7 @@ struct AcceptanceResult {
 /// it reports is the one the cycle would get, without the runner.
 [[nodiscard]] AcceptanceResult RunAcceptance(
     flint::Session& session, dflash::DflashForward& forward,
+    dflash::DflashContext& ctx,
     const std::vector<std::uint32_t>& taps, std::uint32_t hidden,
     const Tokenizer* tokenizer, const AcceptanceJob& job) {
   if (job.prompt.empty() || job.max_tokens == 0)
@@ -862,7 +874,8 @@ struct AcceptanceResult {
                     captured.data(), hidden * sizeof(float));
       }
     }
-    if (!forward.AppendContext(features, injected, position - injected, &error))
+    if (!forward.AppendContext(ctx, features, injected, position - injected,
+                               &error))
       Fail("context injection: " + error);
     injected = position;
   };
@@ -870,7 +883,7 @@ struct AcceptanceResult {
   // Each prompt starts from an empty target cache and an empty drafter
   // context.
   session.Rewind(0);
-  forward.ResetContext();
+  ctx.ResetContext();
   // The hidden ring keeps only kHiddenRingRows positions. Prefill in chunks and
   // let the drafter take each chunk's rows before the next chunk can push them
   // out of the ring.
@@ -913,7 +926,7 @@ struct AcceptanceResult {
       Fail("target session is too small for the next block; raise its context");
     inject_to(position);
     dflash::DflashDraft draft;
-    if (!forward.Run(anchor, position, draft_count, 0.0F, {}, {}, &draft,
+    if (!forward.Run(ctx, anchor, position, draft_count, 0.0F, {}, {}, &draft,
                      &error))
       Fail("draft block: " + error);
     if (draft.tokens.size() != draft_count)
@@ -1007,6 +1020,7 @@ struct AcceptanceResult {
 /// Prints the markdown table.
 [[nodiscard]] int MeasureAcceptance(
     flint::Session& session, dflash::DflashForward& forward,
+    dflash::DflashContext& ctx,
     const std::vector<std::uint32_t>& taps, std::uint32_t hidden,
     std::uint32_t draft_count, const std::vector<std::uint32_t>& prompt,
     std::uint32_t budget, const std::string& head_route) {
@@ -1015,7 +1029,7 @@ struct AcceptanceResult {
   job.draft_count = draft_count;
   job.max_tokens = budget + 1U;
   const AcceptanceResult result =
-      RunAcceptance(session, forward, taps, hidden, nullptr, job);
+      RunAcceptance(session, forward, ctx, taps, hidden, nullptr, job);
   if (result.cycles == 0)
     Fail("no cycle ran; the context is too small for one block");
 
@@ -1215,6 +1229,7 @@ struct PromptRecord {
   if (!session->SetHiddenCapture(taps, &error))
     Fail("hidden capture: " + error);
   auto forward = CreateDrafter(target, weights, options.head, context);
+  auto ctx = MakeContext(*forward);
 
   std::ofstream report(options.report_path, std::ios::binary | std::ios::trunc);
   if (!report)
@@ -1243,7 +1258,7 @@ struct PromptRecord {
       job.stream = found->second;
     }
     const AcceptanceResult result = RunAcceptance(
-        *session, *forward, taps, target.model->config().hidden_size,
+        *session, *forward, *ctx, taps, target.model->config().hidden_size,
         target.tokenizer.get(), job);
     report << ReportLine(record, result, forced) << '\n';
     std::cout << record.id << "\tcycles " << result.cycles << "\temitted "
@@ -1390,6 +1405,7 @@ struct SweepPrompt {
   if (!session->SetHiddenCapture(taps, &error))
     Fail("hidden capture: " + error);
   auto forward = CreateDrafter(target, weights, options.head, context);
+  auto ctx = MakeContext(*forward);
   const flint::TiedWeights tied = target.model->Tied();
 
   // The ring keeps only kHiddenRingRows rows, so each chunk's captured rows go
@@ -1435,13 +1451,13 @@ struct SweepPrompt {
                          .temperature = options.temperature,
                          .prompt_source = prompt.source};
     const dflash::DflashDraft traced = TraceBlock(
-        *forward, draft_config, config.num_layers, tied.output_type, dir, spec,
+        *forward, *ctx, draft_config, config.num_layers, tied.output_type, dir, spec,
         features, prompt_ids);
 
     // Untraced greedy run on the same context. TraceBlock left the context
     // injected for this position, so only the block is redone.
     dflash::DflashDraft greedy_draft;
-    if (!forward->Run(anchor, position, draft_count, 0.0F, {}, {},
+    if (!forward->Run(*ctx, anchor, position, draft_count, 0.0F, {}, {},
                       &greedy_draft, &error))
       Fail("greedy block: " + error);
     greedy << (index == 0 ? "" : ",\n") << "  \"" << position << "\": ["
@@ -1511,6 +1527,7 @@ struct SweepPrompt {
   auto forward = CreateDrafter(
       target, *weights, options.head,
       options.position + options.accept_tokens + draft_config.block_size);
+  auto ctx = MakeContext(*forward);
 
   // M1b --accept: the acceptance loop does its own prefill, so it gets the
   // prompt ids and the session as it is.
@@ -1518,7 +1535,7 @@ struct SweepPrompt {
     const auto pool = PromptTokens(*target.tokenizer, options.text,
                                    options.position);
     std::vector<std::uint32_t> prompt(pool.begin(), pool.end());
-    return MeasureAcceptance(*session, *forward, taps, config.hidden_size,
+    return MeasureAcceptance(*session, *forward, *ctx, taps, config.hidden_size,
                              draft_count, prompt, options.accept_tokens,
                              options.head);
   }
@@ -1548,8 +1565,8 @@ struct SweepPrompt {
                        .temperature = options.temperature,
                        .prompt_source = "--text"};
   const dflash::DflashDraft draft =
-      TraceBlock(*forward, draft_config, config.num_layers, tied.output_type,
-                 trace, spec, features, prompt_ids);
+      TraceBlock(*forward, *ctx, draft_config, config.num_layers,
+                 tied.output_type, trace, spec, features, prompt_ids);
 
   std::cout << "| stage | file |\n| :-- | :-- |\n"
             << "| trace stages | " << trace.stages() << " |\n"

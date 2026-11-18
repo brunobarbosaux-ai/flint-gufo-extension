@@ -15,15 +15,19 @@
 //                   --settings <substr> runs only the matching settings
 //   --mode memory   runner claim (resident + per-request) vs the device bytes
 //                   taken by runner + one slot + one bound state
+//   --mode curve    speed vs prompt depth: for each --depths entry, spec-off
+//                   and spec-on (dflash, adaptive) on the same prompts, one
+//                   "curve depth=..." line per depth and a final table
 //
 // --depth N pads every chat prompt with deterministic filler so the prompt is
 // exactly N tokens (0 = unpadded). The filler is the same for spec-off and
 // spec-on. Decode throughput excludes prefill.
 //
 // Usage: flint_spec_gate --target <target.gguf> --prompts <prompts.jsonl>
-//          --mode gx|null|speed|settings [--depth N] [--max-tokens N]
-//          [--temps 0,0.6,1.0] [--seeds 1,2,3] [--prompts-limit N]
-//          [--policies fixed,adaptive] [--max-draft N] [--min-draft N]
+//          --mode gx|null|speed|settings|curve [--depth N] [--depths N,N,...]
+//          [--max-tokens N] [--temps 0,0.6,1.0] [--seeds 1,2,3]
+//          [--prompts-limit N] [--policies fixed,adaptive] [--max-draft N]
+//          [--min-draft N]
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -81,6 +85,8 @@ struct Options {
   std::uint32_t min_draft{1};
   // Prompt depth in tokens (0 = unpadded). Sets the runner's max_context.
   std::size_t depth{0};
+  // Curve mode: prompt depths to sweep, in tokens.
+  std::vector<std::size_t> depths;
 };
 
 // The policy the gate's dflash runs use; the spec-off runs ignore it.
@@ -143,6 +149,10 @@ Options ParseArgs(int argc, char** argv) {
         options.seeds.push_back(std::stoull(part));
     } else if (arg == "--depth") {
       options.depth = std::stoul(next("--depth"));
+    } else if (arg == "--depths") {
+      options.depths.clear();
+      for (const auto& part : Split(next("--depths")))
+        options.depths.push_back(std::stoul(part));
     } else if (arg == "--settings") {
       options.settings_filter = next("--settings");
     } else {
@@ -240,6 +250,7 @@ struct RunResult {
   // when the loop ended at the --max-tokens budget.
   bool stopped{false};
   double seconds{0.0};
+  double prefill_seconds{0.0};
   double decode_seconds{0.0};
 };
 
@@ -312,6 +323,8 @@ public:
         break;
     }
     const auto decode_started = std::chrono::steady_clock::now();
+    const double prefill_seconds =
+        std::chrono::duration<double>(decode_started - started).count();
 
     // The host previews the first token on a copy of the sampler and requires
     // the real first decode to repeat it. The gate checks the same thing.
@@ -338,6 +351,7 @@ public:
     }
     const auto finished = std::chrono::steady_clock::now();
     result.seconds = std::chrono::duration<double>(finished - started).count();
+    result.prefill_seconds = prefill_seconds;
     result.decode_seconds =
         std::chrono::duration<double>(finished - decode_started).count();
     return result;
@@ -782,6 +796,119 @@ void ReportSpeed(const Options& options, const std::vector<RunResult>& offs,
   }
 }
 
+// One depth of the curve: aggregate prefill and decode throughput per side.
+struct CurvePoint {
+  std::size_t depth{0};
+  double prefill_off{0.0};
+  double prefill_on{0.0};
+  double decode_off{0.0};
+  double decode_on{0.0};
+  double speedup{0.0};
+  double decode_speedup{0.0};
+  double accept{0.0};
+  double tok_cycle{0.0};
+  double mean_draft{0.0};
+};
+
+// Speed vs prompt depth. Each depth builds its own prompts (filler to exactly
+// `depth` tokens) and runs spec-off then spec-on through RunConfig, which
+// creates and destroys one runner per call, so the two models are never
+// resident together.
+int RunCurve(const Options& options, const qwen::QwenTokenizer& tokenizer) {
+  if (options.depths.empty())
+    Fail("--mode curve needs --depths");
+  const DraftSettings draft{ext::TextDFlashDraftPolicy::kAdaptive,
+                            options.max_draft, options.min_draft};
+  const float temperature = options.temps.front();
+  std::vector<CurvePoint> points;
+  std::cout << std::fixed << std::setprecision(3);
+  for (const std::size_t depth : options.depths) {
+    Options at = options;
+    at.depth = depth;
+    const auto prompts = ReadPrompts(options.prompts, tokenizer,
+                                     options.prompts_limit, depth);
+    std::size_t prompt_tokens = 0;
+    std::vector<Job> jobs;
+    for (const auto& prompt : prompts) {
+      prompt_tokens += prompt.tokens.size();
+      jobs.push_back({&prompt, temperature == 0.0F ? Greedy()
+                                                   : Sampled(temperature, 1),
+                      nullptr});
+    }
+
+    const auto offs = RunConfig("off", at, jobs, options.max_tokens);
+    const auto ons = RunConfig("dflash", at, jobs, options.max_tokens, draft);
+
+    double off_seconds = 0.0;
+    double on_seconds = 0.0;
+    double off_prefill = 0.0;
+    double on_prefill = 0.0;
+    double off_decode = 0.0;
+    double on_decode = 0.0;
+    std::size_t off_tokens = 0;
+    std::size_t on_tokens = 0;
+    std::size_t rounds = 0;
+    std::size_t drafted = 0;
+    std::size_t accepted = 0;
+    for (std::size_t p = 0; p < prompts.size(); ++p) {
+      off_seconds += offs[p].seconds;
+      on_seconds += ons[p].seconds;
+      off_prefill += offs[p].prefill_seconds;
+      on_prefill += ons[p].prefill_seconds;
+      off_decode += offs[p].decode_seconds;
+      on_decode += ons[p].decode_seconds;
+      off_tokens += offs[p].tokens.size();
+      on_tokens += ons[p].tokens.size();
+      rounds += ons[p].draft_rounds;
+      drafted += ons[p].draft_tokens;
+      accepted += ons[p].draft_accepted_tokens;
+    }
+    const double prompt_count = static_cast<double>(prompt_tokens);
+    CurvePoint point;
+    point.depth = depth;
+    point.prefill_off = prompt_count / off_prefill;
+    point.prefill_on = prompt_count / on_prefill;
+    point.decode_off = off_tokens / off_decode;
+    point.decode_on = on_tokens / on_decode;
+    point.speedup = (on_tokens / on_seconds) / (off_tokens / off_seconds);
+    point.decode_speedup = point.decode_on / point.decode_off;
+    point.accept = drafted == 0 ? 0.0
+                                : static_cast<double>(accepted) / drafted;
+    point.tok_cycle = rounds == 0 ? 0.0
+                                  : static_cast<double>(on_tokens) / rounds;
+    point.mean_draft = rounds == 0 ? 0.0
+                                   : static_cast<double>(drafted) / rounds;
+    points.push_back(point);
+    std::cout << "curve depth=" << depth << " prefill_off=" << point.prefill_off
+              << " prefill_on=" << point.prefill_on
+              << " decode_off=" << point.decode_off
+              << " decode_on=" << point.decode_on
+              << " speedup=" << point.speedup
+              << " decode_speedup=" << point.decode_speedup
+              << " accept=" << point.accept
+              << " tok_cycle=" << point.tok_cycle
+              << " mean_draft=" << point.mean_draft << std::endl;
+  }
+
+  std::cout << "\ncurve summary (temp=" << temperature
+            << " prompts=" << options.prompts_limit
+            << " max_tokens=" << options.max_tokens << ")\n"
+            << std::setw(8) << "depth" << std::setw(12) << "prefill_off"
+            << std::setw(12) << "prefill_on" << std::setw(12) << "decode_off"
+            << std::setw(12) << "decode_on" << std::setw(10) << "speedup"
+            << std::setw(14) << "decode_spdup" << std::setw(9) << "accept"
+            << std::setw(10) << "tok_cyc" << std::setw(12) << "mean_draft"
+            << "\n";
+  for (const auto& p : points)
+    std::cout << std::setw(8) << p.depth << std::setw(12) << p.prefill_off
+              << std::setw(12) << p.prefill_on << std::setw(12) << p.decode_off
+              << std::setw(12) << p.decode_on << std::setw(10) << p.speedup
+              << std::setw(14) << p.decode_speedup << std::setw(9) << p.accept
+              << std::setw(10) << p.tok_cycle << std::setw(12) << p.mean_draft
+              << "\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -796,6 +923,8 @@ int main(int argc, char** argv) {
       Fail("tokenizer: " + error);
     if (options.mode == "memory")
       return RunMemory(options);
+    if (options.mode == "curve")
+      return RunCurve(options, *tokenizer);
     const auto prompts = ReadPrompts(options.prompts, *tokenizer,
                                      options.prompts_limit, options.depth);
     if (options.mode == "gx")
@@ -806,7 +935,7 @@ int main(int argc, char** argv) {
       return RunSpeed(options, prompts);
     if (options.mode == "settings")
       return RunSettings(options, prompts, *tokenizer);
-    Fail("--mode must be gx, null, speed, settings or memory");
+    Fail("--mode must be gx, null, speed, settings, memory or curve");
   } catch (const std::exception& failure) {
     std::cerr << "flint_spec_gate: " << failure.what() << "\n";
     return 2;

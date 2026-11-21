@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -45,10 +46,11 @@ void SyncSession(const FlintSession& session) {
 }
 
 using Coverage = std::vector<std::pair<std::size_t, std::size_t>>;
-bool Covered(Coverage ranges, std::size_t end) {
-  std::ranges::sort(ranges);
+bool Covered(const Coverage& ranges, std::size_t end) {
+  Coverage sorted = ranges;
+  std::ranges::sort(sorted);
   std::size_t frontier = 0;
-  for (const auto& [first, last] : ranges) {
+  for (const auto& [first, last] : sorted) {
     if (first > frontier)
       return false;
     frontier = std::max(frontier, last);
@@ -115,7 +117,7 @@ public:
   }
 
   [[nodiscard]] bool IsValid() const noexcept override {
-    return !restoring && !failed;
+    return !restoring && !failed.load();
   }
 
   void Cover(std::size_t index, std::size_t first, std::size_t last) {
@@ -127,7 +129,8 @@ public:
   cache::MutationGuard& guard;
   std::unique_ptr<FlintSession> session;
   bool restoring{false};
-  bool failed{false};
+  // Written by concurrent load pieces, read by IsValid() on the request thread.
+  std::atomic<bool> failed{false};
   cache::Rows expected_position{0};
   std::vector<cache::ComponentPosition> expected;
   std::mutex coverage_mutex;
@@ -196,7 +199,10 @@ FlintContinuationAdapter::FlintContinuationAdapter(
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(2);  // Component layout version.
+  // Identity version 2 is the compatibility epoch for this layout. It is a
+  // separate versioning from the descriptor layout_version = 1 (per-component
+  // format), and bumps whenever the component table changes.
+  put(2);
   put(context_);
 }
 
@@ -205,7 +211,7 @@ FlintContinuationAdapter::~FlintContinuationAdapter() = default;
 FlintContinuationAdapter::State& FlintContinuationAdapter::As(
     cache::Slot& slot) const {
   auto& state = dynamic_cast<State&>(slot);
-  if (state.adapter.model_.get() != model_.get())
+  if (&state.adapter != this)
     throw std::invalid_argument("slot belongs to another Flint adapter");
   return state;
 }
@@ -273,6 +279,8 @@ std::unique_ptr<cache::Slot> FlintContinuationAdapter::CreateSlot(
       ++layers;
   if (session->NumLayers() * std::size_t{2} != layers)
     throw std::runtime_error("Flint session layer count differs from the layout");
+  if (session->Capacity() != context_)
+    throw std::runtime_error("Flint session capacity differs from the context");
 
   auto state = std::make_unique<State>(*this, guard, std::move(session));
   State* owner = state.get();
@@ -334,8 +342,8 @@ void FlintContinuationAdapter::BeginRestore(
   for (const auto& position : ordered)
     if (position.valid_rows != frontier)
       throw std::invalid_argument("inconsistent Flint frontiers");
-  if (frontier > context_)
-    throw std::invalid_argument("Flint frontier exceeds context");
+  if (frontier > state.session->Capacity())
+    throw std::invalid_argument("Flint frontier exceeds session capacity");
 
   // Rows are written in place: guard every append range the restore can
   // replace while the old slot is still readable, then drain the device.
@@ -349,7 +357,7 @@ void FlintContinuationAdapter::BeginRestore(
   state.coverage.assign(descriptors_.size(), {});
   state.metadata.fill(std::byte{});
   state.logits.assign(logits_bytes_, std::byte{});
-  state.failed = false;
+  state.failed.store(false);
   state.restoring = true;
 }
 
@@ -408,7 +416,7 @@ cache::Completion FlintContinuationAdapter::LoadPrivatePiece(
     std::span<const std::byte> bytes, cache::Stream& stream) {
   (void)stream;
   auto& state = As(slot);
-  if (!state.restoring || state.failed)
+  if (!state.restoring || state.failed.load())
     throw std::logic_error("Flint load requires an unfailed restore");
   try {
     const auto& component = RequireComponent(id);
@@ -425,7 +433,7 @@ cache::Completion FlintContinuationAdapter::LoadPrivatePiece(
     state.Cover(id.value - 1, offset, offset + bytes.size());
     return State::Settled(true);
   } catch (...) {
-    state.failed = true;
+    state.failed.store(true);
     throw;
   }
 }
@@ -441,16 +449,20 @@ cache::Completion FlintContinuationAdapter::CopyRowsOut(
   if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
     throw std::invalid_argument("Flint component has no append rows");
   const auto row = row_bytes_;
-  if (first > end || end > state.session->Position() ||
+  // Bound by Capacity, not Position: a rewound slot may still hold rows that
+  // a borrowed frontier needs preserved.
+  if (first > end || end > state.session->Capacity() ||
       bytes.size() != (end - first) * row)
     throw std::invalid_argument("invalid Flint row capture");
   if (first == end)
     return State::Settled(true);
   SyncSession(*state.session);
-  const auto* source = static_cast<const std::byte*>(state.session->KvRows(
-                           component.layer, component.is_value)) +
-                       first * row;
-  Check(hipMemcpy(bytes.data(), source, bytes.size(), hipMemcpyDeviceToHost));
+  const auto* base = static_cast<const std::byte*>(state.session->KvRows(
+      component.layer, component.is_value));
+  if (base == nullptr)
+    throw std::logic_error("Flint KV rows are not allocated");
+  Check(hipMemcpy(bytes.data(), base + first * row, bytes.size(),
+                  hipMemcpyDeviceToHost));
   return State::Settled(true);
 }
 
@@ -459,7 +471,7 @@ cache::Completion FlintContinuationAdapter::CopyRowsIn(
     cache::Rows end, std::span<const std::byte> bytes, cache::Stream& stream) {
   (void)stream;
   auto& state = As(slot);
-  if (!state.restoring || state.failed)
+  if (!state.restoring || state.failed.load())
     throw std::logic_error("Flint load requires an unfailed restore");
   try {
     const auto& component = RequireComponent(id);
@@ -471,14 +483,19 @@ cache::Completion FlintContinuationAdapter::CopyRowsIn(
       throw std::invalid_argument("invalid Flint row restore");
     if (first == end)
       return State::Settled(true);
-    auto* target = static_cast<std::byte*>(state.session->KvRows(
-                       component.layer, component.is_value)) +
-                   first * row;
-    Check(hipMemcpy(target, bytes.data(), bytes.size(), hipMemcpyHostToDevice));
+    auto* base = static_cast<std::byte*>(state.session->KvRows(
+        component.layer, component.is_value));
+    if (base == nullptr)
+      throw std::logic_error("Flint KV rows are not allocated");
+    auto* target = base + first * row;
+    // The source is either host bytes (RAM cache copy) or a device span from
+    // BorrowRowsView on a live slot. hipMemcpyDefault infers the direction
+    // from unified addressing; a fixed H2D kind would misread device sources.
+    Check(hipMemcpy(target, bytes.data(), bytes.size(), hipMemcpyDefault));
     state.Cover(id.value - 1, first * row, end * row);
     return State::Settled(true);
   } catch (...) {
-    state.failed = true;
+    state.failed.store(true);
     throw;
   }
 }
@@ -497,6 +514,8 @@ std::span<const std::byte> FlintContinuationAdapter::BorrowRowsView(
   SyncSession(*state.session);
   const auto* base = static_cast<const std::byte*>(state.session->KvRows(
       component.layer, component.is_value));
+  if (base == nullptr)
+    throw std::logic_error("Flint KV rows are not allocated");
   return {base + first * row_bytes_, (end - first) * row_bytes_};
 }
 
@@ -506,14 +525,16 @@ bool FlintContinuationAdapter::Validate(
   if (!state.restoring)
     throw std::logic_error("Flint validation requires an active restore");
   const auto refuse = [&] {
-    state.failed = true;
+    state.failed.store(true);
     return false;
   };
-  if (state.failed || positions.size() != descriptors_.size())
+  if (state.failed.load() || positions.size() != descriptors_.size())
     return refuse();
 
   // Every component must report exactly the expected frontier and be fully
-  // covered by loads: rows up to valid_rows, private state whole.
+  // covered by loads: rows up to valid_rows, private state whole. Reading
+  // state.coverage without coverage_mutex is safe here: the caller settles
+  // all loads before calling Validate, so no Cover() call is in flight.
   for (std::size_t i = 0; i < state.expected.size(); ++i) {
     const auto& expected = state.expected[i];
     const auto& descriptor = descriptors_[i];
@@ -529,7 +550,7 @@ bool FlintContinuationAdapter::Validate(
   std::memcpy(&metadata, state.metadata.data(), sizeof(metadata));
   if (metadata.version != 1 ||
       metadata.position != state.expected_position ||
-      metadata.logits_valid > 1)
+      metadata.logits_valid != (metadata.position > 0 ? 1U : 0U))
     return refuse();
 
   try {
@@ -562,7 +583,7 @@ bool FlintContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
         state.guard.BeforeRelease(component.descriptor.id, 0, context_);
     state.session->Reset();
     state.restoring = false;
-    state.failed = false;
+    state.failed.store(false);
     state.expected.clear();
     state.coverage.clear();
     state.guard.AfterReset();

@@ -8,6 +8,11 @@ Starts `gufo serve llm` with a RAM cache, then checks:
       user "Now continue."]; status 200, cache reuse, cached_tokens >= 0.5 *
       r1 prompt tokens, non-empty content
 
+Spec-on runs (--dflash-model) reuse the same reuse assertions. They do not
+validate the drafter: serve reports draft_proposed=0 because draft counters are
+not copied on the SelectNext/Advance path (see DEFERRED.md), so the spec-on leg
+is "spec on (cache reuse only; draft counters unavailable)".
+
 Why the answer is reasoning_content + content: Flint's pinned chat template
 has no thinking switch (no enable_thinking conditional; the assistant prompt
 is always rendered as <|assistant|>), so the model always decides on its own
@@ -36,6 +41,7 @@ Stdlib only. Exit 0 on success, 1 on any failed assertion.
 import argparse
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -125,10 +131,17 @@ def read_gguf_geometry(path):
             vocab = get("vocab_size") or wanted.get("tokenizer.ggml.tokens")
             if key_len is None and emb and heads:
                 key_len = emb // heads
-            if not (layers and kv and key_len):
+            # kv may be a per-layer array in some GGUFs; the gate needs one
+            # positive int, so anything else degrades to the weak bound.
+            if isinstance(kv, list):
+                kv = kv[0] if kv and all(v == kv[0] for v in kv) else None
+            if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0
+                       for v in (layers, kv, key_len)):
                 return None
-            return int(layers), kv, int(key_len), int(vocab or 0)
-    except (OSError, ValueError, struct.error):
+            if not isinstance(vocab, int) or vocab <= 0:
+                return None
+            return int(layers), int(kv), int(key_len), int(vocab)
+    except (OSError, ValueError, TypeError, struct.error):
         return None
 
 
@@ -253,6 +266,11 @@ def usage_of(payload):
     return payload.get("usage", {}) if isinstance(payload, dict) else {}
 
 
+def parse_restore_ms(line):
+    match = re.search(r"cache_restore_ms=([0-9.]+)", line)
+    return float(match.group(1)) if match else None
+
+
 def check(ok, message, failures):
     print(("PASS " if ok else "FAIL ") + message)
     if not ok:
@@ -278,6 +296,9 @@ def main():
     log_path = args.keep_log or os.path.join(
         "/tmp/opencode", "cache_reuse_%d.log" % int(time.time()))
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    leg = ("spec on (cache reuse only; draft counters unavailable)"
+           if args.dflash_model else "spec off")
+    print(f"leg: {leg}")
     print(f"serve log: {log_path}")
     geometry = read_gguf_geometry(args.target)
     if geometry is None:
@@ -346,6 +367,12 @@ def main():
               "r2 request-completed line reports cache=memory", failures)
         check(r2["cached"] > 0, f"r2 cached_tokens > 0 (got {r2['cached']})",
               failures)
+        # cache=memory and cached_tokens>0 also hold when r2 is served from the
+        # live session without a restore, so require a measured restore.
+        r2_restore = parse_restore_ms(r2_line)
+        print(f"r2 cache_restore_ms (log) = {r2_restore}")
+        check(r2_restore is not None and r2_restore > 0,
+              f"r2 restore happened (cache_restore_ms={r2_restore})", failures)
         check(bool(r1["content"]), "r1 content non-empty", failures)
         check(r1["answer"] != "" and r1["answer"] == r2["answer"],
               "r2 answer (reasoning+content) identical to r1", failures)
@@ -367,17 +394,22 @@ def main():
         elif geometry:
             layers, kv, head_dim, vocab = geometry
             # Per token: every layer's K and V row, fp16 (num_kv*head_dim*2 each).
-            row_total = layers * kv * head_dim * 2 * 2
-            lo = row_total  # At least one token's rows.
-            hi = (r1["prompt_tokens"] + r1["completion_tokens"]) * row_total \
-                + vocab * 4 + 4096
-            print(f"snapshot expected rows-only range: [{lo}, {hi}] B "
-                  f"(row_total={row_total} B/token)")
-            check(lo <= snap <= hi,
-                  f"r1 cache_snapshot_bytes {snap} within valid-row bounds",
+            row_total = layers * 2 * kv * head_dim * 2
+            expected = r1["prompt_tokens"] * row_total + vocab * 4 + 64
+            print(f"r1 snapshot expected exactly {expected} B "
+                  f"(prompt_tokens*{row_total} + vocab*4 + 64)")
+            check(snap == expected,
+                  f"r1 cache_snapshot_bytes {snap} == expected {expected}",
                   failures)
             check(snap < 0.25 * OLD_BLOB_BYTES,
                   f"r1 cache_snapshot_bytes {snap} far below old blob",
+                  failures)
+            # r3's capture is chunk-shared (a tail of the 256-row chunk), so it
+            # is not an exact function of its prompt; only bound it.
+            r3_snap = r3["snapshot"]
+            print(f"r3 cache_snapshot_bytes = {r3_snap}")
+            check(bool(r3_snap) and 0 < r3_snap < snap,
+                  f"r3 cache_snapshot_bytes {r3_snap} in (0, r1 snapshot)",
                   failures)
         else:
             bound = 0.25 * OLD_BLOB_BYTES

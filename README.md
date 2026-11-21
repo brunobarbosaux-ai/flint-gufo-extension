@@ -52,6 +52,12 @@ load**; **262144 (256k) currently hangs in session setup** (pre-existing,
 unrelated to speculation — see `DEFERRED.md`). Advertise 192k until the
 higher ceiling is fixed.
 
+Note that this is a **load** check: long-context *requests* were not exercised
+in that verification. The first request at a very large context pays the
+continuation-cache snapshot cost, which 0.3.1 bounds by capping the retained
+snapshot claim at 8 GiB (see `DEFERRED.md`); the structural fix (per-layer K/V
+`kAppendRows` components) is tracked in gufo-org/gufo#1317.
+
 Flint can run DFlash2 speculative decoding: a small drafter proposes several
 tokens, and the target verifies them in one batched pass. Accepted tokens are
 emitted without extra target steps, so single-stream decode is faster. It is

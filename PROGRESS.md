@@ -1,8 +1,30 @@
-# Progress — DFlash2 integration (M2-M6)
+# Progress
 
-Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`.
+## Workstreams
+
+| Workstream | Plan | Status |
+|---|---|---|
+| DFlash2 speculative decoding (0.3.0, merged) | `docs/PLAN-DFLASH2.md` | COMPLETE — see "Milestone status" below |
+| Tool calls (0.4.0) | `docs/PLAN-DFLASH2.md` + PR #2 | MERGED to main; release waits for PR #3 |
+| Long-context continuation cache → per-layer `kAppendRows` | `docs/PLAN-KV-ROWS.md` | **IN PROGRESS — Stage 1** |
+| Strycast serve gates | (separate repo) | PR #77 open, CI green |
+
+### KV-rows stage status
+
+Detail and gates: `docs/PLAN-KV-ROWS.md` §4. Update that table, not this one, for
+per-stage notes; keep this row set in sync.
+
+| Stage | Work | Status |
+|---|---|---|
+| 1 | Engine API (`NumLayers`/`KvRowBytes`/`KvRows`/`Synchronize`/`RestoreRows`/`SetLogits`/`SetRowWriteHook`) + `RestoreSnapshot` refactor + `flint.engine_snapshot` | IN PROGRESS |
+| 2 | Adapter descriptors + private components | NOT STARTED |
+| 3 | Row hooks + `MutationGuard` integration | NOT STARTED |
+| 4 | Identity bump + runner claim/position check | NOT STARTED |
+| 5 | Long-context validation + benchmark | NOT STARTED |
 
 ## Milestone status
+
+Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`.
 
 | Milestone | Title | Status | Commit | Notes |
 |---|---|---|---|---|

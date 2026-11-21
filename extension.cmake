@@ -363,6 +363,31 @@ if(TARGET flint_target_adapter_test)
     PROPERTIES LABELS "flint;hip;gpu;gfx1151")
 endif()
 
+# Session row access and snapshot restore against the real target: restore
+# through snapshot and through split row copies must match a fresh session, and
+# the row-write hook must report each append once. Skips (exit 0) when the
+# artifact or a HIP device is absent.
+gufo_extension_target(
+  NAME flint_engine_snapshot_test
+  SOURCES
+    tests/engine_snapshot_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_engine_snapshot_test)
+  target_include_directories(flint_engine_snapshot_test PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+  add_test(NAME flint.engine_snapshot COMMAND flint_engine_snapshot_test)
+  set_tests_properties(flint.engine_snapshot
+    PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+endif()
+
 if(TARGET flint_dflash_ops_test)
   # The vendored header, like its in-tree source, is gated on the backend
   # macro its real consumer defines.

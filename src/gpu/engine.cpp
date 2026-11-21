@@ -250,6 +250,8 @@ struct Session::Impl {
   StepGraph graphs[Session::kMaxVerifyRows + 1];
   std::uint32_t logit_rows{1};
   StageTimer timer;
+  /// Notified with the rows an Append/AppendAll is about to write.
+  std::function<void(std::uint32_t, std::uint32_t)> row_write_hook;
 
   std::vector<DeviceBuffer<__half>> k_cache, v_cache;
   /// Opt-in block-sparse attention on the global layers (FLINT_SPARSE_ATTN):
@@ -1323,6 +1325,11 @@ bool Session::Append(std::span<const std::int32_t> tokens,
   if (impl_->position + tokens.size() > impl_->capacity) {
     return Fail(error_msg, "Flint: context capacity exceeded");
   }
+  if (impl_->row_write_hook) {
+    impl_->row_write_hook(impl_->position,
+                          impl_->position +
+                              static_cast<std::uint32_t>(tokens.size()));
+  }
   const std::size_t chunk_max = impl_->tile;
   for (std::size_t off = 0; off < tokens.size();) {
     const std::size_t remaining = tokens.size() - off;
@@ -1343,7 +1350,17 @@ bool Session::AppendAll(std::span<const std::int32_t> tokens,
   if (impl_->position + tokens.size() > impl_->capacity) {
     return Fail(error_msg, "Flint: context capacity exceeded");
   }
+  if (impl_->row_write_hook) {
+    impl_->row_write_hook(impl_->position,
+                          impl_->position +
+                              static_cast<std::uint32_t>(tokens.size()));
+  }
   return impl_->Forward(tokens, true, error_msg);
+}
+
+void Session::SetRowWriteHook(
+    std::function<void(std::uint32_t first, std::uint32_t end)> hook) {
+  impl_->row_write_hook = std::move(hook);
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {
@@ -1590,7 +1607,66 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
       at += layer_bytes;
     }
   }
-  std::memcpy(impl_->h_logits, at, std::size_t{c.vocab_size} * sizeof(float));
+  // The payload offset is not guaranteed to be float-aligned: copy the bytes.
+  std::vector<float> logits(c.vocab_size);
+  std::memcpy(logits.data(), at, std::size_t{c.vocab_size} * sizeof(float));
+  if (!SetLogits(logits, error_msg))
+    return false;
+  return RestoreRows(position, error_msg);
+}
+
+bool Session::Synchronize(std::string* error_msg) const {
+  if (hipStreamSynchronize(impl_->stream) != hipSuccess)
+    return Fail(error_msg, "Flint: device synchronization failed");
+  return true;
+}
+
+std::uint32_t Session::NumLayers() const noexcept {
+  return impl_->model->config.num_layers;
+}
+
+std::size_t Session::KvRowBytes() const noexcept {
+  const Config& c = impl_->model->config;
+  return std::size_t{c.num_kv} * c.head_dim * sizeof(__half);
+}
+
+const void* Session::KvRows(std::uint32_t layer, bool value) const noexcept {
+  if (layer >= NumLayers())
+    return nullptr;
+  return (value ? impl_->v_cache : impl_->k_cache)[layer].get();
+}
+
+void* Session::KvRows(std::uint32_t layer, bool value) noexcept {
+  if (layer >= NumLayers())
+    return nullptr;
+  return (value ? impl_->v_cache : impl_->k_cache)[layer].get();
+}
+
+bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
+  const Config& c = impl_->model->config;
+  if (position > impl_->capacity)
+    return Fail(error_msg, "Flint: restore position exceeds the capacity");
+  if (!Synchronize(error_msg))
+    return false;
+  if (position == 0) {
+    // Logits are zeroed rather than left stale. logit_rows stays 1: Logits()
+    // indexes logit_rows - 1, so 0 would underflow.
+    std::memset(impl_->h_logits, 0, std::size_t{c.vocab_size} * sizeof(float));
+    impl_->logit_rows = 1;
+    impl_->position = 0;
+    if (impl_->sparse) {
+      for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+        if (hipMemsetAsync(impl_->kmm[il].get(), 0,
+                           impl_->kmm[il].bytes(),
+                           impl_->stream) != hipSuccess) {
+          return Fail(error_msg, "Flint: key bound reset failed");
+        }
+      }
+      if (!Synchronize(error_msg))
+        return false;
+    }
+    return true;
+  }
   impl_->logit_rows = 1;
   impl_->position = position;
   // The block-sparse key bounds are derived from the keys: rebuild them.
@@ -1610,6 +1686,15 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     if (hipStreamSynchronize(impl_->stream) != hipSuccess)
       return Fail(error_msg, "Flint: key bound rebuild failed");
   }
+  return true;
+}
+
+bool Session::SetLogits(std::span<const float> row, std::string* error_msg) {
+  const std::uint32_t vocab = impl_->model->config.vocab_size;
+  if (row.size() != vocab)
+    return Fail(error_msg, "Flint: logits row has the wrong size");
+  std::memcpy(impl_->h_logits, row.data(), std::size_t{vocab} * sizeof(float));
+  impl_->logit_rows = 1;
   return true;
 }
 

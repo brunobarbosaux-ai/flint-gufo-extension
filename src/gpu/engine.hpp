@@ -2,6 +2,7 @@
 #define GUFO_MODELS_FLINT_GPU_ENGINE_HPP_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -103,6 +104,37 @@ public:
   /// model). The position becomes the payload's.
   [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
                                      std::string* error_msg);
+
+  // --- Row-level access (per-layer KV components) -------------------------
+  //
+  // Each layer's K and V cache is a device buffer laid out as
+  // [position][num_kv * head_dim] of __half, token-major. The layout and the
+  // buffers are stable for the session lifetime. A row is KvRowBytes() bytes.
+
+  [[nodiscard]] std::uint32_t NumLayers() const noexcept;
+  /// Bytes of one token's K (or V) row in one layer: num_kv*head_dim*2.
+  [[nodiscard]] std::size_t KvRowBytes() const noexcept;
+  /// Device pointer to layer `layer`'s K cache (`value == false`) or V cache
+  /// (`value == true`). nullptr when `layer >= NumLayers()`.
+  [[nodiscard]] const void* KvRows(std::uint32_t layer,
+                                   bool value) const noexcept;
+  [[nodiscard]] void* KvRows(std::uint32_t layer, bool value) noexcept;
+  /// Waits for all work this session has queued.
+  [[nodiscard]] bool Synchronize(std::string* error_msg) const;
+  /// Declares the first `position` rows of every layer to be in place (written
+  /// through KvRows() or copied from a snapshot) and makes them the session
+  /// state: position, one logits row, and sparse key bounds rebuilt from the
+  /// keys. Does not write logits; call SetLogits() for those. position 0 empties
+  /// the session (logits zeroed, sparse bounds cleared).
+  [[nodiscard]] bool RestoreRows(std::uint32_t position,
+                                 std::string* error_msg);
+  /// Sets the logits Logits() reports to `row` (vocab_size floats).
+  [[nodiscard]] bool SetLogits(std::span<const float> row,
+                               std::string* error_msg);
+  /// Called with [first, end) once per Append/AppendAll, before any row in
+  /// that range is written. Not called by Rewind. An empty function clears it.
+  void SetRowWriteHook(
+      std::function<void(std::uint32_t first, std::uint32_t end)> hook);
 
 private:
   friend class Model;

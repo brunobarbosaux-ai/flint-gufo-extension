@@ -42,6 +42,13 @@ using ext::TextRunnerToken;
 
 constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v1";
 
+// A retained snapshot is one full private state (~15.7 GiB at 130k context
+// on this model). The host captures it synchronously on the request thread,
+// so an unbounded budget turns the first request at long context into a
+// multi-second stall (measured 14.2 s at -c 130000). Cap the budget: larger
+// snapshots are refused instead of captured.
+constexpr std::size_t kFlintMaxRetainedSnapshotBytes = std::size_t{8} << 30;
+
 void Log(const std::string& line) {
   std::fprintf(stderr, "[flint] %s\n", line.c_str());
 }
@@ -346,8 +353,12 @@ public:
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = per_request,
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes(),
-        .retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes(),
+        .retained_snapshot_capacity_bytes =
+            std::min(ext::HostSnapshotBudgetBytes(),
+                     kFlintMaxRetainedSnapshotBytes),
+        .retained_snapshot_ceiling_bytes =
+            std::min(ext::HostSnapshotCeilingBytes(),
+                     kFlintMaxRetainedSnapshotBytes),
         .requires_device_runtime_lock = true,
     };
   }
@@ -366,7 +377,10 @@ public:
                                                    component_identity_),
         ledger,
         hip::ComponentCacheHooks{
-            [] { return ext::HostSnapshotCeilingBytes(); },
+            [] {
+              return std::min(ext::HostSnapshotCeilingBytes(),
+                              kFlintMaxRetainedSnapshotBytes);
+            },
             [](std::string_view) {},
             [](std::string_view) {},
         });

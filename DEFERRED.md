@@ -17,3 +17,8 @@
 
 ### MMQ scratch arena never reclaimed (noted during `fb616ad` root-cause)
 - `qfn_stack_pool::reserve` allocates a 256 MiB arena per (device, stream); each session owns a private stream, and `flint_mmq_release_stream` (`flint_mmq.h:10`) is declared but never called — arenas are never returned. The claim now models this honestly, but a long-lived server with rotating sessions could accumulate arenas. Action: call `flint_mmq_release_stream` on session teardown, or share one arena under the device lock.
+
+### Long-context first-request stall (fixed in 0.3.1 by capping the retained-snapshot claim)
+- At `-c 130000` with the default RAM cache, the host captured a full private-state snapshot **synchronously on the request thread** (~15.7 GB) before answering: first request 14.2 s vs 0.47 s with the capture refused. Prefill itself was healthy; `--stall-timeout-ms` defaults to 0, so on slower machines the stall logs nothing and looks like a hang.
+- Flint-side fix (`0.3.1`): the retained-snapshot capacity/ceiling claim is capped at 8 GiB, so a snapshot larger than the cap is refused cheaply instead of captured. Verified: 130k first request 0.47 s; 8k keeps prefix retention (`cached_tokens=8` on the second request).
+- Remaining upstream work (Gufo host, not this extension): capture snapshots off the request thread; clamp the backing-segment target so `parts` cannot collapse; replace the `std::bad_alloc` refusal with a clean refusal; default `stall_timeout` to a non-zero value.

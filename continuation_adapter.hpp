@@ -18,15 +18,12 @@ using FlintSession = gpu::Session;
 
 // Prefix-continuation adapter for the Flint ROCm session.
 //
-// Flint's continuation state is a single opaque device snapshot: the KV rows of
-// every layer plus the last logits, saved and restored as one blob
-// (Session::SaveSnapshot / RestoreSnapshot). Unlike per-layer KV models there
-// are no independently addressable append rows here, so the whole continuation
-// is modelled as one private-state component. A Flint snapshot's byte count
-// tracks the live KV position, so the component is sized to the model's maximum
-// possible snapshot and each payload records its own live length in a header.
-// Prefix caching then works by copying that blob between the slot's session and
-// cache-owned host pages.
+// The continuation is split into cache components (layout table in the .cpp):
+// two private components (metadata, last logits row) and one kAppendRows K and
+// one V component per layer, each token-major with row_bytes =
+// num_kv * head_dim * 2. Capture copies only valid rows; restore copies rows in
+// place through the session's KvRows() buffers and then commits the frontier in
+// Validate.
 class FlintContinuationAdapter final : public cache::Adapter {
 public:
   FlintContinuationAdapter(std::shared_ptr<FlintModel> model,
@@ -69,6 +66,9 @@ public:
   [[nodiscard]] cache::Completion CopyRowsOut(
       const cache::Slot&, cache::ComponentId, cache::Rows first,
       cache::Rows end, std::span<std::byte>, cache::Stream&) override;
+  [[nodiscard]] std::span<const std::byte> BorrowRowsView(
+      const cache::Slot&, cache::ComponentId, cache::Rows first,
+      cache::Rows end) const override;
   [[nodiscard]] cache::Completion CopyRowsIn(cache::Slot&, cache::ComponentId,
                                              cache::Rows first, cache::Rows end,
                                              std::span<const std::byte>,
@@ -78,14 +78,25 @@ public:
   [[nodiscard]] bool Invalidate(cache::Slot&) noexcept override;
 
 private:
+  enum class PrivatePart : std::uint8_t { kMetadata, kLogits };
+  struct Component {
+    cache::ComponentDescriptor descriptor;
+    PrivatePart private_part{PrivatePart::kMetadata};  // kPrivateState only.
+    std::uint32_t layer{0};                            // kAppendRows only.
+    bool is_value{false};                              // kAppendRows only.
+  };
+
   class State;
   State& As(cache::Slot&) const;
-  void RequireComponent(cache::ComponentId) const;
+  const State& As(const cache::Slot&) const;
+  const Component& RequireComponent(cache::ComponentId) const;
 
   std::shared_ptr<FlintModel> model_;
   std::uint32_t context_;
   cache::Identity identity_;
-  std::size_t snapshot_bytes_{0};
+  std::size_t row_bytes_{0};
+  std::size_t logits_bytes_{0};
+  std::vector<Component> components_;
   std::vector<cache::ComponentDescriptor> descriptors_;
 };
 

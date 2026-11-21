@@ -41,7 +41,10 @@ using FlintModel = gpu::Model;
 using FlintSession = gpu::Session;
 using ext::TextRunnerToken;
 
-constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v1";
+constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v2";
+// Per-layer K/V append rows plus a metadata/logits private state. A v1
+// single-blob disk cache must not load into this layout.
+constexpr std::string_view kFlintPayloadLayout = "flint-kv-rows-v1";
 
 // A retained snapshot is one full private state (~15.7 GiB at 130k context
 // on this model). The host captures it synchronously on the request thread,
@@ -67,8 +70,7 @@ std::vector<std::uint8_t> FlintCompatibilityIdentity(
            << "context_tokens=" << max_context << '\n'
            << "chat_template=flint-glm-compiled-v1\n"
            << "state_abi=" << kFlintStateAbi << '\n'
-           << "payload_layout=flint-rocm-session-snapshot-v"
-           << FlintSession::kSnapshotPayloadVersion << '\n';
+           << "payload_layout=" << kFlintPayloadLayout << '\n';
   const auto canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -83,8 +85,7 @@ std::vector<std::uint8_t> ComponentIdentity(const FlintModel* model,
            << "model_instance=" << model << '\n'
            << "context_tokens=" << max_context << '\n'
            << "state_abi=" << kFlintStateAbi << '\n'
-           << "payload_layout=flint-rocm-session-snapshot-v"
-           << FlintSession::kSnapshotPayloadVersion << '\n';
+           << "payload_layout=" << kFlintPayloadLayout << '\n';
   const auto canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }

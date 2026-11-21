@@ -1,28 +1,70 @@
 #include "continuation_adapter.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <cstring>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+
+// Component layout (ids ascend; layout_version = 1 for every component):
+//
+// | id      | component | kind          | row_bytes        | rows_per_chunk | state_bytes  |
+// |---------|-----------|---------------|------------------|----------------|--------------|
+// | 1       | metadata  | kPrivateState | 0                | 0              | 64           |
+// | 2       | logits    | kPrivateState | 0                | 0              | vocab_size*4 |
+// | 3 + 2*l | K(l)      | kAppendRows   | num_kv*head_dim*2| 256            | 0            |
+// | 4 + 2*l | V(l)      | kAppendRows   | num_kv*head_dim*2| 256            | 0            |
+//
+// Rows are token-major, [position][num_kv * head_dim] of __half, exactly the
+// engine's per-layer K/V buffer layout. The component table is parallel to
+// descriptors_: index i holds id i + 1.
 
 namespace gufo::models::flint {
 namespace {
 
-// The private payload is one metadata header followed by the raw session
-// snapshot, padded to a fixed capacity. A Flint snapshot's byte count tracks
-// the live KV position, so the cache's fixed-size component holds the largest
-// possible snapshot and the header records how many bytes are live.
-constexpr std::uint32_t kPayloadVersion = 1;
-struct PayloadHeader {
-  std::uint32_t version{kPayloadVersion};
+using cache::Rows;
+using TransferResult = cache::TransferResult;
+
+constexpr std::size_t kMetadataBytes = 64;
+constexpr Rows kRowsPerChunk = 256;
+
+void Check(hipError_t result) {
+  if (result != hipSuccess)
+    throw std::runtime_error(hipGetErrorString(result));
+}
+
+void SyncSession(const FlintSession& session) {
+  std::string error;
+  if (!session.Synchronize(&error))
+    throw std::runtime_error("Flint synchronize failed: " + error);
+}
+
+using Coverage = std::vector<std::pair<std::size_t, std::size_t>>;
+bool Covered(Coverage ranges, std::size_t end) {
+  std::ranges::sort(ranges);
+  std::size_t frontier = 0;
+  for (const auto& [first, last] : ranges) {
+    if (first > frontier)
+      return false;
+    frontier = std::max(frontier, last);
+  }
+  return frontier == end;
+}
+
+// Host view of the 64-byte metadata component. Fields past `reserved` are zero.
+struct Metadata {
+  std::uint32_t version{1};
+  std::uint32_t position{0};
+  std::uint32_t logits_valid{0};
   std::uint32_t reserved{0};
-  std::uint64_t position{0};
-  std::uint64_t snapshot_len{0};
+  std::array<std::uint8_t, kMetadataBytes - 16> tail{};
 };
-static_assert(sizeof(PayloadHeader) == 24);
+static_assert(sizeof(Metadata) == kMetadataBytes);
 
 }  // namespace
 
@@ -33,10 +75,8 @@ public:
       : adapter(adapter), guard(guard), session(std::move(session)) {}
 
   struct Job {
-    bool load{false};
     mutable std::mutex mutex;
     std::optional<cache::TransferResult> result;
-    std::optional<cache::Completion> completion;
   };
 
   class Signal final : public cache::CompletionSignal {
@@ -44,15 +84,10 @@ public:
     explicit Signal(std::shared_ptr<Job> job) : job_(std::move(job)) {}
     [[nodiscard]] bool Ready() const noexcept override {
       const std::lock_guard lock(job_->mutex);
-      return job_->result.has_value() ||
-             (job_->completion && job_->completion->Ready());
+      return job_->result.has_value();
     }
     [[nodiscard]] cache::TransferResult Wait() noexcept override {
       const std::lock_guard lock(job_->mutex);
-      if (!job_->result) {
-        job_->result = job_->completion->Wait();
-        job_->completion.reset();
-      }
       return *job_->result;
     }
 
@@ -60,16 +95,32 @@ public:
     std::shared_ptr<Job> job_;
   };
 
-  // A completed transfer that already moved its bytes.
+  // Every transfer here completes synchronously on the calling thread.
   static cache::Completion Settled(bool success) {
     auto job = std::make_shared<Job>();
-    job->result = success ? cache::TransferResult::kSucceeded
-                          : cache::TransferResult::kFailed;
+    job->result = success ? TransferResult::kSucceeded : TransferResult::kFailed;
     return cache::Completion(std::make_unique<Signal>(std::move(job)));
+  }
+
+  ~State() override {
+    // Destruction must not terminate: release what can be released and drop
+    // the row hook so the session cannot call back into a dead guard.
+    try {
+      session->SetRowWriteHook({});
+      for (const auto& component : adapter.components_)
+        if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+          guard.BeforeRelease(component.descriptor.id, 0, adapter.context_);
+    } catch (...) {
+    }
   }
 
   [[nodiscard]] bool IsValid() const noexcept override {
     return !restoring && !failed;
+  }
+
+  void Cover(std::size_t index, std::size_t first, std::size_t last) {
+    const std::lock_guard lock(coverage_mutex);
+    coverage[index].emplace_back(first, last);
   }
 
   FlintContinuationAdapter& adapter;
@@ -77,8 +128,12 @@ public:
   std::unique_ptr<FlintSession> session;
   bool restoring{false};
   bool failed{false};
-  std::vector<std::byte> staging;
-  std::uint64_t expected_position{0};
+  cache::Rows expected_position{0};
+  std::vector<cache::ComponentPosition> expected;
+  std::mutex coverage_mutex;
+  std::vector<Coverage> coverage;
+  std::array<std::byte, kMetadataBytes> metadata{};
+  std::vector<std::byte> logits;
 };
 
 FlintContinuationAdapter::FlintContinuationAdapter(
@@ -89,26 +144,59 @@ FlintContinuationAdapter::FlintContinuationAdapter(
       identity_(std::move(identity)) {
   if (!model_ || context_ == 0)
     throw std::invalid_argument("invalid Flint continuation configuration");
-  // Flint snapshot bytes track the live KV position; the model-sized value is
-  // the fixed capacity the cache allocates, and each payload records its own
-  // live length.
-  snapshot_bytes_ = model_->SnapshotBytes(context_);
-  if (snapshot_bytes_ == 0)
-    throw std::invalid_argument("Flint snapshot has no bytes");
-  cache::ComponentDescriptor descriptor;
-  descriptor.id = {1};
-  descriptor.layout_version = 1;
-  descriptor.kind = cache::ComponentKind::kPrivateState;
-  descriptor.state_bytes = sizeof(PayloadHeader) + snapshot_bytes_;
-  descriptors_.push_back(descriptor);
-
   if (identity_.empty())
     throw std::invalid_argument("Flint adapter requires an identity");
+
+  const auto& config = model_->config();
+  if (config.num_layers == 0 || config.num_kv == 0 || config.head_dim == 0 ||
+      config.vocab_size == 0)
+    throw std::invalid_argument("Flint model has no continuation geometry");
+  row_bytes_ = std::size_t{config.num_kv} * config.head_dim * 2;
+  logits_bytes_ = std::size_t{config.vocab_size} * sizeof(float);
+
+  Component metadata;
+  metadata.descriptor = {.id = {1},
+                         .layout_version = 1,
+                         .kind = cache::ComponentKind::kPrivateState,
+                         .row_bytes = 0,
+                         .rows_per_chunk = 0,
+                         .state_bytes = kMetadataBytes};
+  metadata.private_part = PrivatePart::kMetadata;
+  components_.push_back(metadata);
+
+  Component logits;
+  logits.descriptor = {.id = {2},
+                       .layout_version = 1,
+                       .kind = cache::ComponentKind::kPrivateState,
+                       .row_bytes = 0,
+                       .rows_per_chunk = 0,
+                       .state_bytes = logits_bytes_};
+  logits.private_part = PrivatePart::kLogits;
+  components_.push_back(logits);
+
+  for (std::uint32_t layer = 0; layer < config.num_layers; ++layer) {
+    for (const bool is_value : {false, true}) {
+      Component rows;
+      rows.descriptor = {
+          .id = {3 + 2 * layer + (is_value ? 1U : 0U)},
+          .layout_version = 1,
+          .kind = cache::ComponentKind::kAppendRows,
+          .row_bytes = row_bytes_,
+          .rows_per_chunk = kRowsPerChunk,
+          .state_bytes = 0};
+      rows.layer = layer;
+      rows.is_value = is_value;
+      components_.push_back(rows);
+    }
+  }
+  for (const auto& component : components_)
+    descriptors_.push_back(component.descriptor);
+
   const auto put = [&](std::uint32_t value) {
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(1);  // Component layout version.
+  put(2);  // Component layout version.
   put(context_);
 }
 
@@ -122,6 +210,11 @@ FlintContinuationAdapter::State& FlintContinuationAdapter::As(
   return state;
 }
 
+const FlintContinuationAdapter::State& FlintContinuationAdapter::As(
+    const cache::Slot& slot) const {
+  return As(const_cast<cache::Slot&>(slot));
+}
+
 FlintSession& FlintContinuationAdapter::GetSession(cache::Slot& slot) {
   auto& state = As(slot);
   if (!state.IsValid())
@@ -129,9 +222,11 @@ FlintSession& FlintContinuationAdapter::GetSession(cache::Slot& slot) {
   return *state.session;
 }
 
-void FlintContinuationAdapter::RequireComponent(cache::ComponentId id) const {
-  if (id.value != 1)
+const FlintContinuationAdapter::Component&
+FlintContinuationAdapter::RequireComponent(cache::ComponentId id) const {
+  if (id.value == 0 || id.value > components_.size())
     throw std::invalid_argument("invalid Flint component id");
+  return components_[id.value - 1];
 }
 
 std::vector<cache::BackingClass> FlintContinuationAdapter::BackingPlan(
@@ -170,20 +265,43 @@ std::unique_ptr<cache::Slot> FlintContinuationAdapter::CreateSlot(
   auto session = model_->CreateSession(context_, &error);
   if (!session)
     throw std::runtime_error(error);
-  return std::make_unique<State>(*this, guard, std::move(session));
+  if (session->KvRowBytes() != row_bytes_)
+    throw std::runtime_error("Flint session row size differs from the layout");
+  std::size_t layers = 0;
+  for (const auto& component : components_)
+    if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+      ++layers;
+  if (session->NumLayers() * std::size_t{2} != layers)
+    throw std::runtime_error("Flint session layer count differs from the layout");
+
+  auto state = std::make_unique<State>(*this, guard, std::move(session));
+  State* owner = state.get();
+  owner->session->SetRowWriteHook(
+      [owner](std::uint32_t first, std::uint32_t end) {
+        if (first == end)
+          return;
+        for (const auto& component : owner->adapter.components_)
+          if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+            owner->guard.BeforeOverwrite(component.descriptor.id, first, end);
+      });
+  return state;
 }
 
 std::vector<cache::ComponentPosition> FlintContinuationAdapter::Positions(
     const cache::Slot& slot) const {
-  const auto& state = As(const_cast<cache::Slot&>(slot));
+  const auto& state = As(slot);
   if (!state.IsValid())
     throw std::logic_error("cannot query an invalid Flint slot");
-  return {{descriptors_.front().id, state.session->Position()}};
+  std::vector<cache::ComponentPosition> positions;
+  positions.reserve(descriptors_.size());
+  for (const auto& descriptor : descriptors_)
+    positions.push_back({descriptor.id, state.session->Position()});
+  return positions;
 }
 
 std::vector<cache::Rows> FlintContinuationAdapter::PlanPrefill(
     const cache::Slot& slot, cache::Rows first, cache::Rows end) const {
-  const auto& state = As(const_cast<cache::Slot&>(slot));
+  const auto& state = As(slot);
   if (!state.IsValid() || first > end || end > context_)
     throw std::invalid_argument("invalid Flint prefill plan");
   std::vector<cache::Rows> result;
@@ -200,19 +318,46 @@ void FlintContinuationAdapter::BeginRestore(
   auto& state = As(slot);
   if (!state.IsValid())
     throw std::logic_error("Flint restore requires a valid slot");
-  if (positions.size() != 1 || positions.front().id.value != 1)
+  if (positions.size() != descriptors_.size())
     throw std::invalid_argument("incomplete Flint restore positions");
-  if (positions.front().valid_rows > context_)
+
+  std::vector<cache::ComponentPosition> ordered;
+  ordered.reserve(descriptors_.size());
+  for (const auto& descriptor : descriptors_) {
+    if (std::ranges::count(positions, descriptor.id,
+                           &cache::ComponentPosition::id) != 1)
+      throw std::invalid_argument("duplicate or missing Flint frontier");
+    ordered.push_back(*std::ranges::find(positions, descriptor.id,
+                                         &cache::ComponentPosition::id));
+  }
+  const auto frontier = ordered.front().valid_rows;
+  for (const auto& position : ordered)
+    if (position.valid_rows != frontier)
+      throw std::invalid_argument("inconsistent Flint frontiers");
+  if (frontier > context_)
     throw std::invalid_argument("Flint frontier exceeds context");
-  state.expected_position = positions.front().valid_rows;
+
+  // Rows are written in place: guard every append range the restore can
+  // replace while the old slot is still readable, then drain the device.
+  for (const auto& component : components_)
+    if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+      state.guard.BeforeOverwrite(component.descriptor.id, 0, context_);
+  SyncSession(*state.session);
+
+  state.expected = std::move(ordered);
+  state.expected_position = frontier;
+  state.coverage.assign(descriptors_.size(), {});
+  state.metadata.fill(std::byte{});
+  state.logits.assign(logits_bytes_, std::byte{});
   state.failed = false;
   state.restoring = true;
-  state.staging.clear();
 }
 
 cache::Completion FlintContinuationAdapter::CapturePrivate(
     const cache::Slot& slot, cache::ComponentId id, std::span<std::byte> bytes,
     cache::Stream& stream) {
+  if (bytes.size() != RequireComponent(id).descriptor.state_bytes)
+    throw std::invalid_argument("incorrect Flint private buffer");
   return CapturePrivatePiece(slot, id, 0, bytes, stream);
 }
 
@@ -220,53 +365,41 @@ cache::Completion FlintContinuationAdapter::CapturePrivatePiece(
     const cache::Slot& slot, cache::ComponentId id, std::size_t offset,
     std::span<std::byte> bytes, cache::Stream& stream) {
   (void)stream;
-  RequireComponent(id);
-  auto& state = As(const_cast<cache::Slot&>(slot));
+  const auto& component = RequireComponent(id);
+  auto& state = As(slot);
   if (!state.IsValid())
     throw std::logic_error("cannot capture an invalid Flint slot");
-  const auto total = descriptors_.front().state_bytes;
+  if (component.descriptor.kind != cache::ComponentKind::kPrivateState)
+    throw std::invalid_argument("Flint component is not private state");
+  const auto total = component.descriptor.state_bytes;
   if (offset > total || bytes.size() > total - offset)
     throw std::invalid_argument("invalid Flint private piece");
-  // Save into a temporary sized for the live snapshot, then place header and
-  // snapshot directly into the destination span. Bytes of the payload beyond
-  // the live snapshot are zeroed so a payload is deterministic without
-  // materialising a second full-capacity buffer.
-  const auto live_bytes = state.session->SnapshotBytes();
-  if (live_bytes > snapshot_bytes_)
-    throw std::logic_error("Flint live snapshot exceeds its capacity");
-  std::vector<std::uint8_t> live(live_bytes);
-  std::string error;
-  if (!state.session->SaveSnapshot(live, &error))
-    throw std::runtime_error("Flint snapshot capture failed: " + error);
-  const PayloadHeader header{.version = kPayloadVersion,
-                             .reserved = 0,
-                             .position = state.session->Position(),
-                             .snapshot_len = live_bytes};
-  const auto copy = [&](std::size_t from, const void* source,
-                        std::size_t count) {
-    const auto to = from + count;
-    if (to <= offset || from >= offset + bytes.size())
-      return;
-    const auto begin = std::max(from, offset);
-    const auto end = std::min(to, offset + bytes.size());
-    std::memcpy(bytes.data() + (begin - offset),
-                static_cast<const std::uint8_t*>(source) + (begin - from),
-                end - begin);
-  };
-  // Zero the region the live snapshot does not cover.
-  const auto covered = sizeof(PayloadHeader) + live_bytes;
-  const auto zero_begin = std::max(offset, covered);
-  const auto zero_end = std::min(offset + bytes.size(), total);
-  if (zero_begin < zero_end)
-    std::memset(bytes.data() + (zero_begin - offset), 0, zero_end - zero_begin);
-  copy(0, &header, sizeof(header));
-  copy(sizeof(PayloadHeader), live.data(), live_bytes);
+
+  // Build the complete component so a piece never exposes a partial region.
+  SyncSession(*state.session);
+  const auto position = state.session->Position();
+  std::vector<std::byte> whole(total, std::byte{});
+  if (component.private_part == PrivatePart::kMetadata) {
+    const Metadata metadata{.version = 1,
+                            .position = position,
+                            .logits_valid = position > 0 ? 1U : 0U};
+    std::memcpy(whole.data(), &metadata, sizeof(metadata));
+  } else if (position > 0) {
+    const auto logits = state.session->Logits();
+    if (logits.size_bytes() != total)
+      throw std::logic_error("Flint logits size differs from the layout");
+    std::memcpy(whole.data(), logits.data(), total);
+  }
+  if (!bytes.empty())
+    std::memcpy(bytes.data(), whole.data() + offset, bytes.size());
   return State::Settled(true);
 }
 
 cache::Completion FlintContinuationAdapter::LoadPrivate(
     cache::Slot& slot, cache::ComponentId id, std::span<const std::byte> bytes,
     cache::Stream& stream) {
+  if (bytes.size() != RequireComponent(id).descriptor.state_bytes)
+    throw std::invalid_argument("incorrect Flint private buffer");
   return LoadPrivatePiece(slot, id, 0, bytes, stream);
 }
 
@@ -274,29 +407,97 @@ cache::Completion FlintContinuationAdapter::LoadPrivatePiece(
     cache::Slot& slot, cache::ComponentId id, std::size_t offset,
     std::span<const std::byte> bytes, cache::Stream& stream) {
   (void)stream;
-  RequireComponent(id);
   auto& state = As(slot);
   if (!state.restoring || state.failed)
     throw std::logic_error("Flint load requires an unfailed restore");
-  const auto total = descriptors_.front().state_bytes;
-  if (offset > total || bytes.size() > total - offset)
-    throw std::invalid_argument("invalid Flint private piece");
-  if (state.staging.size() != total)
-    state.staging.resize(total);
-  std::memcpy(state.staging.data() + offset, bytes.data(), bytes.size());
-  return State::Settled(true);
+  try {
+    const auto& component = RequireComponent(id);
+    if (component.descriptor.kind != cache::ComponentKind::kPrivateState)
+      throw std::invalid_argument("Flint component is not private state");
+    const auto total = component.descriptor.state_bytes;
+    if (offset > total || bytes.size() > total - offset)
+      throw std::invalid_argument("invalid Flint private piece");
+    auto* target = component.private_part == PrivatePart::kMetadata
+                       ? state.metadata.data()
+                       : state.logits.data();
+    if (!bytes.empty())
+      std::memcpy(target + offset, bytes.data(), bytes.size());
+    state.Cover(id.value - 1, offset, offset + bytes.size());
+    return State::Settled(true);
+  } catch (...) {
+    state.failed = true;
+    throw;
+  }
 }
 
 cache::Completion FlintContinuationAdapter::CopyRowsOut(
-    const cache::Slot&, cache::ComponentId, cache::Rows, cache::Rows,
-    std::span<std::byte>, cache::Stream&) {
-  throw std::logic_error("Flint has no append-row components");
+    const cache::Slot& slot, cache::ComponentId id, cache::Rows first,
+    cache::Rows end, std::span<std::byte> bytes, cache::Stream& stream) {
+  (void)stream;
+  const auto& state = As(slot);
+  if (!state.IsValid())
+    throw std::logic_error("cannot read an invalid Flint slot");
+  const auto& component = RequireComponent(id);
+  if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
+    throw std::invalid_argument("Flint component has no append rows");
+  const auto row = row_bytes_;
+  if (first > end || end > state.session->Position() ||
+      bytes.size() != (end - first) * row)
+    throw std::invalid_argument("invalid Flint row capture");
+  if (first == end)
+    return State::Settled(true);
+  SyncSession(*state.session);
+  const auto* source = static_cast<const std::byte*>(state.session->KvRows(
+                           component.layer, component.is_value)) +
+                       first * row;
+  Check(hipMemcpy(bytes.data(), source, bytes.size(), hipMemcpyDeviceToHost));
+  return State::Settled(true);
 }
 
 cache::Completion FlintContinuationAdapter::CopyRowsIn(
-    cache::Slot&, cache::ComponentId, cache::Rows, cache::Rows,
-    std::span<const std::byte>, cache::Stream&) {
-  throw std::logic_error("Flint has no append-row components");
+    cache::Slot& slot, cache::ComponentId id, cache::Rows first,
+    cache::Rows end, std::span<const std::byte> bytes, cache::Stream& stream) {
+  (void)stream;
+  auto& state = As(slot);
+  if (!state.restoring || state.failed)
+    throw std::logic_error("Flint load requires an unfailed restore");
+  try {
+    const auto& component = RequireComponent(id);
+    if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
+      throw std::invalid_argument("Flint component has no append rows");
+    const auto row = row_bytes_;
+    if (first > end || end > state.expected_position ||
+        bytes.size() != (end - first) * row)
+      throw std::invalid_argument("invalid Flint row restore");
+    if (first == end)
+      return State::Settled(true);
+    auto* target = static_cast<std::byte*>(state.session->KvRows(
+                       component.layer, component.is_value)) +
+                   first * row;
+    Check(hipMemcpy(target, bytes.data(), bytes.size(), hipMemcpyHostToDevice));
+    state.Cover(id.value - 1, first * row, end * row);
+    return State::Settled(true);
+  } catch (...) {
+    state.failed = true;
+    throw;
+  }
+}
+
+std::span<const std::byte> FlintContinuationAdapter::BorrowRowsView(
+    const cache::Slot& slot, cache::ComponentId id, cache::Rows first,
+    cache::Rows end) const {
+  const auto& state = As(slot);
+  if (!state.IsValid())
+    throw std::logic_error("cannot borrow invalid Flint rows");
+  const auto& component = RequireComponent(id);
+  if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
+    throw std::logic_error("Flint component has no append rows");
+  if (first >= end || end > state.session->Position())
+    throw std::invalid_argument("invalid Flint borrowed range");
+  SyncSession(*state.session);
+  const auto* base = static_cast<const std::byte*>(state.session->KvRows(
+      component.layer, component.is_value));
+  return {base + first * row_bytes_, (end - first) * row_bytes_};
 }
 
 bool FlintContinuationAdapter::Validate(
@@ -308,40 +509,62 @@ bool FlintContinuationAdapter::Validate(
     state.failed = true;
     return false;
   };
-  if (state.failed || positions.size() != 1 ||
-      positions.front().id.value != 1 ||
-      positions.front().valid_rows != state.expected_position)
+  if (state.failed || positions.size() != descriptors_.size())
     return refuse();
-  const auto total = descriptors_.front().state_bytes;
-  if (state.staging.size() != total)
+
+  // Every component must report exactly the expected frontier and be fully
+  // covered by loads: rows up to valid_rows, private state whole.
+  for (std::size_t i = 0; i < state.expected.size(); ++i) {
+    const auto& expected = state.expected[i];
+    const auto& descriptor = descriptors_[i];
+    if (std::ranges::count(positions, expected) != 1 ||
+        !Covered(state.coverage[i],
+                 descriptor.row_bytes
+                     ? expected.valid_rows * descriptor.row_bytes
+                     : descriptor.state_bytes))
+      return refuse();
+  }
+
+  Metadata metadata{};
+  std::memcpy(&metadata, state.metadata.data(), sizeof(metadata));
+  if (metadata.version != 1 ||
+      metadata.position != state.expected_position ||
+      metadata.logits_valid > 1)
     return refuse();
-  PayloadHeader header{};
-  std::memcpy(&header, state.staging.data(), sizeof(header));
-  if (header.version != kPayloadVersion ||
-      header.position != state.expected_position || header.snapshot_len == 0 ||
-      header.snapshot_len > snapshot_bytes_)
+
+  try {
+    std::string error;
+    if (!state.session->RestoreRows(
+            static_cast<std::uint32_t>(state.expected_position), &error))
+      return refuse();
+    if (metadata.logits_valid == 1) {
+      std::vector<float> logits(logits_bytes_ / sizeof(float));
+      std::memcpy(logits.data(), state.logits.data(), logits_bytes_);
+      if (!state.session->SetLogits(logits, &error))
+        return refuse();
+    }
+    if (state.session->Position() != state.expected_position)
+      return refuse();
+  } catch (...) {
     return refuse();
-  const auto snapshot = std::span<const std::uint8_t>(
-      reinterpret_cast<const std::uint8_t*>(state.staging.data() +
-                                            sizeof(PayloadHeader)),
-      header.snapshot_len);
-  std::string error;
-  if (!state.session->RestoreSnapshot(snapshot, &error))
-    return refuse();
-  if (state.session->Position() != state.expected_position)
-    return refuse();
+  }
   state.restoring = false;
-  state.staging.clear();
+  state.expected.clear();
+  state.coverage.clear();
   return true;
 }
 
 bool FlintContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
   try {
     auto& state = As(slot);
+    for (const auto& component : components_)
+      if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+        state.guard.BeforeRelease(component.descriptor.id, 0, context_);
     state.session->Reset();
-    state.failed = false;
     state.restoring = false;
-    state.staging.clear();
+    state.failed = false;
+    state.expected.clear();
+    state.coverage.clear();
     state.guard.AfterReset();
     return true;
   } catch (...) {

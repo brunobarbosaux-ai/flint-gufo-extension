@@ -60,7 +60,7 @@ follow-up turn copies only the new chunks; backing segments stay ~128 MiB.
 | D7 | Session position is set in `Validate`, never `BeginRestore` | A failed/partial restore must leave the slot invalid, not half-restored. |
 | D8 | Engine row-write hook fires once per `Append`/`AppendAll` for `[position, position+n)` before any write | The only way to cover every write path (runner, spec target adapter) with `MutationGuard::BeforeOverwrite`. Over-reporting is safe (guard drops pins early); under-reporting corrupts the cache. |
 | D9 | Keep `SaveSnapshot`/`RestoreSnapshot` for tests; refactor `RestoreSnapshot` to call the new `RestoreRows` | One implementation of the sparse `kmm` rebuild (`engine.cpp:1594-1612`) — the trap that silently breaks sparse attention. |
-| D10 | Bump `state_abi` → `flint-rocm-session-v2`, `payload_layout` → `flint-kv-rows-v1` in Stage 4 | A v1 single-blob disk cache must not load into a v2 multi-component adapter. |
+| D10 | Bump `state_abi` → `flint-rocm-session-v2`, `payload_layout` → `flint-kv-rows-v1` in the **same commit** as the adapter layout change (Stage 2) | A v1 single-blob disk cache must not load into a v2 multi-component adapter; the identity is the only host-visible discriminator. |
 | D11 | 8 GiB cap stays until §7 is answered by measurement | Cheap refusal guard; removal is a separate, measured change. |
 | D12 | `Reset()` is the canonical "empty for reuse"; `RestoreRows(0)` additionally zeroes logits and key bounds and exists only for restore paths | `Invalidate` uses `Reset()`; the two paths must not be confused (review finding, Stage 1). |
 
@@ -89,9 +89,9 @@ component and no capacity field — `context` bounds `valid_rows`.
 | Stage | Work | Status | Gate | Commit |
 |---|---|---|---|---|
 | **1** | Engine API: `NumLayers`, `KvRowBytes`, `KvRows`, `Synchronize`, `RestoreRows`, `SetLogits`, `SetRowWriteHook`; refactor `RestoreSnapshot` onto `RestoreRows`; new `flint.engine_snapshot` test | **COMPLETE** | `flint.engine_snapshot` (both legs), `flint.ops`, `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter`; `--mode gx` 3/3 | `e0577ff` + review fixes `feb7475` |
-| **2** | Adapter descriptors + private components: metadata/logits capture/restore, `Positions`, `BeginRestore`, `Validate`, `Invalidate`; rows still throw | NOT STARTED | bit-exact logits after restore; prefix reuse | — |
-| **3** | Row hooks + guard: `CopyRowsOut`/`CopyRowsIn`/`BorrowRowsView`, engine row-write hook, `BeforeOverwrite`/`BeforeRelease`/`AfterReset` | NOT STARTED | K/V round-trip bit-exact; disk cache write/read; `flint_spec_gate --mode gx` | — |
-| **4** | Identity bump + runner: `flint-rocm-session-v2`, `flint-kv-rows-v1`, position check in `ReconcileComponentState`, cap decision by measurement | NOT STARTED | old cache rejected; new round-trip; `--mode memory`; 130k latency A/B | — |
+| **2** | Adapter rewrite: descriptors (metadata/logits private, K/V per layer as `kAppendRows`), private piece capture/restore, row hooks, `MutationGuard` integration, **identity bump** (`flint-rocm-session-v2`, `flint-kv-rows-v1`) | NOT STARTED | in-process cache: two-request prefix reuse with `cached_tokens > 0`, `cache_snapshot_bytes` proportional to valid rows; spec off/on | — |
+| **3** | Disk cache round trip + guard/eviction stress (multi-session, prune under a small budget) | NOT STARTED | disk write/read bit-identical; old v1 cache rejected; guard drains under eviction | — |
+| **4** | Runner: position check in `ReconcileComponentState`, claim/cap decision by measurement | NOT STARTED | `--mode memory`; 130k latency A/B | — |
 | **5** | Long-context validation: 130k capture, follow-up turns, disk cache, spec on/off, sparse on/off | NOT STARTED | full suite + benchmark vs 0.3.1 baseline | — |
 
 ### Stage 1 — engine API (detail)
@@ -146,32 +146,49 @@ Continuation is checked with a 16-token append before single-token decode: width
 take the vector path and never read the key bounds, so only `n > 8` proves the `kmm`
 rebuild (verified against a mutant that skips it).
 
-### Stage 2 — adapter descriptors (detail)
+### Stage 2 — adapter rewrite (detail)
 
-Replace the single descriptor with the layout in §3; `CapturePrivatePiece`/
-`LoadPrivatePiece` handle only `kPrivateState` (metadata + logits, zero-fill beyond
-valid bytes). `BeginRestore` validates one position per descriptor, records `expected`
-and coverage, calls `Synchronize`. `Validate` checks coverage per component, parses
-metadata, calls `RestoreRows(expected_position)` then `SetLogits`. `Invalidate` calls
-`guard.BeforeRelease` over `[0, capacity)` then `Reset` then `AfterReset`. Row hooks
-still return an error. `SnapshotBytes`/`PayloadHeader` use is removed from the adapter.
+Replace the single descriptor with the layout in §3 and make the adapter functional in
+one commit (descriptor-only stages cannot be gated: the cache always captures every
+declared component, so throwing row hooks make every capture fail).
 
-### Stage 3 — rows + guard (detail)
+- **Descriptors**: `kMetadata` (64 B), `kLogits` (`vocab*4`), per-layer `kKey`/`kValue`
+  (`row_bytes = num_kv*head_dim*2`, `rows_per_chunk = 256`). Keep a component table
+  parallel to the descriptors so `layer`/`part` are recoverable from an id.
+- **Private pieces**: `CapturePrivatePiece`/`LoadPrivatePiece` handle metadata and
+  logits only, at arbitrary offsets; stage into `metadata`/`logits` byte buffers and
+  record coverage. Metadata carries `version`, `position`, `logits_valid`.
+- **Rows**: `CopyRowsOut`/`CopyRowsIn` validate range/size, `Synchronize`, `hipMemcpy`
+  at `KvRows(layer, is_value) + first*row_bytes`, record coverage, return `Settled`.
+  `BorrowRowsView` returns the device span for `kAppendRows` only. Accept tail ranges
+  (`end - first` not a multiple of 256).
+- **Restore**: `BeginRestore` requires one position per descriptor, all at the same
+  `valid_rows`, guards every append component over `[0, capacity)`, synchronizes, and
+  records `expected`/coverage. `Validate` checks coverage per component
+  (`valid_rows*row_bytes` for rows, `state_bytes` for private), parses metadata
+  (`version`, `position == expected`), then `RestoreRows(position)` and
+  `SetLogits(logits)` — position is set only here (D7).
+- **Guard**: `CreateSlot` installs the engine row-write hook that calls
+  `guard.BeforeOverwrite(id, first, end)` for every append component; the slot destructor
+  clears the hook and calls `BeforeRelease(id, 0, capacity)`; `Invalidate` calls
+  `BeforeRelease` + `Reset()` + `AfterReset()`.
+- **Identity** (moved here from the old Stage 4): bump `kFlintStateAbi` →
+  `flint-rocm-session-v2` and both `payload_layout` strings → `flint-kv-rows-v1` in the
+  **same commit** as the layout change. A v1 disk cache must never be readable as the new
+  layout, and the identity is the only thing that distinguishes them for the host.
 
-`CopyRowsOut`/`CopyRowsIn` validate range and size, sync, `hipMemcpy` at
-`KvRows(layer, is_value) + first*row_bytes`, record coverage, return `Settled`.
-`BorrowRowsView` returns `{KvRows + first*row_bytes, (end-first)*row_bytes}` for
-`kAppendRows` only. `CreateSlot` installs the hook: for each `kAppendRows` component,
-`guard.BeforeOverwrite(id, first, end)`. The slot destructor clears the hook and calls
-`BeforeRelease` for every append component over `[0, capacity)`.
+### Stage 3 — disk cache + eviction stress (detail)
 
-### Stage 4 — identity + claim (detail)
+Disk write/read round trip at 8k and 32k, old-cache rejection with the bumped identity,
+repeated prefix reuse across a multi-turn session (guard drains, no pin leaks), and a
+small `--cache-ram-bytes` budget so checkpoint pruning runs.
 
-`runner.cpp`: `kFlintStateAbi` → `flint-rocm-session-v2`, `ComponentIdentity.payload_layout`
-→ `flint-kv-rows-v1`. `ReconcileComponentState` additionally asserts
-`flint.session().Position() == position`. `ResourceClaim` unchanged except for the cap
-decision from §7; do not add `prompt_state_bytes_per_token` unless the host would
-otherwise under-charge (avoid double counting with `per_request_state_bytes`).
+### Stage 4 — runner claim (detail)
+
+`ReconcileComponentState` additionally asserts `flint.session().Position() == position`.
+`ResourceClaim` unchanged except for the cap decision from §7; do not add
+`prompt_state_bytes_per_token` unless the host would otherwise under-charge (avoid
+double counting with `per_request_state_bytes`).
 
 ---
 
@@ -265,3 +282,18 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Known low-priority leftovers: one redundant sync in `RestoreSnapshot` (harmless), the
   `KvRows` const overload returning a non-const pointer internally (public API correct),
   and the pre-existing `AttnCore` unused-variable warning.
+
+### 2026-11-21 — Stage 2 re-scoped (adapter rewrite in one commit; identity bump moved)
+- Reason: the cache captures every declared component on every capture, so a stage that
+  declares `kAppendRows` descriptors but leaves `CopyRowsOut`/`CopyRowsIn` throwing is
+  ungatable — no capture can succeed. The former Stage 2 + Stage 3 are therefore merged
+  into one "adapter rewrite" stage with the row hooks and guard included.
+- The identity bump moved from the old Stage 4 into Stage 2: the component layout changes
+  in Stage 2, so the host-visible identity must change with it or a
+  `flint-rocm-session-snapshot-v1` disk cache could be read as the new layout.
+- Stage 3 is now disk cache + eviction/guard stress; Stage 4 is the runner position check
+  and the claim/cap measurement; Stage 5 is long-context validation.
+- Expected headline metric for the Stage 2 gate, from the 0.3.1 baseline at 8k
+  (`/tmp/opencode/v2_8k.log`): `cache_snapshot_bytes` 822,684,216 B for a 5-token prefix
+  (one full-capacity blob). With valid-rows-only components it should be ~0.5 MB and
+  scale with the number of valid rows; `cached_tokens` on the second request must stay 5.

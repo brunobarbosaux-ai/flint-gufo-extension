@@ -3,8 +3,8 @@
 ## Current workstream
 
 **Continuation cache → per-layer `kAppendRows` components** (`docs/PLAN-KV-ROWS.md`).
-Stage 1 (engine row API) COMPLETE (`e0577ff`, `feb7475`; all gates pass).
-Stage 2 (adapter descriptors) next — awaiting go.
+Stage 2 (adapter rewrite: descriptors, row hooks, guard, identity bump) IN PROGRESS.
+Stages 3–5 not started.
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.

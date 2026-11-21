@@ -89,7 +89,7 @@ component and no capacity field — `context` bounds `valid_rows`.
 | Stage | Work | Status | Gate | Commit |
 |---|---|---|---|---|
 | **1** | Engine API: `NumLayers`, `KvRowBytes`, `KvRows`, `Synchronize`, `RestoreRows`, `SetLogits`, `SetRowWriteHook`; refactor `RestoreSnapshot` onto `RestoreRows`; new `flint.engine_snapshot` test | **COMPLETE** | `flint.engine_snapshot` (both legs), `flint.ops`, `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter`; `--mode gx` 3/3 | `e0577ff` + review fixes `feb7475` |
-| **2** | Adapter rewrite: descriptors (metadata/logits private, K/V per layer as `kAppendRows`), private piece capture/restore, row hooks, `MutationGuard` integration, **identity bump** (`flint-rocm-session-v2`, `flint-kv-rows-v1`) | NOT STARTED | in-process cache: two-request prefix reuse with `cached_tokens > 0`, `cache_snapshot_bytes` proportional to valid rows; spec off/on | — |
+| **2** | Adapter rewrite: descriptors (metadata/logits private, K/V per layer as `kAppendRows`), private piece capture/restore, row hooks, `MutationGuard` integration, **identity bump** (`flint-rocm-session-v2`, `flint-kv-rows-v1`) | **COMPLETE** | in-process cache: r2 `cache=memory`, `cached_tokens=1223`, restore 2.9 ms, answer identical; exact captured bytes; spec-on leg passes | `c559211` + review fixes `e1d0f6f` |
 | **3** | Disk cache round trip + guard/eviction stress (multi-session, prune under a small budget) | NOT STARTED | disk write/read bit-identical; old v1 cache rejected; guard drains under eviction | — |
 | **4** | Runner: position check in `ReconcileComponentState`, claim/cap decision by measurement | NOT STARTED | `--mode memory`; 130k latency A/B | — |
 | **5** | Long-context validation: 130k capture, follow-up turns, disk cache, spec on/off, sparse on/off | NOT STARTED | full suite + benchmark vs 0.3.1 baseline | — |
@@ -231,6 +231,18 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 9. Bump both identity strings; a v1 disk cache must be rejected, not misread.
 10. Do not delete `SaveSnapshot`/`SnapshotBytes` — tests and `spec_gate` tooling still
     use them; only the adapter stops.
+11. **`CopyRowsIn` must accept a device source.** With `BorrowRowsView` returning device
+    memory, the cache passes that same span back to `CopyRowsIn` when the source slot is
+    still live. A hard-coded `hipMemcpyHostToDevice` silently "works" on this APU via host
+    mapping and corrupts on a discrete GPU — it is the Stage 3 multi-session path.
+    Use `hipMemcpyDefault` (or a pointer-attribute branch).
+12. **`State::failed` must be atomic.** Non-overlapping loads are allowed on independent
+    streams; a plain `bool` written by two threads is a data race.
+13. **`CopyRowsOut` bounds by capacity, not `Position()`.** Preservation after a rewind
+    asks for rows that are stable but outside the live frontier.
+14. **Gate assertions must prove the copy.** `cache_snapshot_bytes` is a *computed* size
+    and `cache=memory` can be served from the live session; assert `cache_restore_ms > 0`
+    and the exact captured byte count, or the gate passes without a restore.
 
 ---
 
@@ -297,3 +309,48 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
   (`/tmp/opencode/v2_8k.log`): `cache_snapshot_bytes` 822,684,216 B for a 5-token prefix
   (one full-capacity blob). With valid-rows-only components it should be ~0.5 MB and
   scale with the number of valid rows; `cached_tokens` on the second request must stay 5.
+
+### 2026-11-21 — Stage 2 implemented (adapter rewrite), gate green
+- Commit `c559211`. Layout as specified in §3: metadata 64 B, logits `vocab*4`,
+  K/V per layer with `row_bytes = num_kv*head_dim*2 = 1024`; 49 layers × 2 =
+  98 append-row components, so one token costs 100,352 B across all of them.
+- Measured (Q4_K_XL, 1223-token prompt, `gates/cache_reuse.py`):
+  - r1 `cache_snapshot_bytes = 123,331,136` = 1223 × 100352 + 600576 + 64 — exactly
+    the valid-row layout (all K/V components + logits + metadata); the old blob was
+    822,684,216 B at the same prompt.
+  - r2 (identical request): `cache=memory`, `cached_tokens=1223`, restore 2.9–3.1 ms
+    vs 177 ms for the old blob, answer bit-identical.
+  - r3 (multi-turn follow-up): `cached_tokens=1223`, non-empty answer, restore 3.1 ms.
+  - dflash2 run: same numbers (restore 4.1 ms), so the restore path survives
+    `ReconcileComponentState` + drafter-cycle reset. Serve still logs `draft_proposed=0`
+    (known counter gap in DEFERRED.md), so the run does not measure drafter throughput.
+- Gate-definition correction: the original r3 (same user turn, appended suffix) can never
+  hit a checkpoint — the adapter captures at request boundaries only. Recorded in
+  DEFERRED.md; r3 is now the multi-turn follow-up, which is the workload the plan targets.
+- Template finding: Flint's pinned chat template has no thinking switch, so the host's
+  thinking flags do not change the prompt; the gate forces `</think>` with
+  `reasoning_budget_tokens: 0` and compares `reasoning_content + content`. Recorded in
+  DEFERRED.md.
+
+### 2026-11-21 — Stage 2 review fixes (`e1d0f6f`)
+- **H1 (silent corruption path)**: `CopyRowsIn` had a hard-coded
+  `hipMemcpyHostToDevice`. With `BorrowRowsView` returning device memory, the host hands
+  that same span back when the source slot is live; on this APU it "works" via host
+  mapping and would corrupt on a discrete GPU. Now `hipMemcpyDefault`. This is exactly the
+  Stage 3 multi-session case — added as trap 11.
+- **H2**: `State::failed` is atomic (concurrent non-overlapping load pieces).
+- **H3/H4 (gate false-pass)**: `cache_snapshot_bytes` is a *computed* size and
+  `cache=memory` can be served from the live session, so the gate now requires
+  `cache_restore_ms > 0` and the exact r1 size
+  (`prompt_tokens*row_total + vocab*4 + 64`). r3 is only bounded: its capture is
+  chunk-shared (23,482,368 B = a 234-row tail after reusing 1024 rows).
+- Bounds/validation: `CopyRowsOut` bounded by `Capacity()` (preservation after a rewind),
+  `CreateSlot` asserts `Capacity() == context_`, `Validate` requires
+  `logits_valid == (position > 0)`, `As()` compares the adapter pointer, `KvRows()`
+  nullptr checks.
+- Spec-on leg relabelled: serve reports `draft_proposed=0` because counters are not copied
+  on the `SelectNext`/`Advance` path, so the leg proves cache reuse with speculation
+  loaded, not drafter throughput.
+- Re-verified by the orchestrator: `flint.engine_snapshot`, `flint.target_adapter`,
+  `flint.ops` pass; plain gate r2 `cached_tokens=1223`, restore 2.9 ms; spec-on gate
+  restore 4.1 ms; both PASSED.

@@ -3,8 +3,8 @@
 ## Current workstream
 
 **Continuation cache → per-layer `kAppendRows` components** (`docs/PLAN-KV-ROWS.md`).
-Stage 2 (adapter rewrite: descriptors, row hooks, guard, identity bump) IN PROGRESS.
-Stages 3–5 not started.
+Stage 2 (adapter rewrite) COMPLETE (`c559211`); review in flight before Stage 3.
+Stage 3 (disk cache + eviction stress) next.
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.

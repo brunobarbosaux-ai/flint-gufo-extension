@@ -25,3 +25,34 @@
 - **Structural fix (ours, pending)**: declare K/V as per-layer `kAppendRows` components (row hooks, `rows_per_chunk = 256`, `kPrivateState` only for small fixed state), as recommended in gufo#1317. Gains: captures copy only valid tokens, follow-up turns copy only new tokens (chunk sharing), many frontiers fit the cache, backing segments stay ~128 MiB instead of growing to the whole budget. Revisit the 8 GiB cap afterwards. Execution plan and stage status: `docs/PLAN-KV-ROWS.md`.
 - Load-only verification caveat: the 192k "verified" number was serve **startup**, never a long-context request.
 - Remaining upstream hygiene (separate from #1319): capture off the request thread; clean refusal instead of `std::bad_alloc`; non-zero default `stall_timeout`; timeouts on the unbounded waits.
+
+### Mid-prompt (partial-prefix) checkpoint reuse is not implemented
+- Measured during the KV-rows Stage 2 gate (2026-11-21): with a 1223-token prompt, an
+  identical second request reuses fully (`cached_tokens=1223`, restore 3-4 ms), but a
+  request whose prompt extends the first one *inside the same user turn* misses
+  (`cache_miss_reason=no_compatible_boundary`, `common_prefix_tokens=1221`,
+  `nearest_checkpoint_tokens=0`). Identical result on the 0.3.1 single-blob adapter, so
+  this is not a KV-rows regression.
+- Cause: Flint prefills the prompt in one unsplit pass and the adapter captures only at
+  request boundaries, so the only checkpoint is at the end of the first prompt; anything
+  shorter has nothing at or below its common prefix. The extension leaves
+  `Adapter::PrefillCheckpointPositions` unimplemented, and the host's boundary policy is
+  in Gufo (`component_text_cache.cpp`).
+- Effect: chat follow-ups reuse the full previous turn (the workload that matters), but
+  "user edited the tail of a long prompt" pays full prefill. Not a gate: the Stage 2 gate
+  tests the multi-turn follow-up instead.
+- Action if ever needed: implement `PrefillCheckpointPositions` (in-pass checkpoints at
+  the prefill chunk boundaries) and have the host capture them. Separate from the KV-rows
+  work; no partial-prefix claim should be made in docs until then.
+
+### Thinking cannot be disabled from the request (template has no switch)
+- Flint's pinned template has no `enable_thinking` conditional
+  (`tests/golden/chat_template.jinja`), and `src/chat_template.cpp` renders
+  `<|assistant|>` unconditionally (`(void)options`). The host's `--think`,
+  `thinking`, `chat_template_kwargs.enable_thinking` and `reasoning_effort` therefore do
+  not change the prompt for this extension; the model always decides.
+- Consequence for tests/tools: to get an immediate answer, set the host's reasoning
+  budget (`"reasoning_budget_tokens": 0`), which forces `</think>`. `gates/cache_reuse.py`
+  uses that and compares `reasoning_content + content`.
+- Not a bug against the pinned template; revisit only if the model gains a
+  non-thinking mode.

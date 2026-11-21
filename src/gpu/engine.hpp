@@ -111,6 +111,7 @@ public:
   // [position][num_kv * head_dim] of __half, token-major. The layout and the
   // buffers are stable for the session lifetime. A row is KvRowBytes() bytes.
 
+  /// Number of layers; the valid range for KvRows().
   [[nodiscard]] std::uint32_t NumLayers() const noexcept;
   /// Bytes of one token's K (or V) row in one layer: num_kv*head_dim*2.
   [[nodiscard]] std::size_t KvRowBytes() const noexcept;

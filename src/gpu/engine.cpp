@@ -1608,10 +1608,8 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     }
   }
   // The payload offset is not guaranteed to be float-aligned: copy the bytes.
-  std::vector<float> logits(c.vocab_size);
-  std::memcpy(logits.data(), at, std::size_t{c.vocab_size} * sizeof(float));
-  if (!SetLogits(logits, error_msg))
-    return false;
+  std::memcpy(impl_->h_logits, at, std::size_t{c.vocab_size} * sizeof(float));
+  impl_->logit_rows = 1;
   return RestoreRows(position, error_msg);
 }
 
@@ -1648,14 +1646,13 @@ bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
     return Fail(error_msg, "Flint: restore position exceeds the capacity");
   if (!Synchronize(error_msg))
     return false;
+  // State is assigned only after the device work has completed, so a failed
+  // restore leaves position and logits untouched.
   if (position == 0) {
-    // Logits are zeroed rather than left stale. logit_rows stays 1: Logits()
-    // indexes logit_rows - 1, so 0 would underflow.
-    std::memset(impl_->h_logits, 0, std::size_t{c.vocab_size} * sizeof(float));
-    impl_->logit_rows = 1;
-    impl_->position = 0;
     if (impl_->sparse) {
       for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+        if (c.IsSwa(il))
+          continue;
         if (hipMemsetAsync(impl_->kmm[il].get(), 0,
                            impl_->kmm[il].bytes(),
                            impl_->stream) != hipSuccess) {
@@ -1665,10 +1662,13 @@ bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
       if (!Synchronize(error_msg))
         return false;
     }
+    // Logits are zeroed rather than left stale. logit_rows stays 1: Logits()
+    // indexes logit_rows - 1, so 0 would underflow.
+    std::memset(impl_->h_logits, 0, std::size_t{c.vocab_size} * sizeof(float));
+    impl_->logit_rows = 1;
+    impl_->position = 0;
     return true;
   }
-  impl_->logit_rows = 1;
-  impl_->position = position;
   // The block-sparse key bounds are derived from the keys: rebuild them.
   if (impl_->sparse) {
     impl_->h_pos[0] = 0;
@@ -1686,6 +1686,8 @@ bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
     if (hipStreamSynchronize(impl_->stream) != hipSuccess)
       return Fail(error_msg, "Flint: key bound rebuild failed");
   }
+  impl_->logit_rows = 1;
+  impl_->position = position;
   return true;
 }
 

@@ -16,7 +16,7 @@ per-stage notes; keep this row set in sync.
 
 | Stage | Work | Status |
 |---|---|---|
-| 1 | Engine API (`NumLayers`/`KvRowBytes`/`KvRows`/`Synchronize`/`RestoreRows`/`SetLogits`/`SetRowWriteHook`) + `RestoreSnapshot` refactor + `flint.engine_snapshot` | IN PROGRESS |
+| 1 | Engine API (`NumLayers`/`KvRowBytes`/`KvRows`/`Synchronize`/`RestoreRows`/`SetLogits`/`SetRowWriteHook`) + `RestoreSnapshot` refactor + `flint.engine_snapshot` | **COMPLETE** (`e0577ff`, `feb7475`; all gates pass) |
 | 2 | Adapter descriptors + private components | NOT STARTED |
 | 3 | Row hooks + `MutationGuard` integration | NOT STARTED |
 | 4 | Identity bump + runner claim/position check | NOT STARTED |

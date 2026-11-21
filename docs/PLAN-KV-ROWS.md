@@ -62,6 +62,7 @@ follow-up turn copies only the new chunks; backing segments stay ~128 MiB.
 | D9 | Keep `SaveSnapshot`/`RestoreSnapshot` for tests; refactor `RestoreSnapshot` to call the new `RestoreRows` | One implementation of the sparse `kmm` rebuild (`engine.cpp:1594-1612`) — the trap that silently breaks sparse attention. |
 | D10 | Bump `state_abi` → `flint-rocm-session-v2`, `payload_layout` → `flint-kv-rows-v1` in Stage 4 | A v1 single-blob disk cache must not load into a v2 multi-component adapter. |
 | D11 | 8 GiB cap stays until §7 is answered by measurement | Cheap refusal guard; removal is a separate, measured change. |
+| D12 | `Reset()` is the canonical "empty for reuse"; `RestoreRows(0)` additionally zeroes logits and key bounds and exists only for restore paths | `Invalidate` uses `Reset()`; the two paths must not be confused (review finding, Stage 1). |
 
 ---
 
@@ -87,7 +88,7 @@ component and no capacity field — `context` bounds `valid_rows`.
 
 | Stage | Work | Status | Gate | Commit |
 |---|---|---|---|---|
-| **1** | Engine API: `NumLayers`, `KvRowBytes`, `KvRows`, `Synchronize`, `RestoreRows`, `SetLogits`, `SetRowWriteHook`; refactor `RestoreSnapshot` onto `RestoreRows`; new `flint.engine_snapshot` test | IN PROGRESS | `flint.ops`, `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter`, `flint.engine_snapshot`; spec-off/on smoke | — |
+| **1** | Engine API: `NumLayers`, `KvRowBytes`, `KvRows`, `Synchronize`, `RestoreRows`, `SetLogits`, `SetRowWriteHook`; refactor `RestoreSnapshot` onto `RestoreRows`; new `flint.engine_snapshot` test | **COMPLETE** | `flint.engine_snapshot` (both legs), `flint.ops`, `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter`; `--mode gx` 3/3 | `e0577ff` + review fixes `feb7475` |
 | **2** | Adapter descriptors + private components: metadata/logits capture/restore, `Positions`, `BeginRestore`, `Validate`, `Invalidate`; rows still throw | NOT STARTED | bit-exact logits after restore; prefix reuse | — |
 | **3** | Row hooks + guard: `CopyRowsOut`/`CopyRowsIn`/`BorrowRowsView`, engine row-write hook, `BeforeOverwrite`/`BeforeRelease`/`AfterReset` | NOT STARTED | K/V round-trip bit-exact; disk cache write/read; `flint_spec_gate --mode gx` | — |
 | **4** | Identity bump + runner: `flint-rocm-session-v2`, `flint-kv-rows-v1`, position check in `ReconcileComponentState`, cap decision by measurement | NOT STARTED | old cache rejected; new round-trip; `--mode memory`; 130k latency A/B | — |
@@ -118,11 +119,14 @@ Behaviour:
 
 - `KvRows`: bounds-check `layer < num_layers`; return `nullptr` when out of range. The
   non-const overload is the restore target.
-- `RestoreRows`: `position <= capacity`; `position == 0` resets position and clears
-  `logit_rows`; otherwise syncs the stream, replicates `RestoreSnapshot`'s steps
-  (`h_pos[0]=0` + 4-byte `pos` upload, `position`, `logit_rows=1`, `PoolKeyBlocks` over
-  `[0, position)` for non-SWA layers when `sparse`, final sync). Must not write
-  `h_logits`.
+- `RestoreRows`: `position <= capacity`; `position == 0` empties the session
+  (`h_logits` zeroed, `logit_rows` stays 1 — `Logits()` indexes `logit_rows - 1`, so 0
+  would underflow — and `kmm` cleared for non-SWA layers only, because SWA layers have no
+  `kmm` buffer). For `position > 0`: syncs the stream, replicates `RestoreSnapshot`'s
+  steps (`h_pos[0]=0` + 4-byte `pos` upload, `PoolKeyBlocks` over `[0, position)` for
+  non-SWA layers when `sparse`, final sync), and only then sets `position` and
+  `logit_rows = 1`, so a failed restore leaves the session untouched (D7). It must not
+  write `h_logits`.
 - `SetLogits`: require `row.size() == vocab_size`; `memcpy` into `h_logits`;
   `logit_rows = 1`.
 - `SetRowWriteHook`: invoked once in `Append`/`AppendAll`, after the capacity check and
@@ -131,12 +135,16 @@ Behaviour:
 - `RestoreSnapshot`: replace its tail (logits copy is separate) with `RestoreRows`; keep
   the payload header/version/size checks and the `position > 0` requirement.
 
-Test `flint.engine_snapshot` (GPU, skips with exit 0 without artifact/device, same
-pattern as `target_adapter_test`): append a prefix at `-c 512`; snapshot; append more;
-restore; assert position, logits bits, and that the next append is bit-identical to a
-fresh session that appended the same prefix. Repeat with `RestoreRows` + `SetLogits`
-directly (no snapshot) to prove the split path. Run once with sparse on and once off
-(`FLINT_SPARSE_ATTN`).
+Test `flint.engine_snapshot` as built (GPU, skips with exit 0 without artifact/device):
+one loaded model, two legs sharing it — dense at context 512/prefix 64, sparse at
+`FLINT_SPARSE_ATTN=1`/`FLINT_SPARSE_TOPK=1`, context 4096/prefix 2560 (past the
+2304-token sparse-engage threshold, asserted in the test). Per leg: snapshot round trip
+into a *dirty* session, split-path restore (`KvRows` copies + `RestoreRows` +
+`SetLogits`), `RestoreRows(0)`, single-call hook accounting, hook ordering (the row is still
+unwritten when the hook runs), and a multi-chunk 5000-token append reporting one call.
+Continuation is checked with a 16-token append before single-token decode: widths 1–8
+take the vector path and never read the key bounds, so only `n > 8` proves the `kmm`
+rebuild (verified against a mutant that skips it).
 
 ### Stage 2 — adapter descriptors (detail)
 
@@ -237,3 +245,23 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Docs corrected in `a9d87d9`: 192k was a load-only check; root cause is
   `ReserveBacking` O(n²) (their #1319), our cap is a mitigation.
 - #1319 status at the time: OPEN, MERGEABLE, BLOCKED on review (+39/−3, 2 files).
+
+### 2026-11-21 — Stage 1 COMPLETE (engine row API)
+- Commits: `e0577ff` (API + test) and `feb7475` (review fixes). Pushed to `main`.
+- Added: `NumLayers`, `KvRowBytes`, `KvRows` (const/non-const), `Synchronize`,
+  `RestoreRows`, `SetLogits`, `SetRowWriteHook`; `RestoreSnapshot` now runs on
+  `RestoreRows` + a direct logits memcpy. No adapter/runner/cap change.
+- Gates (orchestrator-run): `flint.engine_snapshot` 18.1 s both legs; `flint.ops`,
+  `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter` pass; `--mode gx`
+  3/3 byte-identical (Q6_K drafter, 128 tokens).
+- Review findings fixed: `RestoreRows(0)` no longer memsets SWA layers' null `kmm`;
+  `position`/`logit_rows` are assigned only after the device work succeeds;
+  `RestoreSnapshot` no longer allocates per restore; hook ordering and multi-chunk
+  coverage added.
+- Review finding that mattered most: the first sparse leg was inert (512 context, below
+  the 2304-token engage threshold), so a broken key-bound rebuild would have passed. The
+  leg now runs at 4096/2560 with top-k 1 and continues with a 16-token append, because
+  widths ≤ 8 take the vector path and never read `kmm`.
+- Known low-priority leftovers: one redundant sync in `RestoreSnapshot` (harmless), the
+  `KvRows` const overload returning a non-const pointer internally (public API correct),
+  and the pre-existing `AttnCore` unused-variable warning.

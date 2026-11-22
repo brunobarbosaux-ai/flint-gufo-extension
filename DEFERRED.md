@@ -56,3 +56,16 @@
   uses that and compares `reasoning_content + content`.
 - Not a bug against the pinned template; revisit only if the model gains a
   non-thinking mode.
+
+### Small RAM budgets retain nothing on the row cache (accounting note)
+- Measured (Stage 3, `--cache-ram-bytes 419430400`): the ledger sits at ~374 MB with a
+  123 MB checkpoint, so the backing reservation consumes nearly the whole budget and every
+  captured checkpoint is pruned before the next request. `cache_captures=1` on all seven
+  requests, ledger flat (no growth, no refused captures), and a repeat of the first prefix
+  is a miss. This is a valid capture/prune stress, not a retention test.
+- To exercise retention under pressure, use a budget of at least ~1.5 GiB (one checkpoint
+  plus backing). Revisit when the backing sizing is understood; the effective checkpoint
+  share of the budget is far below the nominal value.
+- `event=state_lending sheds=N` is emitted only when the resources' `set_shed` hook is
+  installed, which this path does not do; its absence is not a pin signal. Borrow health
+  is judged from the flat ledger plus continued captures.

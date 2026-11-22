@@ -3,8 +3,9 @@
 ## Current workstream
 
 **Continuation cache → per-layer `kAppendRows` components** (`docs/PLAN-KV-ROWS.md`).
-Stage 2 (adapter rewrite) COMPLETE (`c559211`); review in flight before Stage 3.
-Stage 3 (disk cache + eviction stress) next.
+Stage 2 (adapter rewrite) COMPLETE (`c559211`, review fixes `e1d0f6f`).
+Stage 3 (disk cache + eviction stress) COMPLETE (`b2893cc`, `4cc90dc`).
+Stage 4 next: position assertion + 130k cap A/B (#1319 merged, needs a disposable clone).
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.
@@ -35,6 +36,10 @@ Shipped and idle:
 
 ## Open questions
 
-- gufo#1319 (O(n²) `ReserveBacking` fix): OPEN, MERGEABLE, blocked on review.
-  When merged: rebuild and run the 130k A/B with the cap removed (PLAN-KV-ROWS §7 Q1).
-- gufo#1317: keep open until row components land; then post before/after numbers.
+- gufo#1319 (O(n²) `ReserveBacking` fix) **MERGED** 2026-11-21 (`93a1d230`), not in a
+  release yet (v0.35.0 predates it). The cap-removed 130k A/B is now runnable: build a
+  **disposable clone** of Gufo at our 0.3.27 reference plus `93a1d230` under `/tmp/opencode`
+  (never modify `/home/bruno/AI/Gufo-api03`), point `GUFO_EXTENSION_DIRS` at this repo,
+  and measure with the 8 GiB cap temporarily removed. Result decides PLAN-KV-ROWS §7 Q1.
+- gufo#1317: keep open until Stage 5 numbers are posted (before/after capture size,
+  restore time, follow-up-turn cost).

@@ -90,7 +90,7 @@ component and no capacity field — `context` bounds `valid_rows`.
 |---|---|---|---|---|
 | **1** | Engine API: `NumLayers`, `KvRowBytes`, `KvRows`, `Synchronize`, `RestoreRows`, `SetLogits`, `SetRowWriteHook`; refactor `RestoreSnapshot` onto `RestoreRows`; new `flint.engine_snapshot` test | **COMPLETE** | `flint.engine_snapshot` (both legs), `flint.ops`, `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter`; `--mode gx` 3/3 | `e0577ff` + review fixes `feb7475` |
 | **2** | Adapter rewrite: descriptors (metadata/logits private, K/V per layer as `kAppendRows`), private piece capture/restore, row hooks, `MutationGuard` integration, **identity bump** (`flint-rocm-session-v2`, `flint-kv-rows-v1`) | **COMPLETE** | in-process cache: r2 `cache=memory`, `cached_tokens=1223`, restore 2.9 ms, answer identical; exact captured bytes; spec-on leg passes | `c559211` + review fixes `e1d0f6f` |
-| **3** | Disk cache round trip + guard/eviction stress (multi-session, prune under a small budget) | NOT STARTED | disk write/read bit-identical; old v1 cache rejected; guard drains under eviction | — |
+| **3** | Disk cache round trip + guard/eviction stress (multi-session, prune under a small budget) | **COMPLETE** | restart `cache=disk` (1223 tok, 45 ms; 9001 tok, 244 ms), answers identical; identity mismatch → no reuse; 7/7 under 400 MiB with flat ledger | `b2893cc` (identity log) + `4cc90dc` (gate) |
 | **4** | Runner: position check in `ReconcileComponentState`, claim/cap decision by measurement | NOT STARTED | `--mode memory`; 130k latency A/B | — |
 | **5** | Long-context validation: 130k capture, follow-up turns, disk cache, spec on/off, sparse on/off | NOT STARTED | full suite + benchmark vs 0.3.1 baseline | — |
 
@@ -243,6 +243,16 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 14. **Gate assertions must prove the copy.** `cache_snapshot_bytes` is a *computed* size
     and `cache=memory` can be served from the live session; assert `cache_restore_ms > 0`
     and the exact captured byte count, or the gate passes without a restore.
+15. **`cache_snapshot_bytes` is a sum over captures, not one checkpoint.** The host adds
+    every published snapshot (`text_model_runner.cpp:590,777,814`). In-pass checkpoints are
+    prompt prefixes, so their chunks are shared and each extra capture adds only
+    `vocab*4 + 64` (logits + metadata). Exact form:
+    `rows*row_total + cache_captures*(vocab*4 + 64)`. Verified at 1223/7268/9001 tokens.
+16. **A follow-up turn captures at most one new chunk per component.** Its new bytes are
+    the tail remainder after the last 256-row boundary plus the private payload of each
+    capture: `r3 <= rows_per_chunk*row_total + captures*(vocab*4 + 64)`. A ratio-of-r1
+    bound is prompt-length dependent (2.4% at 8880 tokens looked fine but failed a 2%
+    rule); use the absolute chunk bound.
 
 ---
 
@@ -354,3 +364,27 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Re-verified by the orchestrator: `flint.engine_snapshot`, `flint.target_adapter`,
   `flint.ops` pass; plain gate r2 `cached_tokens=1223`, restore 2.9 ms; spec-on gate
   restore 4.1 ms; both PASSED.
+
+### 2026-11-21 — Stage 3 complete (disk cache + eviction)
+- Commits: `b2893cc` (one-line `event=cache_identity` diagnostic) and `4cc90dc` (gate).
+- Measured (`gates/cache_reuse.py`, Q4_K_XL):
+  - **Disk round trip across a restart**, 1223 tokens at 8k: restarted process
+    `cache=disk`, `cached_tokens=1223`, restore 37–46 ms, answer identical to the
+    capturing process. At 8880 tokens / 32k: `cache=disk`, `cached_tokens=8880`,
+    restore 235 ms, answer identical.
+  - **Capture-sum identity**: r1 `894,128,960 = 8880×100352 + 5×600,640` — exact at
+    1223 (1 capture), 7268 (4), 8880/9001 (5). `cache_snapshot_bytes` sums captures, and
+    extra in-pass captures cost only their private payload.
+  - **Follow-up bound**: r3 copies at most one tail chunk per component
+    (`≤ 256×row_total + captures×600,640` = 26,290,752 B); measured 21,774,912 B at
+    8880 tokens (211 tail rows) and 8,227,392 B at 9001.
+  - **Identity**: manifests store `SHA-256(identity)` only. Same dir with `-c 16384`
+    → `cache=miss`, full prefill, digest differs from the 8k dir while both manifests have
+    100 components. A v1 manifest additionally fails structural validation.
+  - **Eviction**, 400 MiB budget, 6 distinct prefixes + repeat: 7/7 status 200, all with
+    `cache_captures=1`, ledger flat at ~374 MB, clean exit. At this budget the backing
+    reservation leaves no checkpoint headroom, so nothing is retained (documented in
+    DEFERRED).
+- Correction recorded: a ratio-of-r1 bound for the follow-up capture is prompt-length
+  dependent (2.44% at 8880 tokens vs a 2% guess); replaced with the absolute chunk bound
+  (trap 16).

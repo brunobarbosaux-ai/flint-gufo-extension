@@ -5,10 +5,12 @@
 - The M5 memory gate criterion (hidden ring + drafter accounted in `ResourceClaim`) is met: the spec-on per-session claim grows 436 MiB over spec-off and the measured growth is exactly the 320 MiB hidden ring.
 - Action before release: audit `Session::Init` allocations against `SessionBytes` and add the missing terms. Evidence: `/tmp/opencode/m5-smoke/memory2.log`.
 
-### Serve startup hangs at 262144-token context (pre-existing, no speculation involved)
-- `gufo serve -c 262144` never completes the `sessions` load phase (11+ min, killed), with AND without `--speculative`. Blocked in KFD GPU memory allocation; GTT climbs past 55 GB while the session cap is 2. Verified boundary (2026-11-17): 196608 loads (~62 s), 262144 hangs; boundary between them not bisected.
-- Practical ceiling today: **196608 (192k)**. Documented in the README; the model's native 262144 remains unsupported at serve startup.
-- Action: audit the host session pre-allocation path (queue budget / `ResourceClaim`-driven sizing) at 256k; likely fix is capping pre-allocated sessions by free VRAM.
+### Serve at 262144-token context: loads, but only two sessions fit (capacity, not a hang)
+- History: on 2026-11-17 `gufo serve -c 262144` never completed the `sessions` load phase (11+ min, killed; blocked in KFD GPU allocation, GTT climbing past 55 GB, with AND without `--speculative`); 196608 loaded in ~62 s and the boundary was not bisected.
+- **That hang no longer reproduces** (2026-11-22, current 0.3.27 build with the row-component cache): 1 and 2 sessions at 262144 both reach `listening` in ~9 s, spec off. The original hang was never bisected, so the cause is not pinned; only the current behaviour is verified.
+- The remaining limit is device capacity, and the host refuses cleanly instead of hanging. A 262144-token session reserves 27,921,916,852 B (26.0 GiB) of request state, so a 4-session server fails at admission: "4 sessions at 262144-token context need 27921916852 bytes (26.0 GiB) each, but only 78597005312 bytes (73.2 GiB) of device memory is available; at most 2 sessions fit". The 73.2 GiB figure is the admission budget at that moment (free minus host reserve), not the device size; measured `gpu_device_used_mib` is 67.2 GiB for 1 session and 93.0 GiB for 2, of which ~25 GiB is weights and non-claim allocation outside the request-state reservation.
+- Not verified: **262144-token requests**. Long-context requests are exercised to 130k (Stage 4/5: dense, sparse, speculative, disk restart — `docs/PLAN-KV-ROWS.md`); a 262144 prefill has not been run through serve, so no throughput claim should be made at that depth.
+- With the ring-buffer PR (sebt3 `feat/ring-kv`, #5) the same box loads 2 sessions at 262144 using 43.6 GiB and **4 sessions using 61.5 GiB** (10 s). When it lands this item collapses to "four sessions at the native context".
 
 ### Serve draft counters report zero (root-caused 2026-11-18; not a logging bug)
 - Serve drives Flint via `SelectNext()`/`Advance()` (per PLAN-DFLASH2: sampler-history correctness), so the counter-copying `DecodeStep` hook (`runner.cpp:612`) is never called; `Descriptor().multi_token_decode` is false and the host's `StepDecode` path never reads `SpecCycle::stats()`.
@@ -23,7 +25,7 @@
 - Upstream root cause (Gufo maintainer, gufo-org/gufo#1317): `ResourceCharge::ReserveBacking` compared each backing block with every earlier one, so one 15.7 GB frontier (~240k blocks) made the first capture's allocation take ~20 s; fixed with a sort in gufo-org/gufo#1319 (12 ms). Our 0.3.1 cap is therefore a **mitigation, not the fix**.
 - Flint-side mitigation (`0.3.1`): the retained-snapshot capacity/ceiling claim is capped at 8 GiB, so a snapshot larger than the cap is refused cheaply instead of captured. Verified: 130k first request 0.47 s; 8k keeps prefix retention (`cached_tokens=8` on the second request).
 - **Structural fix (done, `docs/PLAN-KV-ROWS.md`)**: K/V are per-layer `kAppendRows` components (row hooks, `rows_per_chunk = 256`, `kPrivateState` only for small fixed state), as recommended in gufo#1317. Gains: captures copy only valid tokens, follow-up turns copy only new tokens (chunk sharing), many frontiers fit the cache (backing-segment sizing not separately measured). Execution plan and stage status: `docs/PLAN-KV-ROWS.md`; the 8 GiB cap is now a version guard (see below).
-- Load-only verification caveat: the 192k "verified" number was serve **startup**, never a long-context request.
+- Depth caveat: long-context requests are now exercised to **130k** (Stage 4/5: dense, block-sparse, speculative, disk restart — `docs/PLAN-KV-ROWS.md`), but 262144 is verified at serve **startup** only (see the 262144 item above), so no throughput claim exists at that depth.
 - Remaining upstream hygiene (separate from #1319): capture off the request thread; clean refusal instead of `std::bad_alloc`; non-zero default `stall_timeout`; timeouts on the unbounded waits.
 
 ### Mid-prompt (partial-prefix) checkpoint reuse is not implemented

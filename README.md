@@ -47,13 +47,19 @@ this repository only reads the format.
 
 ## Speculative decoding (DFlash2)
 
-**Context ceiling.** Verified serve startup: contexts up to **196608 (192k)
-load**; **262144 (256k) currently hangs in session setup** (pre-existing,
-unrelated to speculation — see `DEFERRED.md`). Advertise 192k until the
-higher ceiling is fixed.
+**Context ceiling.** Verified serve startup on 0.3.27: contexts up to
+**262144 (the model's native maximum) load**, with 1 and 2 sessions each in
+about 9 s. The 262144 hang in session setup reported on 2026-11-17 no longer
+reproduces. The remaining limit is device capacity, not a hang: a
+262144-token session reserves 26.0 GiB of request state, so with 73 GiB in the
+admission budget a 4-session server is **refused at admission** ("at most 2
+sessions fit at this context"); 2 sessions load and use 93 GiB of device
+memory, ~24 GiB of which is the weights. Advertise 2 sessions at 262144.
 
-Note that this is a **load** check: long-context *requests* were not exercised
-in that verification. The continuation cache now stores the K/V of each layer
+Note that this is a **load** check. Long-context *requests* were exercised to
+130k tokens (dense, block-sparse, speculative, and disk-restart restores); a
+262144-token prefill has not been run through serve, so no throughput claim is
+made at that depth. The continuation cache stores the K/V of each layer
 as append rows, so a capture copies only the valid tokens (123 MB instead of
 822 MB for a 1.2k-token prompt at any context) and a follow-up turn copies only
 the new tail (25 MB at 128,981 tokens); a warm restore is 2-25 ms from RAM and

@@ -13,7 +13,10 @@ supported Gufo contains #1319 (`93a1d230`); full GX battery at the 0.4.0 release
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.
-- 0.4.0 (tool calls + perf) — waits for sebt3's PR #3 rebase.
+- 0.4.0 (tool calls + perf) — waits for sebt3's ring PR (#5): four review items
+  outstanding, cross-fork test PR <https://github.com/sebt3/flint-gufo-extension/pull/1>
+  open against `feat/ring-kv`. Docs/ceiling corrected 2026-11-22: 262144 now loads
+  2 sessions; the remaining limit is capacity, not a hang (`DEFERRED.md`).
 
 ## Decisions in force
 

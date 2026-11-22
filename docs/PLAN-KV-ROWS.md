@@ -443,3 +443,13 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Stage 5 clearance means the #1317 before/after comment can be posted; the 8 GiB cap stays
   on the 0.3.x line (unreleased #1319), and the full 0/8k/32k/131k GX battery remains the
   0.4.0 release gate.
+
+### 2026-11-22 — long-context ceiling claim corrected
+- The README/DEFERRED claim "262144 hangs in session setup, advertise 192k" was stale. On
+  the current 0.3.27 build 1 and 2 sessions at 262144 load in ~9 s; 4 sessions are refused
+  at admission (26.0 GiB request state each, 73.2 GiB admission budget, "at most 2
+  sessions fit"). Measured `gpu_device_used_mib`: 67.2 GiB (1 session), 93.0 GiB (2).
+- 262144 *requests* remain unverified; long-context requests are exercised to 130k
+  (Stage 4/5). The old hang was never bisected, so no cause is attributed.
+- Ring branch (`feat/ring-kv`, #5, unmerged) on the same box: 2 sessions 43.6 GiB,
+  4 sessions 61.5 GiB, 10 s.

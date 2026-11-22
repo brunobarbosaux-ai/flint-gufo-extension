@@ -22,18 +22,49 @@ reasoning_content + content so equality still compares the whole output if a
 budget ever leaks reasoning. Content must be non-empty independently.
 The r3 assistant turn replays both fields, so the rendered prompt matches
 r1's cached prefix.
-  r1  cache_snapshot_bytes consistent with valid rows: between one token's
-      rows and prompt+completion tokens of per-layer K+V rows, plus one logits
-      row and the fixed metadata. Row bytes come from the target GGUF
-      (block_count, attention.head_count_kv, attention.key_length). If the GGUF
-      cannot be parsed, fall back to the weaker bound
+  r1  cache_snapshot_bytes is exact (Stage 3 derivation, verified on the logs):
+          cache_snapshot_bytes == prompt_tokens * row_total
+                                  + cache_captures * (vocab*4 + 64)
+      row_total = layers * 2 * kv_heads * head_dim * 2 (fp16 K+V per token,
+      from the target GGUF). The reported figure is a SUM over captures: each
+      in-pass checkpoint is a prefix of the prompt, so its row chunks are
+      shared with the final checkpoint; each additional capture adds only its
+      private payload (logits row + metadata). Missing cache_captures on the
+      completed line fails the check; it is never skipped.
+      The GGUF-unparseable fallback is the weak bound
       cache_snapshot_bytes < 0.25 * 822684216 (old single-blob size at 8k).
+
+  r3  (--max-r3-chunk-bytes) a follow-up turn's capture is bounded absolutely:
+          0 < r3 cache_snapshot_bytes
+            <= rows_per_chunk * row_total + r3 cache_captures * (vocab*4 + 64)
+      A follow-up reuses r1's checkpoint, so it copies only the new tail: at
+      most one new 256-row chunk per append component, plus each capture's
+      private payload (logits + metadata). The bound is prompt-length
+      independent; the share of a shorter prompt's tail (e.g. 211 rows of
+      8880 tokens) is well under it. The earlier ratio check was a guess, not
+      an invariant, and is removed.
 
 Why r3 is not a same-turn suffix: the adapter captures continuation state only
 at request boundaries (PrefillCheckpointPositions is not implemented), so a
 prompt extended inside the same user turn can never hit a checkpoint at or
 below its common prefix. Partial mid-prompt reuse needs PrefillCheckpointPositions
 (deferred). A multi-turn follow-up reuses r1's full prompt-end checkpoint.
+
+Stage 3 identity checks (disk cache; no text grep, no byte patch):
+  A1  the serve log has event=cache_identity with the expected state_abi and
+      payload_layout (--expect-identity).
+  A2  --foreign-context N: restart on the same disk dir with -c N and the same
+      prompt; require 200, no cache=disk, and context_tokens=N in the identity.
+  C1  --manifest-compare DIR_A DIR_B: manifests store only a 32-byte SHA-256
+      digest of the identity text, so the two dirs' digests must differ while
+      their component counts agree. Parsed from the manifest header
+      (GUFOMNF2 | version | checkpoint | lineage | digest | ...).
+  C2  the same run as A2 (a different identity does not reuse).
+  A manifest from a v1 build would also fail structural validation: one
+  private blob against 2 private + 98 append-row components. Identity
+  matching is checked first and is what C1+C2 prove. Byte-flipping a manifest
+  is not used: the trailing CRC rejects it before any identity compare, so
+  it proves checksum validation, not identity matching.
 
 Stdlib only. Exit 0 on success, 1 on any failed assertion.
 """
@@ -42,6 +73,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import struct
 import subprocess
@@ -51,7 +83,8 @@ import time
 import urllib.error
 import urllib.request
 
-OLD_BLOB_BYTES = 822684216  # Single-blob snapshot at -c 8192 (0.3.1 baseline).
+OLD_BLOB_BYTES = 822684216
+ROWS_PER_CHUNK = 256  # continuation_adapter.cpp kRowsPerChunk  # Single-blob snapshot at -c 8192 (0.3.1 baseline).
 PARAGRAPH = (
     "The river bent slowly past the old mill, carrying leaves and small "
     "branches toward the sea. Along its banks, reeds swayed in the wind while "
@@ -148,13 +181,16 @@ def read_gguf_geometry(path):
 # ------------------------------------------------------------- server -------
 
 class Server:
-    def __init__(self, args, log_path):
+    def __init__(self, args, log_path, disk_dir=None):
         cmd = [args.gufo, "serve", "llm", "-m", args.target, "-c",
                str(args.context), "--cache-ram-bytes", str(args.cache_bytes),
                # No --think flag: the pinned template has no thinking switch,
                # so it has no effect here. Reasoning is bounded per request
                # with reasoning_budget_tokens=0 instead.
                "-t", "0", "-s", "1", "--log-progress", "-p", str(args.port)]
+        if disk_dir:
+            cmd += ["--cache-disk", disk_dir,
+                    "--cache-disk-bytes", str(args.cache_disk_bytes)]
         if args.dflash_model:
             cmd += ["--speculative", "dflash2", "--dflash-model",
                     args.dflash_model]
@@ -182,6 +218,10 @@ class Server:
         with self.lock:
             return any(needle in line for line in self.lines)
 
+    def lines_with(self, needle):
+        with self.lock:
+            return [line for line in self.lines if needle in line]
+
     def completed_lines(self):
         with self.lock:
             return [l for l in self.lines
@@ -203,6 +243,7 @@ class Server:
                 self.proc.wait()
         self.reader.join(timeout=10)
         self.file.close()
+        return self.proc.returncode
 
 
 def wait_ready(server, timeout):
@@ -277,6 +318,118 @@ def check(ok, message, failures):
         failures.append(message)
 
 
+# ------------------------------------------------------------ helpers -------
+
+def long_prompt(chars, head=""):
+    body = (PARAGRAPH * (chars // len(PARAGRAPH) + 1))[:chars]
+    return head + body + QUESTION
+
+
+def ledger_of(line):
+    match = re.search(r"cache_global_ledger_bytes=([0-9]+)", line)
+    return int(match.group(1)) if match else None
+
+
+def captures_of(line):
+    match = re.search(r"cache_captures=([0-9]+)", line)
+    return int(match.group(1)) if match else None
+
+
+def stop_server(server, label):
+    rc = server.stop()
+    print(f"{label}: gufo exit code {rc}")
+    return rc
+
+
+def identity_line(server):
+    lines = server.lines_with("event=cache_identity")
+    return lines[-1].strip() if lines else ""
+
+
+def field(line, name):
+    match = re.search(r"\b%s=(\S+)" % re.escape(name), line)
+    return match.group(1) if match else None
+
+
+def run_request(server, port, model, name, messages, max_tokens, results):
+    status, payload = chat(port, model, messages, max_tokens)
+    usage = usage_of(payload)
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    gufo = usage.get("gufo") or {}
+    message = message_of(payload)
+    results[name] = {
+        "status": status,
+        "message": message,
+        "content": message.get("content") or "",
+        "answer": answer_of(message),
+        "cached": cached,
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "snapshot": gufo.get("cache_snapshot_bytes"),
+        "restore_ms": gufo.get("cache_restore_ms"),
+    }
+    res = results[name]
+    print(f"{name}: status={status} prompt_tokens={res['prompt_tokens']} "
+          f"cached_tokens={cached} cache_snapshot_bytes={res['snapshot']} "
+          f"cache_restore_ms={res['restore_ms']}")
+    print(f"{name} content={res['content'][:120]!r} "
+          f"reasoning_len={len(message.get('reasoning_content') or '')}")
+    if status != 200 or not res["content"]:
+        print(f"{name} raw payload: {str(payload)[:1500]}")
+    return res
+
+
+def completed_chat(server, index, timeout=10.0):
+    """The index-th (0-based) chat-completion completed line on this server.
+
+    Serve's request=<id> is its own counter (r1 = /v1/models, r2 = first chat),
+    not the gate's name, so chat completions are selected by order. The
+    completed line is written after the HTTP response is sent, so poll until
+    the line appears rather than reading once.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        chats = [l for l in server.completed_lines()
+                 if "path=/v1/chat/completions" in l]
+        if index < len(chats):
+            return chats[index]
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.1)
+
+
+# ------------------------------------------------------ manifest parsing -----
+
+MANIFEST_MAGIC = b"GUFOMNF2"
+
+
+def read_manifests(root):
+    """Parse each manifest header: (path, digest, component_count).
+
+    Layout (src/cache/disk.cpp EncodeManifest): magic(8) version(4)
+    checkpoint(8) lineage(8) compatibility(32, raw) purpose(1) rank(4)
+    input_len(4) input(n) token_count(4) tokens(4 each) component_count(4).
+    The trailing 8-byte checksum is not validated here.
+    """
+    found = []
+    for dirpath, _, files in os.walk(os.path.join(root, "v2", "manifests")):
+        for name in files:
+            path = os.path.join(dirpath, name)
+            with open(path, "rb") as fh:
+                data = fh.read()
+            if data[:8] != MANIFEST_MAGIC:
+                continue
+            digest = data[28:60]
+            pos = 60 + 1 + 4  # compatibility end, purpose(1), rank(4)
+            input_len = struct.unpack_from("<I", data, pos)[0]
+            pos += 4 + input_len
+            token_count = struct.unpack_from("<I", data, pos)[0]
+            pos += 4 + 4 * token_count
+            components = struct.unpack_from("<I", data, pos)[0]
+            found.append((path, digest, components))
+    return found
+
+
 # --------------------------------------------------------------- main -------
 
 def main():
@@ -287,11 +440,47 @@ def main():
     ap.add_argument("--dflash-model")
     ap.add_argument("--port", type=int, default=8094)
     ap.add_argument("--context", type=int, default=8192)
-    ap.add_argument("--cache-bytes", type=int, default=8589934592)
+    ap.add_argument("--cache-bytes", "--ram-bytes", dest="cache_bytes",
+                    type=int, default=8589934592,
+                    help="--cache-ram-bytes value (alias --ram-bytes)")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--prompt-chars", type=int, default=6000)
     ap.add_argument("--keep-log")
+    # Stage 3 additions. Each is opt-in; without them the script is unchanged.
+    ap.add_argument("--cache-disk", metavar="DIR",
+                    help="enable the disk continuation cache in DIR")
+    ap.add_argument("--cache-disk-bytes", type=int, default=8589934592)
+    ap.add_argument("--restart", action="store_true",
+                    help="capture in one process, SIGTERM, reuse in a fresh "
+                         "process on the same --cache-disk (requires it)")
+    ap.add_argument("--stress", type=int, metavar="N",
+                    help="N distinct long prefixes, then a repeat of #1; "
+                         "disk cache off")
+    ap.add_argument("--expect-identity", metavar="STATE_ABI:LAYOUT",
+                    help="require the event=cache_identity line to carry "
+                         "these state_abi and payload_layout values")
+    ap.add_argument("--foreign-context", type=int, metavar="N",
+                    help="A2/C2: restart on --cache-disk with -c N and the "
+                         "same prompt; require 200, no cache=disk, and a "
+                         "different context_tokens in the identity line")
+    ap.add_argument("--manifest-compare", nargs=2, metavar=("DIR_A", "DIR_B"),
+                    help="C1: require the two dirs' manifest digests to "
+                         "differ with equal component counts")
+    ap.add_argument("--min-r2-cached", type=int, default=0,
+                    help="require r2 cached_tokens >= N (deep-prompt runs)")
+    ap.add_argument("--min-r3-cached", type=int, default=0,
+                    help="require r3 cached_tokens >= N (deep-prompt runs)")
+    ap.add_argument("--max-r3-chunk-bytes", action="store_true",
+                    help="require 0 < r3 capture <= rows_per_chunk * row_total "
+                         "+ r3 cache_captures * (vocab*4 + 64) (follow-up turn "
+                         "appends at most one new chunk per component)")
     args = ap.parse_args()
+    if args.restart and not args.cache_disk:
+        ap.error("--restart requires --cache-disk")
+    if args.stress and args.cache_disk:
+        ap.error("--stress runs with the disk cache off")
+    if args.foreign_context and not args.cache_disk:
+        ap.error("--foreign-context requires --cache-disk")
 
     log_path = args.keep_log or os.path.join(
         "/tmp/opencode", "cache_reuse_%d.log" % int(time.time()))
@@ -300,6 +489,18 @@ def main():
            if args.dflash_model else "spec off")
     print(f"leg: {leg}")
     print(f"serve log: {log_path}")
+
+    failures = []
+    if args.manifest_compare:
+        return manifest_compare(args, failures)
+    if args.stress:
+        return stress(args, log_path, failures)
+    if args.foreign_context:
+        return foreign_context(args, log_path, failures)
+    return reuse_run(args, log_path, failures)
+
+
+def reuse_run(args, log_path, failures):
     geometry = read_gguf_geometry(args.target)
     if geometry is None:
         print("note: GGUF geometry unreadable; using the weak snapshot bound")
@@ -307,66 +508,59 @@ def main():
         print("gguf geometry: layers=%d kv_heads=%s head_dim=%d vocab=%d"
               % (geometry[0], geometry[1], geometry[2], geometry[3]))
 
-    server = Server(args, log_path)
-    failures = []
     results = {}
+    server = Server(args, log_path, args.cache_disk)
     try:
         wait_ready(server, 300)
         model = served_model(args.port)
         print(f"served model: {model}")
-
-        prompt = (PARAGRAPH * (args.prompt_chars // len(PARAGRAPH) + 1))
-        prompt = prompt[:args.prompt_chars] + QUESTION
-        user = {"role": "user", "content": prompt}
-
-        def run(name, messages):
-            status, payload = chat(args.port, model, messages, args.max_tokens)
-            usage = usage_of(payload)
-            cached = (usage.get("prompt_tokens_details") or {}).get(
-                "cached_tokens", 0)
-            gufo = usage.get("gufo") or {}
-            message = message_of(payload)
-            results[name] = {
-                "status": status,
-                "message": message,
-                "content": message.get("content") or "",
-                "answer": answer_of(message),
-                "cached": cached,
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "snapshot": gufo.get("cache_snapshot_bytes"),
-                "restore_ms": gufo.get("cache_restore_ms"),
-            }
-            print(f"{name}: status={status} prompt_tokens="
-                  f"{results[name]['prompt_tokens']} cached_tokens={cached} "
-                  f"cache_snapshot_bytes={results[name]['snapshot']} "
-                  f"cache_restore_ms={results[name]['restore_ms']}")
-            print(f"{name} content={results[name]['content'][:120]!r} "
-                  f"reasoning_len={len(message.get('reasoning_content') or '')}")
-            if status != 200 or not results[name]["content"]:
-                print(f"{name} raw payload: {str(payload)[:1500]}")
-
-        run("r1", [user])
-        run("r2", [user])
+        user = {"role": "user", "content": long_prompt(args.prompt_chars)}
+        run_request(server, args.port, model, "r1", [user], args.max_tokens,
+                    results)
+        # Read r1's completed line now: after a restart it lives in the
+        # phase-1 log, which the restarted server does not hold.
+        results["r1"]["line"] = completed_chat(server, 0)
+        r2_source = "memory"
+        if args.restart:
+            # Phase 1 ends here: the capture is on disk; stop cleanly.
+            rc = stop_server(server, "phase1")
+            check(rc == 0, f"phase 1 clean shutdown (exit {rc})", failures)
+            server = Server(args, log_path + ".phase2.log", args.cache_disk)
+            wait_ready(server, 300)
+            model = served_model(args.port)
+            r2_source = "disk"
+        ident = identity_line(server)
+        print("identity: " + ident)
+        if args.expect_identity:
+            abi, layout = args.expect_identity.split(":", 1)
+            check(field(ident, "state_abi") == abi
+                  and field(ident, "payload_layout") == layout,
+                  f"A1 identity line reports state_abi={abi} "
+                  f"payload_layout={layout}", failures)
+        run_request(server, args.port, model, "r2", [user], args.max_tokens,
+                    results)
         r1 = results["r1"]
         # Replay both fields so the rendered prefix equals r1's cached prompt
         # plus its generated tokens.
         assistant = {"role": "assistant", "content": r1["content"]}
         if r1["message"].get("reasoning_content"):
             assistant["reasoning_content"] = r1["message"]["reasoning_content"]
-        run("r3", [user, assistant, {"role": "user", "content": FOLLOWUP}])
+        run_request(server, args.port, model, "r3",
+                    [user, assistant, {"role": "user", "content": FOLLOWUP}],
+                    args.max_tokens, results)
         r2, r3 = results["r2"], results["r3"]
         for name, res in results.items():
             check(res["status"] == 200, f"{name} status 200", failures)
-        # Completion lines are ordered r1, r2, r3; r2 is the second-to-last
-        # of the three (the only completions this script issues).
-        completed = server.completed_lines()
-        r2_line = completed[-2] if len(completed) >= 2 else ""
+        r2_line = completed_chat(server, 0 if args.restart else 1)
         print("r2 completed: " + r2_line.strip())
-        check("cache=memory" in r2_line,
-              "r2 request-completed line reports cache=memory", failures)
+        check(bool(r2_line) and f"cache={r2_source}" in r2_line,
+              f"r2 request-completed line reports cache={r2_source}", failures)
         check(r2["cached"] > 0, f"r2 cached_tokens > 0 (got {r2['cached']})",
               failures)
+        if args.min_r2_cached:
+            check(r2["cached"] >= args.min_r2_cached,
+                  f"r2 cached_tokens {r2['cached']} >= {args.min_r2_cached}",
+                  failures)
         # cache=memory and cached_tokens>0 also hold when r2 is served from the
         # live session without a restore, so require a measured restore.
         r2_restore = parse_restore_ms(r2_line)
@@ -383,10 +577,17 @@ def main():
               f"r3 cached_tokens {r3['cached']} >= 0.5 * r1 prompt tokens",
               failures)
         check(bool(r3["content"]), "r3 content non-empty", failures)
-        r3_line = completed[-1] if completed else ""
+        r3_line = completed_chat(server, 1 if args.restart else 2)
         print("r3 completed: " + r3_line.strip())
-        check("cache=memory" in r3_line,
-              "r3 request-completed line reports cache=memory", failures)
+        # After a disk restore r3 may be served from the restored session
+        # (memory) or from a disk checkpoint; either is a real reuse.
+        check(bool(r3_line) and ("cache=memory" in r3_line
+                                 or "cache=disk" in r3_line),
+              "r3 request-completed line reports a cache hit", failures)
+        if args.min_r3_cached:
+            check(r3["cached"] >= args.min_r3_cached,
+                  f"r3 cached_tokens {r3['cached']} >= {args.min_r3_cached}",
+                  failures)
 
         snap = r1["snapshot"]
         if not snap:
@@ -395,15 +596,25 @@ def main():
             layers, kv, head_dim, vocab = geometry
             # Per token: every layer's K and V row, fp16 (num_kv*head_dim*2 each).
             row_total = layers * 2 * kv * head_dim * 2
-            expected = r1["prompt_tokens"] * row_total + vocab * 4 + 64
-            print(f"r1 snapshot expected exactly {expected} B "
-                  f"(prompt_tokens*{row_total} + vocab*4 + 64)")
-            check(snap == expected,
-                  f"r1 cache_snapshot_bytes {snap} == expected {expected}",
-                  failures)
-            check(snap < 0.25 * OLD_BLOB_BYTES,
-                  f"r1 cache_snapshot_bytes {snap} far below old blob",
-                  failures)
+            captures = captures_of(r1.get("line", ""))
+            if captures is None:
+                check(False, "r1 completed line reports cache_captures "
+                      "(needed for the capture-sum size check)", failures)
+            else:
+                expected = (r1["prompt_tokens"] * row_total
+                            + captures * (vocab * 4 + 64))
+                print(f"r1 snapshot expected exactly {expected} B = "
+                      f"prompt_tokens*{row_total} + cache_captures={captures}"
+                      f"*(vocab*4 + 64)")
+                check(snap == expected,
+                      f"r1 cache_snapshot_bytes {snap} == capture-sum "
+                      f"expected {expected}", failures)
+            # OLD_BLOB_BYTES was measured at -c 8192 with a 1223-token prompt;
+            # it is not a bound for other contexts or prompt sizes.
+            if args.context == 8192 and args.prompt_chars <= 6000:
+                check(snap < 0.25 * OLD_BLOB_BYTES,
+                      f"r1 cache_snapshot_bytes {snap} far below old blob",
+                      failures)
             # r3's capture is chunk-shared (a tail of the 256-row chunk), so it
             # is not an exact function of its prompt; only bound it.
             r3_snap = r3["snapshot"]
@@ -411,6 +622,21 @@ def main():
             check(bool(r3_snap) and 0 < r3_snap < snap,
                   f"r3 cache_snapshot_bytes {r3_snap} in (0, r1 snapshot)",
                   failures)
+            if args.max_r3_chunk_bytes:
+                r3_captures = captures_of(r3_line)
+                if r3_captures is None or not r3_snap:
+                    check(False, "r3 completed line reports cache_captures and "
+                          "cache_snapshot_bytes (needed for the chunk bound)",
+                          failures)
+                else:
+                    bound = (ROWS_PER_CHUNK * row_total
+                             + r3_captures * (vocab * 4 + 64))
+                    print(f"r3 bound = {ROWS_PER_CHUNK}*{row_total} + "
+                          f"{r3_captures}*(vocab*4+64) = {bound}; "
+                          f"r3 capture {r3_snap}")
+                    check(r3_snap <= bound,
+                          f"r3 cache_snapshot_bytes {r3_snap} <= one-chunk "
+                          f"bound {bound}", failures)
         else:
             bound = 0.25 * OLD_BLOB_BYTES
             check(snap < bound,
@@ -420,21 +646,137 @@ def main():
         print(f"setup failure: {err}", file=sys.stderr)
         failures.append(str(err))
     finally:
-        server.stop()
-        print("summary:")
-        for name in ("r1", "r2", "r3"):
-            if name in results:
-                res = results[name]
-                print(f"  {name} status={res['status']} "
-                      f"cached_tokens={res['cached']} "
-                      f"cache_snapshot_bytes={res['snapshot']} "
-                      f"cache_restore_ms={res['restore_ms']}")
+        rc = stop_server(server, "final")
+        check(rc == 0, f"clean shutdown (exit {rc})", failures)
         print(f"serve log: {log_path}")
+    return finish(failures)
 
+
+def finish(failures):
     if failures:
         print(f"FAILED ({len(failures)} assertion(s))")
         sys.exit(1)
     print("PASSED")
+
+
+def foreign_context(args, log_path, failures):
+    """A2/C2: same disk dir, different -c. The identity digest changes, so the
+    cache must not match. Dir is first captured at args.context."""
+    results = {}
+    server = Server(args, log_path, args.cache_disk)
+    try:
+        wait_ready(server, 300)
+        model = served_model(args.port)
+        user = {"role": "user", "content": long_prompt(args.prompt_chars)}
+        run_request(server, args.port, model, "seed", [user], args.max_tokens,
+                    results)
+    except RuntimeError as err:
+        failures.append(str(err))
+    finally:
+        check(stop_server(server, "seed") == 0, "seed clean shutdown",
+              failures)
+    expected_ctx = args.foreign_context
+    args.context = expected_ctx
+    server = Server(args, log_path + ".foreign.log", args.cache_disk)
+    try:
+        wait_ready(server, 300)
+        model = served_model(args.port)
+        ident = identity_line(server)
+        print("foreign identity: " + ident)
+        check(field(ident, "context_tokens") == str(expected_ctx),
+              f"A2 identity line reports context_tokens={expected_ctx}", failures)
+        res = run_request(server, args.port, model, "foreign", [user],
+                          args.max_tokens, results)
+        line = completed_chat(server, 0)
+        print("foreign completed: " + line.strip())
+        check(res["status"] == 200, "A2 foreign request status 200", failures)
+        check(bool(line), "A2 foreign request-completed line present", failures)
+        check("cache=disk" not in line,
+              "A2 foreign context does not reuse the disk cache", failures)
+    except RuntimeError as err:
+        failures.append(str(err))
+    finally:
+        rc = stop_server(server, "foreign")
+        check(rc == 0, f"A2 clean shutdown (exit {rc})", failures)
+        print(f"serve log: {log_path}.foreign.log")
+    finish(failures)
+
+
+def manifest_compare(args, failures):
+    """C1: two dirs captured with different -c. The digests must differ while
+    the component counts agree, so the difference is the identity alone."""
+    a_dir, b_dir = args.manifest_compare
+    a = read_manifests(a_dir)
+    b = read_manifests(b_dir)
+    print(f"{a_dir}: {len(a)} manifest(s); {b_dir}: {len(b)} manifest(s)")
+    check(bool(a) and bool(b), "both dirs contain v2 manifests", failures)
+    if a and b:
+        da = {d for _, d, _ in a}
+        db = {d for _, d, _ in b}
+        ca = sorted({c for _, _, c in a})
+        cb = sorted({c for _, _, c in b})
+        print("digest A: " + ", ".join(x.hex() for x in sorted(da)))
+        print("digest B: " + ", ".join(x.hex() for x in sorted(db)))
+        print(f"component counts A={ca} B={cb}")
+        check(da.isdisjoint(db),
+              "C1 compatibility digest differs between the two identities",
+              failures)
+        check(ca == cb and len(ca) == 1,
+              "C1 component counts identical across the two dirs", failures)
+    finish(failures)
+
+
+def stress(args, log_path, failures):
+    """Distinct long prefixes under a small RAM budget, then a repeat of #1.
+
+    Pass criteria (per the Stage 3 plan): every request 200 with a non-empty
+    answer; at least 3 of the 7 report cache_captures >= 1 (pruning must not
+    wedge captures); clean shutdown. No event=state_lending assertion: that
+    line needs the set_shed hook, which this path does not install.
+    The ledger is printed per request, not bounded: it includes host backing
+    reservations, not just checkpoints.
+    """
+    server = Server(args, log_path)
+    results = {}
+    captured = 0
+    total = 0
+    try:
+        wait_ready(server, 300)
+        model = served_model(args.port)
+        prompts = [long_prompt(args.prompt_chars, head=f"Document {i}. ")
+                   for i in range(1, args.stress + 1)]
+        sequence = [("p%d" % i, p) for i, p in enumerate(prompts, 1)]
+        sequence.append(("p1-repeat", prompts[0]))
+        for index, (name, prompt) in enumerate(sequence):
+            user = {"role": "user", "content": prompt}
+            res = run_request(server, args.port, model, name, [user],
+                              args.max_tokens, results)
+            total += 1
+            check(res["status"] == 200 and bool(res["content"]),
+                  f"{name} status 200 with non-empty answer", failures)
+            line = completed_chat(server, index)
+            captures = captures_of(line)
+            if captures is not None and captures >= 1:
+                captured += 1
+            print(f"{name} ledger={ledger_of(line)} captures={captures} "
+                  f"cache={field(line, 'cache')} "
+                  f"cache_reuse={field(line, 'cache_reuse')}")
+        check(captured >= 3,
+              f"at least 3 of {total} requests report cache_captures >= 1 "
+              f"(got {captured})", failures)
+        # event=state_lending is logged only when the resources' set_shed
+        # hook is installed (component_text_cache.cpp, cache Impl destructor).
+        # That hook is not installed on this RAM-only path, so its absence
+        # proves nothing and is not asserted. The ledger series is the
+        # evidence here instead.
+    except RuntimeError as err:
+        print(f"setup failure: {err}", file=sys.stderr)
+        failures.append(str(err))
+    finally:
+        rc = stop_server(server, "stress")
+        check(rc == 0, f"clean shutdown (exit {rc})", failures)
+        print(f"serve log: {log_path}")
+    finish(failures)
 
 
 if __name__ == "__main__":

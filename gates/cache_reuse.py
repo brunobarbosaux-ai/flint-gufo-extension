@@ -34,15 +34,23 @@ r1's cached prefix.
       The GGUF-unparseable fallback is the weak bound
       cache_snapshot_bytes < 0.25 * 822684216 (old single-blob size at 8k).
 
-  r3  (--max-r3-chunk-bytes) a follow-up turn's capture is bounded absolutely:
-          0 < r3 cache_snapshot_bytes
-            <= rows_per_chunk * row_total + r3 cache_captures * (vocab*4 + 64)
-      A follow-up reuses r1's checkpoint, so it copies only the new tail: at
-      most one new 256-row chunk per append component, plus each capture's
-      private payload (logits + metadata). The bound is prompt-length
-      independent; the share of a shorter prompt's tail (e.g. 211 rows of
-      8880 tokens) is well under it. The earlier ratio check was a guess, not
-      an invariant, and is removed.
+  r3  (--max-r3-chunk-bytes) a follow-up turn's capture is an exact function
+      of the token counts (no equality is assumed beyond the derivation below):
+          tail = r1_prompt_tokens % rows_per_chunk
+          new  = r3_prompt_tokens - r1_prompt_tokens
+          rows = tail + new
+          r3 cache_snapshot_bytes == rows * row_total
+                                     + r3 cache_captures * (vocab*4 + 64)
+      Derivation: shareable chunks from r1 are [0, r1 - r1 % 256). The r1
+      partial tail chunk is stored as a tail payload, not a shareable chunk,
+      so the follow-up capture rewrites everything from that chunk boundary
+      onward, i.e. the tail plus the new tokens. Each capture adds its
+      private payload (logits + metadata). An earlier bound of
+      256 * row_total + captures * private only holds when tail + new <= 256,
+      which is prompt-length dependent; it is replaced, not loosened.
+      Verified on logs: A/B/C/D 238 + 35 = 273 rows; E 213 + 35 = 248 rows.
+      r3 must produce exactly one capture (all runs do); any other count fails
+      as a changed request shape rather than falling back to a loose bound.
 
 Why r3 is not a same-turn suffix: the adapter captures continuation state only
 at request boundaries (PrefillCheckpointPositions is not implemented), so a
@@ -625,6 +633,7 @@ def reuse_run(args, log_path, failures):
             # r3's capture is chunk-shared (a tail of the 256-row chunk), so it
             # is not an exact function of its prompt; only bound it.
             r3_snap = r3["snapshot"]
+            r1_tokens = r1["prompt_tokens"]
             print(f"r3 cache_snapshot_bytes = {r3_snap}")
             check(bool(r3_snap) and 0 < r3_snap < snap,
                   f"r3 cache_snapshot_bytes {r3_snap} in (0, r1 snapshot)",
@@ -635,15 +644,22 @@ def reuse_run(args, log_path, failures):
                     check(False, "r3 completed line reports cache_captures and "
                           "cache_snapshot_bytes (needed for the chunk bound)",
                           failures)
+                elif r3_captures != 1:
+                    check(False, f"r3 cache_captures={r3_captures}, expected 1: "
+                          "the request shape changed (follow-up turn is no "
+                          "longer one capture); the exact r3 bound does not "
+                          "apply", failures)
                 else:
-                    bound = (ROWS_PER_CHUNK * row_total
-                             + r3_captures * (vocab * 4 + 64))
-                    print(f"r3 bound = {ROWS_PER_CHUNK}*{row_total} + "
-                          f"{r3_captures}*(vocab*4+64) = {bound}; "
-                          f"r3 capture {r3_snap}")
-                    check(r3_snap <= bound,
-                          f"r3 cache_snapshot_bytes {r3_snap} <= one-chunk "
-                          f"bound {bound}", failures)
+                    tail = r1_tokens % ROWS_PER_CHUNK
+                    new = r3["prompt_tokens"] - r1_tokens
+                    rows = tail + new
+                    expected_r3 = rows * row_total + 1 * (vocab * 4 + 64)
+                    print(f"r3 exact = (r1 % 256 = {tail} + new {new}) = "
+                          f"{rows} rows * {row_total} + 1*(vocab*4+64) = "
+                          f"{expected_r3}; r3 capture {r3_snap}")
+                    check(r3_snap == expected_r3,
+                          f"r3 cache_snapshot_bytes {r3_snap} == exact "
+                          f"derived {expected_r3}", failures)
         else:
             bound = 0.25 * OLD_BLOB_BYTES
             check(snap < bound,

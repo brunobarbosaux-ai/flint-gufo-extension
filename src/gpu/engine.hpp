@@ -30,6 +30,19 @@ public:
   [[nodiscard]] bool Append(std::span<const std::int32_t> tokens,
                             std::string* error_msg);
 
+  /// Append for prompt tokens: every pass runs the prefill kernels, whatever
+  /// its width, so the K/V rows and the final logits are the same however a
+  /// prompt is split into calls, provided each call starts on an even row
+  /// (the attention kernel pairs rows from the pass start). Decode and draft
+  /// verification use Append/AppendAll, whose narrow widths take the vector
+  /// kernels.
+  [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens,
+                             std::string* error_msg);
+  /// Prefill calls must start on a multiple of this to give the same rows as
+  /// one call: the prefill attention kernel computes rows in pairs counted
+  /// from the call's first row, and a row's last bit depends on its partner.
+  static constexpr std::uint32_t kPrefillRowAlignment = 2;
+
   /// Appends 1..kMaxVerifyRows tokens and keeps the logits of every row:
   /// row i is the distribution after tokens[i]. Used to verify drafts.
   [[nodiscard]] bool AppendAll(std::span<const std::int32_t> tokens,

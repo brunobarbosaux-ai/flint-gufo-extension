@@ -304,6 +304,8 @@ struct AttentionShape {
   std::uint32_t heads;
   std::uint32_t kv_heads;
   std::uint32_t head_dim;
+  // First row injected since the context restarted at a frontier.
+  std::uint32_t history_begin = 0;
 };
 
 void AttentionReference(const AttentionShape& shape,
@@ -316,9 +318,10 @@ void AttentionReference(const AttentionShape& shape,
   const auto q_dim = shape.heads * shape.head_dim;
   const auto kv_dim = shape.kv_heads * shape.head_dim;
   const auto group = shape.heads / shape.kv_heads;
-  const auto history_start = shape.current_pos + 1U > shape.sliding_window
-                                 ? shape.current_pos + 1U - shape.sliding_window
-                                 : 0U;
+  const auto window_start = shape.current_pos + 1U > shape.sliding_window
+                                ? shape.current_pos + 1U - shape.sliding_window
+                                : 0U;
+  const auto history_start = std::max(window_start, shape.history_begin);
   const auto history_count = shape.history_length > history_start
                                  ? shape.history_length - history_start
                                  : 0U;
@@ -416,7 +419,7 @@ void TestAttention(const AttentionShape& shape, const char* label) {
            out_dev.get(), shape.current_pos, shape.history_length,
            shape.block_count, shape.sliding_window, shape.heads,
            shape.kv_heads, shape.head_dim, scale, nullptr,
-           shape.history_capacity);
+           shape.history_capacity, shape.history_begin);
     Check(hipStreamSynchronize(nullptr), "sync attention");
     return out_dev.Download();
   };
@@ -923,6 +926,43 @@ int main() {
          .kv_heads = 2,
          .head_dim = 32},
         "unmasked");
+    // Restarted at a frontier (prefix reuse): the window would start at row
+    // 37, but rows below 90 were never injected, so only [90, 101) is read.
+    // Narrow block (single-head wave route) and wide block (two heads per CTA).
+    TestAttention(
+        {.current_pos = 100,
+         .history_length = 101,
+         .history_capacity = 64,
+         .block_count = 2,
+         .sliding_window = 64,
+         .heads = 3,
+         .kv_heads = 1,
+         .head_dim = 12,
+         .history_begin = 90},
+        "restarted");
+    TestAttention(
+        {.current_pos = 100,
+         .history_length = 101,
+         .history_capacity = 64,
+         .block_count = 8,
+         .sliding_window = 64,
+         .heads = 4,
+         .kv_heads = 2,
+         .head_dim = 8,
+         .history_begin = 90},
+        "restarted_wide");
+    // A frontier below the window start changes nothing.
+    TestAttention(
+        {.current_pos = 40,
+         .history_length = 48,
+         .history_capacity = 64,
+         .block_count = 8,
+         .sliding_window = 16,
+         .heads = 4,
+         .kv_heads = 2,
+         .head_dim = 8,
+         .history_begin = 10},
+        "frontier_below_window");
     TestGatherRows();
     TestDraftTableLogits();
     TestSelectorGreedy();

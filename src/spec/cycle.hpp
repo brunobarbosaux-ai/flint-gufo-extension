@@ -69,7 +69,7 @@ class SpecCycle {
 
   /// Restarts the drafter context at `frontier` (the target's cached position
   /// after an external reposition, e.g. prefix reuse or snapshot restore). The
-  /// rows below it are not re-fed, so the drafter starts with no history there.
+  /// rows below it are not re-fed: the drafter's history restarts there.
   void Reset(std::uint32_t frontier) noexcept;
 
   /// Test hook (null drafter, flint_spec_gate only): rewrites each proposal before verification.

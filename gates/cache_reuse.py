@@ -198,9 +198,13 @@ class Server:
         self.log_path = log_path
         self.lines = []
         self.lock = threading.Lock()
+        env = dict(os.environ)
+        for item in args.env or []:
+            key, _, value = item.partition("=")
+            env[key] = value
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True,
-                                     bufsize=1)
+                                     bufsize=1, env=env)
         self.file = open(log_path, "w")
         self.reader = threading.Thread(target=self._tee, daemon=True)
         self.reader.start()
@@ -446,6 +450,9 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--prompt-chars", type=int, default=6000)
     ap.add_argument("--keep-log")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="environment variable for the gufo serve child "
+                         "(repeatable), e.g. FLINT_SPARSE_ATTN=1")
     # Stage 3 additions. Each is opt-in; without them the script is unchanged.
     ap.add_argument("--cache-disk", metavar="DIR",
                     help="enable the disk continuation cache in DIR")

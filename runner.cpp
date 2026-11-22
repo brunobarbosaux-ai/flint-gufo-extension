@@ -257,6 +257,13 @@ public:
     } else {
       component_identity_ = ComponentIdentity(model_.get(), max_context_);
     }
+    // Field diagnostics: which cache layout this build speaks. Disk manifests
+    // store only a digest of the identity, so this line is the only readable
+    // record of it.
+    Log("event=cache_identity state_abi=" + std::string(kFlintStateAbi) +
+        " payload_layout=" + std::string(kFlintPayloadLayout) +
+        " context_tokens=" + std::to_string(max_context_) +
+        " identity_bytes=" + std::to_string(component_identity_.size()));
     Warmup();
   }
 

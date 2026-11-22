@@ -21,6 +21,12 @@
 //     so every append after the prefix engages it too, and a wrong key-bound
 //     rebuild changes the logits.
 //
+//   - ring, sparse off: context 8192, prefix 6000. The sliding-window ring is
+//     active (ring 4672 < 8192) and the prefix wraps it. Checks that KvRows()
+//     refuses window layers and serves global ones, that TransferRows() refuses
+//     a window copy older than the ring, and that the snapshot round trip and
+//     the TransferRows split path both continue bit-identically.
+//
 // The target is FLINT_TARGET, or the Q4_K_XL artifact the other tools default
 // to. If the file or a HIP device is absent the test skips with exit 0.
 
@@ -62,7 +68,7 @@ constexpr std::uint32_t kSparseEngageTokens = (2 + 32 + kSparseTop + 1) * 64;
 // Multi-chunk append: 5000 tokens cross the 4096-token prefill tile.
 constexpr std::uint32_t kLongContext = 8192;
 constexpr std::uint32_t kLongAppend = 5000;
-constexpr std::uint32_t kPromptTokens = kLongAppend + 8;
+constexpr std::uint32_t kPromptTokens = 6100;  // covers kRingParams.prefix + extra + continue
 
 struct Params {
   std::uint32_t context;
@@ -71,9 +77,15 @@ struct Params {
 
 constexpr Params kDenseParams{512, 64};
 constexpr Params kSparseParams{4096, 2560};
+// Ring leg: context 8192 keeps the sliding-window layers in a ring (ring length
+// round_up(window + prefill tile, 64) = 4672 < 8192), and the 6000-token prefix
+// wraps it, so a window layer's cache no longer holds position 0.
+constexpr Params kRingParams{8192, 6000};
 // The prompt must cover the longest per-leg use: prefix + extra + decode steps.
 static_assert(kPromptTokens >= kSparseParams.prefix + kExtra + kContinue);
 static_assert(kPromptTokens >= kDenseParams.prefix + kExtra + kContinue);
+static_assert(kPromptTokens >= kRingParams.prefix + kExtra + kContinue);
+static_assert(kPromptTokens >= kLongAppend + 8);
 
 void Require(bool condition, const std::string& message) {
   if (!condition)
@@ -369,6 +381,112 @@ void TestRowHookOrdering(flint::Model& model, const Params& p,
   std::cout << "  row hook ordering ok\n";
 }
 
+/// Ring leg: window layers keep only the ring, so KvRows() must refuse them
+/// while TransferRows() serves the rows the continuation needs. Global layers
+/// go through KvRows() as before.
+void TestRingSplit(flint::Model& model, const Params& p,
+                   const std::vector<std::int32_t>& prompt) {
+  std::string error;
+  const auto& config = model.config();
+  const std::uint32_t window = config.sliding_window;
+  Require(window > 0, "ring leg needs a sliding-window model");
+  // Engine ring length: round_up(window + prefill tile, 64), tile 4096.
+  const std::uint32_t ring = (window + 4096 + 63) / 64 * 64;
+  Require(p.context > ring, "ring leg context must exceed the ring length");
+  Require(p.prefix > ring,
+          "ring leg prefix must wrap the ring (prefix > ring length)");
+
+  auto session = Make(model, p.context);
+  auto reference = Make(model, p.context);
+  const std::span<const std::int32_t> prefix(prompt.data(), p.prefix);
+  RequireOk(session->Append(prefix, &error), error, "ring prefix");
+  RequireOk(reference->Append(prefix, &error), error, "ring reference prefix");
+
+  const std::uint32_t layers = session->NumLayers();
+  const std::size_t row = session->KvRowBytes();
+  std::uint32_t global_layers = 0;
+  std::uint32_t window_layers = 0;
+  for (std::uint32_t il = 0; il < layers; ++il) {
+    if (config.IsSwa(il)) {
+      ++window_layers;
+      Require(session->KvRows(il, false) == nullptr,
+              "KvRows must refuse a ring layer (K)");
+      Require(session->KvRows(il, true) == nullptr,
+              "KvRows must refuse a ring layer (V)");
+    } else {
+      ++global_layers;
+      Require(session->KvRows(il, false) != nullptr,
+              "KvRows must serve a global layer (K)");
+    }
+  }
+  Require(global_layers > 0 && window_layers > 0,
+          "ring leg needs both global and window layers");
+  std::cout << "  ring layers: " << global_layers << " global, " << window_layers
+            << " window (ring " << ring << ", window " << window << ")\n";
+
+  // The copy-out refusal: a window row older than the ring is gone, so
+  // TransferRows must not serve it (the trap in the plan).
+  std::vector<std::uint8_t> probe(std::size_t{ring + 1} * row);
+  std::uint32_t swa = 0;
+  while (!config.IsSwa(swa)) ++swa;
+  Require(!session->TransferRows(swa, false, p.prefix - ring - 1, p.prefix,
+                                 probe, true, &error),
+          "TransferRows refuses a window copy starting before position - ring");
+  Require(!error.empty(), "refused TransferRows reports an error");
+
+  // Capture: global [0, P) by KvRows, window [P - span, P) by TransferRows.
+  // span is the window plus one chunk, clamped to the prefix.
+  const std::uint32_t span = std::min<std::uint32_t>(p.prefix, window + 256);
+  std::vector<std::vector<std::uint8_t>> captured(layers * 2);
+  for (std::uint32_t il = 0; il < layers; ++il) {
+    for (const bool value : {false, true}) {
+      auto& buf = captured[std::size_t{il} * 2 + (value ? 1 : 0)];
+      if (config.IsSwa(il)) {
+        const std::uint32_t first = p.prefix - span;
+        buf.resize(std::size_t{span} * row);
+        RequireOk(session->TransferRows(il, value, first, p.prefix, buf, true,
+                                        &error),
+                  error, "window capture");
+      } else {
+        buf.resize(std::size_t{p.prefix} * row);
+        CopyOrThrow(buf.data(), session->KvRows(il, value), buf.size(),
+                    hipMemcpyDeviceToHost, "global capture");
+      }
+    }
+  }
+  const auto logits = session->Logits();
+  const std::vector<float> logit_row(logits.begin(), logits.end());
+
+  // Restore into a session holding other rows. Window rows go back at their
+  // absolute positions (TransferRows may write any position).
+  auto restored = Make(model, p.context);
+  RequireOk(restored->Append(std::span<const std::int32_t>(prompt.data(), 8),
+                             &error),
+            error, "ring dirty target");
+  for (std::uint32_t il = 0; il < layers; ++il) {
+    for (const bool value : {false, true}) {
+      const auto& buf = captured[std::size_t{il} * 2 + (value ? 1 : 0)];
+      if (config.IsSwa(il)) {
+        const std::uint32_t first = p.prefix - span;
+        std::vector<std::uint8_t> host(buf);
+        RequireOk(restored->TransferRows(il, value, first, p.prefix, host,
+                                         false, &error),
+                  error, "window restore");
+      } else {
+        CopyOrThrow(restored->KvRows(il, value), buf.data(), buf.size(),
+                    hipMemcpyHostToDevice, "global restore");
+      }
+    }
+  }
+  RequireOk(restored->SetLogits(logit_row, &error), error, "ring set logits");
+  RequireOk(restored->RestoreRows(p.prefix, &error), error, "ring restore rows");
+  CheckContinuation(*restored, *reference, p.prefix,
+                    std::span<const std::int32_t>(prompt.data() + p.prefix,
+                                                  kContinue),
+                    "ring split");
+  std::cout << "  ring split (TransferRows) ok\n";
+}
+
 void RunLeg(flint::Model& model, const Params& p,
             const std::vector<std::int32_t>& prompt) {
   TestSnapshotRoundTrip(model, p, prompt);
@@ -412,6 +530,11 @@ int main() {
     std::cout << "leg: sparse off (context " << kDenseParams.context
               << ", prefix " << kDenseParams.prefix << ")\n";
     RunLeg(*model, kDenseParams, prompt);
+
+    std::cout << "leg: sparse off, ring active (context " << kRingParams.context
+              << ", prefix " << kRingParams.prefix << ")\n";
+    TestSnapshotRoundTrip(*model, kRingParams, prompt);
+    TestRingSplit(*model, kRingParams, prompt);
 
     ::setenv("FLINT_SPARSE_ATTN", "1", 1);
     ::setenv("FLINT_SPARSE_TOPK", "1", 1);

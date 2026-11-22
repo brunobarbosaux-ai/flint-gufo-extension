@@ -1293,8 +1293,13 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     float2 dmA = __half22float2(x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + k0/QI8_1]);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    /* Explicit FMAs: with plain expressions the compiler
+                     * contracted each unrolled column tile differently, so a
+                     * token's result depended on its column in the tile (and
+                     * a prefill on how its tokens were grouped). */
+                    float & acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __builtin_fmaf(dmA.x*dsB.x, static_cast<float>(C.x[l]), acc);
+                    acc = __builtin_fmaf(dmA.y, dsB.y, acc);
                 }
             }
         }

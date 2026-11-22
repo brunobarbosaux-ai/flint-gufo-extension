@@ -134,6 +134,15 @@ public:
   [[nodiscard]] const void* KvRows(std::uint32_t layer,
                                    bool value) const noexcept;
   [[nodiscard]] void* KvRows(std::uint32_t layer, bool value) noexcept;
+  /// Row-wise copy for the layers KvRows() cannot serve (a sliding-window layer
+  /// keeps a ring, not every position): rows [first, end) by absolute position,
+  /// `host` holding (end - first) * KvRowBytes() bytes. Copying out needs the
+  /// rows to still be in the ring and below Position(); copying in may write any
+  /// position (RestoreRows sets the position afterwards).
+  [[nodiscard]] bool TransferRows(std::uint32_t layer, bool value,
+                                  std::uint32_t first, std::uint32_t end,
+                                  std::span<std::uint8_t> host, bool to_host,
+                                  std::string* error_msg);
   /// Waits for all work this session has queued.
   [[nodiscard]] bool Synchronize(std::string* error_msg) const;
   /// Declares the first `position` rows of every layer to be in place (written

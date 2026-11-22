@@ -1726,13 +1726,45 @@ std::size_t Session::KvRowBytes() const noexcept {
 const void* Session::KvRows(std::uint32_t layer, bool value) const noexcept {
   if (layer >= NumLayers())
     return nullptr;
+  // A ring layer is not position-indexed: use TransferRows().
+  if (impl_->ring[layer] != 0)
+    return nullptr;
   return (value ? impl_->v_cache : impl_->k_cache)[layer].get();
 }
 
 void* Session::KvRows(std::uint32_t layer, bool value) noexcept {
   if (layer >= NumLayers())
     return nullptr;
+  // A ring layer is not position-indexed: use TransferRows().
+  if (impl_->ring[layer] != 0)
+    return nullptr;
   return (value ? impl_->v_cache : impl_->k_cache)[layer].get();
+}
+
+bool Session::TransferRows(std::uint32_t layer, bool value, std::uint32_t first,
+                           std::uint32_t end, std::span<std::uint8_t> host,
+                           bool to_host, std::string* error_msg) {
+  const Config& c = impl_->model->config;
+  if (layer >= c.num_layers || first > end || end > impl_->capacity)
+    return Fail(error_msg, "Flint: row range is out of range");
+  const std::size_t kv_row = std::size_t{c.num_kv} * c.head_dim;
+  if (host.size() != std::size_t{end - first} * kv_row * sizeof(__half))
+    return Fail(error_msg, "Flint: row buffer has the wrong size");
+  if (first == end)
+    return true;
+  const std::uint32_t ring = impl_->ring[layer];
+  // Rows leave the ring as the position moves on: a copy out may only read the
+  // last `ring` positions.
+  if (to_host && ring != 0 &&
+      (end > impl_->position || impl_->position - first > ring))
+    return Fail(error_msg, "Flint: rows are no longer in the window ring");
+  if (!Synchronize(error_msg))
+    return false;
+  auto& cache = value ? impl_->v_cache[layer] : impl_->k_cache[layer];
+  if (!CopyRows(cache.get(), ring, kv_row, first, end - first, host.data(),
+                to_host))
+    return Fail(error_msg, "Flint: row copy failed");
+  return true;
 }
 
 bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {

@@ -184,6 +184,11 @@ void ExpandQ8ToHalf(const void* q8, __half* out, std::size_t count,
 void AddInPlace(float* x, const float* y, std::size_t count,
                 hipStream_t stream);
 
+/// Selects the decode attention kernel: 0 the matrix-core slice kernel where it
+/// applies (global layer, head_dim 128, group 8, up to 8 rows), 1 the scalar
+/// kernels. FLINT_ATTN_OLD=1 starts in mode 1.
+void SetAttentionMode(int mode);
+
 }  // namespace gufo::models::flint::gpu::rocm
 
 #endif  // GUFO_MODELS_FLINT_GPU_KERNELS_KERNELS_HPP_

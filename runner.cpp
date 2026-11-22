@@ -435,6 +435,10 @@ public:
                                std::size_t position) const override {
     auto& flint = RequireFlintState(state);
     flint.set_position(position);
+    // The adapter's Validate owns the session position; a mismatch means cache and runner disagree on the frontier.
+    if (static_cast<std::size_t>(flint.session().Position()) != position)
+      throw std::logic_error(
+          "Flint restored session position disagrees with the checkpoint");
     flint.set_uncached(false);
     // The reused prefix is cached through `position`. The drafter's context
     // cannot be re-fed from 0 (the hidden ring holds only recent rows), so it

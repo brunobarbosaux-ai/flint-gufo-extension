@@ -5,7 +5,8 @@
 **Continuation cache → per-layer `kAppendRows` components** (`docs/PLAN-KV-ROWS.md`).
 Stage 2 (adapter rewrite) COMPLETE (`c559211`, review fixes `e1d0f6f`).
 Stage 3 (disk cache + eviction stress) COMPLETE (`b2893cc`, `4cc90dc`).
-Stage 4 next: position assertion + 130k cap A/B (#1319 merged, needs a disposable clone).
+Stage 4 (position assertion + 130k A/B) COMPLETE (`9ceaa4d`). Cap kept on 0.3.x because
+#1319 is unreleased; raise when the minimum supported Gufo includes it. Stage 5 next.
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.

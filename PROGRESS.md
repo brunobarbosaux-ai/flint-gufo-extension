@@ -19,7 +19,7 @@ per-stage notes; keep this row set in sync.
 | 1 | Engine API (`NumLayers`/`KvRowBytes`/`KvRows`/`Synchronize`/`RestoreRows`/`SetLogits`/`SetRowWriteHook`) + `RestoreSnapshot` refactor + `flint.engine_snapshot` | **COMPLETE** (`e0577ff`, `feb7475`; all gates pass) |
 | 2 | Adapter rewrite: descriptors, private pieces, row hooks, guard, identity bump (`flint-rocm-session-v2`/`flint-kv-rows-v1`) + serve cache-reuse gate | **COMPLETE** (`c559211`; plain + dflash gates pass) |
 | 3 | Disk cache round trip + eviction/guard stress | **COMPLETE** (`b2893cc`, `4cc90dc`; restart reuse, identity, 400 MiB stress) |
-| 4 | Runner position check + claim/cap measurement | NOT STARTED |
+| 4 | Runner position check + claim/cap measurement | **COMPLETE** (`9ceaa4d`; 130k A/B: +4.8 s capture vs 172 ms restore; cap kept on 0.3.x) |
 | 5 | Long-context validation + benchmark | NOT STARTED |
 
 ## Milestone status

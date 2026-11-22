@@ -91,7 +91,7 @@ component and no capacity field — `context` bounds `valid_rows`.
 | **1** | Engine API: `NumLayers`, `KvRowBytes`, `KvRows`, `Synchronize`, `RestoreRows`, `SetLogits`, `SetRowWriteHook`; refactor `RestoreSnapshot` onto `RestoreRows`; new `flint.engine_snapshot` test | **COMPLETE** | `flint.engine_snapshot` (both legs), `flint.ops`, `flint.dflash_ops`, `flint.dflash_forward`, `flint.target_adapter`; `--mode gx` 3/3 | `e0577ff` + review fixes `feb7475` |
 | **2** | Adapter rewrite: descriptors (metadata/logits private, K/V per layer as `kAppendRows`), private piece capture/restore, row hooks, `MutationGuard` integration, **identity bump** (`flint-rocm-session-v2`, `flint-kv-rows-v1`) | **COMPLETE** | in-process cache: r2 `cache=memory`, `cached_tokens=1223`, restore 2.9 ms, answer identical; exact captured bytes; spec-on leg passes | `c559211` + review fixes `e1d0f6f` |
 | **3** | Disk cache round trip + guard/eviction stress (multi-session, prune under a small budget) | **COMPLETE** | restart `cache=disk` (1223 tok, 45 ms; 9001 tok, 244 ms), answers identical; identity mismatch → no reuse; 7/7 under 400 MiB with flat ledger | `b2893cc` (identity log) + `4cc90dc` (gate) |
-| **4** | Runner: position check in `ReconcileComponentState`, claim/cap decision by measurement | NOT STARTED | `--mode memory`; 130k latency A/B | — |
+| **4** | Runner: position check in `ReconcileComponentState`, claim/cap decision by measurement | **COMPLETE** | `--mode memory` 2/2; 130k A/B: capture costs +4.8 s on a 104 s prefill, restore 172 ms | `9ceaa4d` (+ 130k A/B in `/tmp/opencode/gufo-1319`) |
 | **5** | Long-context validation: 130k capture, follow-up turns, disk cache, spec on/off, sparse on/off | NOT STARTED | full suite + benchmark vs 0.3.1 baseline | — |
 
 ### Stage 1 — engine API (detail)
@@ -388,3 +388,30 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Correction recorded: a ratio-of-r1 bound for the follow-up capture is prompt-length
   dependent (2.44% at 8880 tokens vs a 2% guess); replaced with the absolute chunk bound
   (trap 16).
+
+### 2026-11-21 — Stage 4 complete (position check, 130k A/B)
+- Commit `9ceaa4d`: `ReconcileComponentState` now asserts the adapter session position equals
+  the runner checkpoint. `flint.engine_snapshot`, `flint.target_adapter`, and the 8k plain
+  gate pass.
+- **130k A/B** on a disposable tree (`/tmp/opencode/gufo-1319` = `390639b3` + merged
+  `93a1d230`), with the cap removed only in `/tmp/opencode/ext-nocap`; the reference tree was
+  not modified.
+  - Arm A (capture off, `--cache-ram-bytes off`): first request 128,981 tokens,
+    `duration_ms=104,342.9`, ttft 103.7 s, prefill 1246 t/s.
+  - Arm B (capture on, 32 GiB budget): first request `duration_ms=109,153.5`, ttft 108.0 s;
+    `cache_snapshot_bytes=12,946,504,512` (5 captures). **Capture cost: +4.8 s (+4.6%)**.
+  - Follow-up identical request: `cache=memory`, `cached_tokens=128,981`,
+    `cache_restore_ms=172.8`, total 1.76 s (vs ~104 s re-prefill).
+  - Multi-turn follow-up: `cached_tokens=128,981`, restore 171.7 ms, new capture
+    **25,487,936 B** — under the one-chunk bound (26,290,752), i.e. chunk sharing works at
+    depth.
+  - Memory gate (reference build): 2/2; per-request claimed 2.44 GB (spec off) vs measured
+    2.23 GB. GX on the clone build: 3/3 byte-identical.
+- **Q1 answer (cap):** the linear-time fix makes 130k capture affordable (+4.8 s once, then
+  172 ms per reuse), but **`#1319` is not in any release**. On 0.3.27 (our shipped API) the
+  same capture still costs ~14 s, so removing the cap would regress every 0.3.x user. Decision:
+  **keep the 8 GiB cap on the 0.3.x line**; raise/remove it only when the minimum supported
+  Gufo contains `93a1d230` (documented in DEFERRED). The cap is now purely a version
+  guard, not a design choice.
+- Note: the clone needed the reference's configure flags (Ninja, `GUFO_BUILD_TOOLS=ON`,
+  `BUILD_TESTING=ON`, `-Wl,--allow-shlib-undefined`) to link `flint_spec_gate`.

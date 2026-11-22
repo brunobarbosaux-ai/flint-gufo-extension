@@ -69,3 +69,14 @@
 - `event=state_lending sheds=N` is emitted only when the resources' `set_shed` hook is
   installed, which this path does not do; its absence is not a pin signal. Borrow health
   is judged from the flat ledger plus continued captures.
+
+### 8 GiB snapshot cap is now a version guard, not a performance choice
+- Measured 2026-11-21 with the merged linear-time fix (gufo#1319, `93a1d230`) in a
+  disposable tree, cap removed: capture of a 128,981-token frontier costs **+4.8 s** on a
+  104 s prefill (`cache_snapshot_bytes=12,946,504,512`), and a follow-up request restores
+  in **172 ms** instead of re-prefilling for ~104 s.
+- On 0.3.27 (the API this line ships against) the same capture still costs ~14 s, so the
+  cap stays: it prevents a 14 s first-request stall for every 0.3.x user.
+- Action when the minimum supported Gufo contains `93a1d230`: raise or remove the cap
+  (`kFlintMaxRetainedSnapshotBytes` in `runner.cpp`), re-run the 130k A/B on the release
+  build, and update the README. Until then, 130k prefix reuse is unavailable by design.

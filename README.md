@@ -53,10 +53,15 @@ unrelated to speculation — see `DEFERRED.md`). Advertise 192k until the
 higher ceiling is fixed.
 
 Note that this is a **load** check: long-context *requests* were not exercised
-in that verification. The first request at a very large context pays the
-continuation-cache snapshot cost, which 0.3.1 bounds by capping the retained
-snapshot claim at 8 GiB (see `DEFERRED.md`); the structural fix (per-layer K/V
-`kAppendRows` components) is tracked in gufo-org/gufo#1317.
+in that verification. The continuation cache now stores the K/V of each layer
+as append rows, so a capture copies only the valid tokens (123 MB instead of
+822 MB for a 1.2k-token prompt at any context) and a follow-up turn copies only
+the new tail (25 MB at 128,981 tokens); a warm restore is 2-25 ms from RAM and
+174-577 ms from disk. Capture is still synchronous on the request thread: at
+130k it costs about 4.8 s *with* the upstream linear-time fix in
+gufo-org/gufo#1319, and about 14 s on 0.3.27. The retained-snapshot claim
+therefore stays capped at 8 GiB on the 0.3.x line as a version guard until the
+minimum supported Gufo contains that fix (see `DEFERRED.md`).
 
 Flint can run DFlash2 speculative decoding: a small drafter proposes several
 tokens, and the target verifies them in one batched pass. Accepted tokens are

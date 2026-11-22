@@ -20,7 +20,7 @@ per-stage notes; keep this row set in sync.
 | 2 | Adapter rewrite: descriptors, private pieces, row hooks, guard, identity bump (`flint-rocm-session-v2`/`flint-kv-rows-v1`) + serve cache-reuse gate | **COMPLETE** (`c559211`; plain + dflash gates pass) |
 | 3 | Disk cache round trip + eviction/guard stress | **COMPLETE** (`b2893cc`, `4cc90dc`; restart reuse, identity, 400 MiB stress) |
 | 4 | Runner position check + claim/cap measurement | **COMPLETE** (`9ceaa4d`; 130k A/B: +4.8 s capture vs 172 ms restore; cap kept on 0.3.x) |
-| 5 | Long-context validation + benchmark | NOT STARTED |
+| 5 | Long-context validation + benchmark | **COMPLETE** (`47cab02`, `dff1a01`; 24k dense/sparse/spec/disk, 130k spec+sparse, suite green) |
 
 ## Milestone status
 

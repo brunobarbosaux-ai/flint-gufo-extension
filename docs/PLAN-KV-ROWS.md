@@ -92,7 +92,7 @@ component and no capacity field — `context` bounds `valid_rows`.
 | **2** | Adapter rewrite: descriptors (metadata/logits private, K/V per layer as `kAppendRows`), private piece capture/restore, row hooks, `MutationGuard` integration, **identity bump** (`flint-rocm-session-v2`, `flint-kv-rows-v1`) | **COMPLETE** | in-process cache: r2 `cache=memory`, `cached_tokens=1223`, restore 2.9 ms, answer identical; exact captured bytes; spec-on leg passes | `c559211` + review fixes `e1d0f6f` |
 | **3** | Disk cache round trip + guard/eviction stress (multi-session, prune under a small budget) | **COMPLETE** | restart `cache=disk` (1223 tok, 45 ms; 9001 tok, 244 ms), answers identical; identity mismatch → no reuse; 7/7 under 400 MiB with flat ledger | `b2893cc` (identity log) + `4cc90dc` (gate) |
 | **4** | Runner: position check in `ReconcileComponentState`, claim/cap decision by measurement | **COMPLETE** | `--mode memory` 2/2; 130k A/B: capture costs +4.8 s on a 104 s prefill, restore 172 ms | `9ceaa4d` (+ 130k A/B in `/tmp/opencode/gufo-1319`) |
-| **5** | Long-context validation: 130k capture, follow-up turns, disk cache, spec on/off, sparse on/off | NOT STARTED | full suite + benchmark vs 0.3.1 baseline | — |
+| **5** | Long-context validation: 130k capture, follow-up turns, disk cache, spec on/off, sparse on/off | **COMPLETE** | 24k dense/sparse/spec/disk+sparse all reuse with identical answers; 130k spec and spec+sparse restore in 174/208 ms; suite green | `47cab02`, `dff1a01` (gate) |
 
 ### Stage 1 — engine API (detail)
 
@@ -248,11 +248,12 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
     prompt prefixes, so their chunks are shared and each extra capture adds only
     `vocab*4 + 64` (logits + metadata). Exact form:
     `rows*row_total + cache_captures*(vocab*4 + 64)`. Verified at 1223/7268/9001 tokens.
-16. **A follow-up turn captures at most one new chunk per component.** Its new bytes are
-    the tail remainder after the last 256-row boundary plus the private payload of each
-    capture: `r3 <= rows_per_chunk*row_total + captures*(vocab*4 + 64)`. A ratio-of-r1
-    bound is prompt-length dependent (2.4% at 8880 tokens looked fine but failed a 2%
-    rule); use the absolute chunk bound.
+16. **A follow-up turn recaptures the r1 tail plus the new tokens.** Shareable chunks after a
+    capture at `P` are `[0, P - P%256)`; the partial tail is stored as a tail payload, not a
+    chunk, so a capture at `Q` copies `rows = P%256 + (Q-P)` — exact:
+    `Q_snapshot == rows*row_total + captures*(vocab*4 + 64)`. The "one new chunk" bound
+    (`256*row_total + private`) is wrong whenever `P%256 + new > 256` (238+35 at 23,790
+    tokens = 273 rows). Verified exactly at 8k/24k/130k.
 
 ---
 
@@ -415,3 +416,30 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
   guard, not a design choice.
 - Note: the clone needed the reference's configure flags (Ninja, `GUFO_BUILD_TOOLS=ON`,
   `BUILD_TESTING=ON`, `-Wl,--allow-shlib-undefined`) to link `flint_spec_gate`.
+
+### 2026-11-21 — Stage 5 complete (long-context validation)
+- Gate commits: `47cab02` (`--env KEY=VALUE` for the serve child) and `dff1a01` (exact
+  follow-up capture bound). Numbers below are from the orchestrator's own runs for A/B and
+  from the recorded logs for C/D/E/E2.
+- **A — dense, 23,790-token prompt, 32k context**: r1 `2,390,377,280` B (5 captures);
+  r2 `cache=memory`, `cached_tokens=23,790`, restore 34.9 ms, answer identical;
+  r3 `27,996,736` B = the exact derived bound.
+- **B — sparse, top-k 256**: `block-sparse attention: 256 blocks of 64`; r2 restore 41.0 ms,
+  identical answer. This is the adapter's `kmm`-rebuild path at a depth where sparse
+  attention actually runs; no divergence.
+- **C — speculation loaded, 24k**: r2 restore 36.0 ms, identical answer.
+- **D — disk + sparse across a restart**: restarted process `cache=disk`,
+  `cached_tokens=23,790`, restore 577.1 ms, identity matched, sparse engaged in both
+  processes, identical answer.
+- **E — 130k with speculation (clone build)**: r1 `12,946,504,512` B; r2 restore **174.1 ms**,
+  identical; r3 `25,487,936` B (248 rows = 213 tail + 35 new, exact).
+- **E2 — 130k with speculation + sparse**: restore 207.5 ms, identical, same capture sizes.
+- Suite (real tree): `flint.engine_snapshot`, `flint.target_adapter`, `flint.ops`,
+  `flint.dflash_ops`, `flint.dflash_forward` pass; `--mode gx` 3/3 byte-identical;
+  `--mode memory` 2/2.
+- Gate-formula correction (trap 16): the follow-up capture is
+  `rows = r1%256 + new`, not "at most one chunk". The first formula failed at 24k
+  (238 + 35 = 273 rows) while the cache behaved exactly as designed.
+- Stage 5 clearance means the #1317 before/after comment can be posted; the 8 GiB cap stays
+  on the 0.3.x line (unreleased #1319), and the full 0/8k/32k/131k GX battery remains the
+  0.4.0 release gate.

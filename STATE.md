@@ -5,8 +5,11 @@
 **Continuation cache → per-layer `kAppendRows` components** (`docs/PLAN-KV-ROWS.md`).
 Stage 2 (adapter rewrite) COMPLETE (`c559211`, review fixes `e1d0f6f`).
 Stage 3 (disk cache + eviction stress) COMPLETE (`b2893cc`, `4cc90dc`).
-Stage 4 (position assertion + 130k A/B) COMPLETE (`9ceaa4d`). Cap kept on 0.3.x because
-#1319 is unreleased; raise when the minimum supported Gufo includes it. Stage 5 next.
+Stage 4 (position assertion + 130k A/B) COMPLETE (`9ceaa4d`).
+Stage 5 (long-context validation) COMPLETE. All five stages done (`47cab02`, `dff1a01`
+for the gate; `9ceaa4d` for the runner check).
+Open follow-ups: post the #1317 before/after comment; raise the 8 GiB cap when the minimum
+supported Gufo contains #1319 (`93a1d230`); full GX battery at the 0.4.0 release gate.
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.

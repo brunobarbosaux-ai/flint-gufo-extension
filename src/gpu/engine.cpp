@@ -605,9 +605,17 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
   }
   SetBank();
   {
-    const std::vector<float> efill(slots, kRoutedActScale);
-    FLINT_HIP(hipMemcpy(expert_const.get(), efill.data(),
-                        efill.size() * sizeof(float), hipMemcpyHostToDevice));
+    // A constant fill done on the device, on the session's stream. A pageable
+    // host->device hipMemcpy here goes through the runtime's staged copy and
+    // never completes once enough sessions are resident (the host thread
+    // spins in hsa_signal_wait with the GPU idle).
+    static_assert(sizeof(float) == sizeof(std::uint32_t));
+    std::uint32_t bits = 0;
+    const float scale = kRoutedActScale;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    FLINT_HIP(hipMemsetD32Async(
+        reinterpret_cast<hipDeviceptr_t>(expert_const.get()), bits, slots,
+        stream));
   }
   FLINT_HIP(
       hipMemsetAsync(zero_ids.get(), 0, kVecBatch * sizeof(int32_t), stream));
@@ -1753,6 +1761,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     Fail(error_msg, "failed to upload Flint weights: " + err);
     return nullptr;
   }
+  // The weights are on the device: drop the GGUF mapping. Kept alive it pins
+  // ~16 GB of mapped file pages that the kernel cannot reclaim cheaply, which
+  // starves the GPU allocations of the next sessions on a unified-memory node.
+  impl->reader.reset();
   model->state_ = std::move(impl);
   return model;
 }

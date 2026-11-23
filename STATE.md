@@ -12,7 +12,10 @@ Open follow-ups: post the #1317 before/after comment; raise the 8 GiB cap when t
 supported Gufo contains #1319 (`93a1d230`); full GX battery at the 0.4.0 release gate.
 
 Shipped and idle:
-- 0.3.1 (retained-snapshot cap) — registry PR gufo-org/gufo-extension#24 open, CI PASS.
+- 0.3.1 (retained-snapshot cap) — **merged** into gufo-org/gufo-extension
+  (`ea39c22`, 2026-11-22); registry entry `extensions/flint.json` pins
+  `cb7303d5`, digest `sha256:a112bc6e…`; `registry.py verify flint 0.3.1` passes;
+  post-merge `Registry checks` and `Website catalogue` both green.
 - 0.4.0 (tool calls + perf) — waits for sebt3's ring PR (#5): four review items
   outstanding, cross-fork test PR <https://github.com/sebt3/flint-gufo-extension/pull/1>
   open against `feat/ring-kv`. Docs/ceiling corrected 2026-11-22: 262144 now loads

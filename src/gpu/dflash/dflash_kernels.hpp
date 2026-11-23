@@ -35,7 +35,7 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, std::uint32_t history_begin = 0);
 
 /// Thread-per-key reference route of the call above. Exposed so an equivalence
 /// test can run both routes in one process; the production entry point picks
@@ -47,7 +47,7 @@ void LaunchDFlashNonCausalAttentionScalar(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, std::uint32_t history_begin = 0);
 
 /// Wave-per-key route of the call above. Requires `head_dim` to be a multiple
 /// of four so a K row can be read as `float4`.
@@ -58,7 +58,7 @@ void LaunchDFlashNonCausalAttentionWave(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, std::uint32_t history_begin = 0);
 
 /// Quantizes a BF16 weight matrix into a Q8_0 copy for the draft-only LM head.
 /// `total_elements` must be a multiple of the Q8_0 block size.

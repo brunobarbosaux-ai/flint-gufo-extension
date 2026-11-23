@@ -36,6 +36,17 @@ using ::gufo::hip::Q8_0Block;
 // purely weight-bandwidth bound, and the draft only steers which tokens the
 // target verifies, so a draft-private Q8_0 copy cannot change an emitted token:
 // the verifier still runs the target's BF16 head.
+// First injected row the history window reads: the sliding window's start,
+// but never below `history_begin`, the first row the context was injected
+// with (rows under it were never fed after a restart at a frontier). With
+// history_begin at or below the window start this is the plain window start.
+__host__ __device__ inline uint32_t DFlashHistoryStart(
+    uint32_t current_pos, uint32_t sliding_window, uint32_t history_begin) {
+  const uint32_t window_start =
+      current_pos + 1U > sliding_window ? current_pos + 1U - sliding_window : 0U;
+  return window_start > history_begin ? window_start : history_begin;
+}
+
 __global__ void dflash_quantize_bf16_to_q8_0_kernel(
     const hip_bfloat16* __restrict__ source,
     Q8_0Block* __restrict__ destination, uint64_t total_blocks) {
@@ -136,7 +147,8 @@ __global__ void dflash_noncausal_attention_wave_kernel(
     const float* __restrict__ block_v, float* __restrict__ out,
     uint32_t current_pos, uint32_t history_length, uint32_t block_count,
     uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
-    uint32_t head_dim, float scale, uint32_t history_capacity) {
+    uint32_t head_dim, float scale, uint32_t history_capacity,
+    uint32_t history_begin) {
   constexpr uint32_t kPrefetch = 32;
   const uint32_t tok = blockIdx.x, h = blockIdx.y * QueryHeads;
   if (tok >= block_count || h + QueryHeads > num_q_heads)
@@ -145,9 +157,8 @@ __global__ void dflash_noncausal_attention_wave_kernel(
                  q_dim = num_q_heads * head_dim,
                  kv_dim = num_kv_heads * head_dim;
   const uint32_t query_position = current_pos + tok;
-  const uint32_t history_start = current_pos + 1U > sliding_window
-                                     ? current_pos + 1U - sliding_window
-                                     : 0U;
+  const uint32_t history_start =
+      DFlashHistoryStart(current_pos, sliding_window, history_begin);
   const uint32_t history_count = history_length > history_start
                                      ? history_length - history_start
                                      : 0U,
@@ -320,7 +331,8 @@ __global__ void dflash_noncausal_attention_kernel(
     const float* __restrict__ block_v, float* __restrict__ out,
     uint32_t current_pos, uint32_t history_length, uint32_t block_count,
     uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
-    uint32_t head_dim, float scale, uint32_t history_capacity) {
+    uint32_t head_dim, float scale, uint32_t history_capacity,
+    uint32_t history_begin) {
   const uint32_t tok = blockIdx.x;
   const uint32_t h = blockIdx.y;
   if (tok >= block_count || h >= num_q_heads)
@@ -331,9 +343,8 @@ __global__ void dflash_noncausal_attention_kernel(
   const uint32_t q_dim = num_q_heads * head_dim;
   const uint32_t kv_dim = num_kv_heads * head_dim;
   const uint32_t query_position = current_pos + tok;
-  const uint32_t history_start = current_pos + 1U > sliding_window
-                                     ? current_pos + 1U - sliding_window
-                                     : 0U;
+  const uint32_t history_start =
+      DFlashHistoryStart(current_pos, sliding_window, history_begin);
   const uint32_t history_count =
       history_length > history_start ? history_length - history_start : 0U;
   const uint32_t total_k = history_count + block_count;
@@ -891,10 +902,9 @@ struct DFlashAttentionLaunch {
 [[nodiscard]] DFlashAttentionLaunch DFlashAttentionGeometry(
     std::uint32_t current_pos, std::uint32_t history_length,
     std::uint32_t block_count, std::uint32_t sliding_window,
-    std::uint32_t num_q_heads) noexcept {
-  const std::uint32_t history_start = current_pos + 1U > sliding_window
-                                          ? current_pos + 1U - sliding_window
-                                          : 0U;
+    std::uint32_t num_q_heads, std::uint32_t history_begin) noexcept {
+  const std::uint32_t history_start =
+      DFlashHistoryStart(current_pos, sliding_window, history_begin);
   const std::uint32_t history_count =
       history_length > history_start ? history_length - history_start : 0U;
   return {.grid = dim3(block_count, num_q_heads),
@@ -910,14 +920,15 @@ void LaunchDFlashNonCausalAttentionScalar(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, std::uint32_t history_begin) {
   const auto geometry = DFlashAttentionGeometry(
-      current_pos, history_length, block_count, sliding_window, num_q_heads);
+      current_pos, history_length, block_count, sliding_window, num_q_heads,
+      history_begin);
   dflash_noncausal_attention_kernel<<<geometry.grid, 256, geometry.shared_bytes,
                                       stream>>>(
       q, injected_k, injected_v, block_k, block_v, out, current_pos,
       history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-      head_dim, scale, history_capacity);
+      head_dim, scale, history_capacity, history_begin);
 }
 
 void LaunchDFlashNonCausalAttentionWave(
@@ -927,9 +938,10 @@ void LaunchDFlashNonCausalAttentionWave(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, std::uint32_t history_begin) {
   const auto geometry = DFlashAttentionGeometry(
-      current_pos, history_length, block_count, sliding_window, num_q_heads);
+      current_pos, history_length, block_count, sliding_window, num_q_heads,
+      history_begin);
   // Wider blocks benefit from two query heads per CTA. Keep narrow blocks
   // independent and leave enough LDS for both 256-thread reduction rows.
   const auto heads_per_kv = num_q_heads / num_kv_heads;
@@ -941,14 +953,14 @@ void LaunchDFlashNonCausalAttentionWave(
         <<<grid, 256, 2U * geometry.shared_bytes, stream>>>(
             q, injected_k, injected_v, block_k, block_v, out, current_pos,
             history_length, block_count, sliding_window, num_q_heads,
-            num_kv_heads, head_dim, scale, history_capacity);
+            num_kv_heads, head_dim, scale, history_capacity, history_begin);
     return;
   }
   dflash_noncausal_attention_wave_kernel<1>
       <<<geometry.grid, 256, geometry.shared_bytes, stream>>>(
           q, injected_k, injected_v, block_k, block_v, out, current_pos,
           history_length, block_count, sliding_window, num_q_heads,
-          num_kv_heads, head_dim, scale, history_capacity);
+          num_kv_heads, head_dim, scale, history_capacity, history_begin);
 }
 
 void LaunchDFlashNonCausalAttention(
@@ -958,19 +970,19 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, std::uint32_t history_begin) {
   // Coalesced float4 reads cover all shipped DFlash2 head dimensions.
   if ((head_dim % 4U) == 0U) {
     LaunchDFlashNonCausalAttentionWave(
         q, injected_k, injected_v, block_k, block_v, out, current_pos,
         history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-        head_dim, scale, stream, history_capacity);
+        head_dim, scale, stream, history_capacity, history_begin);
     return;
   }
   LaunchDFlashNonCausalAttentionScalar(
       q, injected_k, injected_v, block_k, block_v, out, current_pos,
       history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-      head_dim, scale, stream, history_capacity);
+      head_dim, scale, stream, history_capacity, history_begin);
 }
 
 std::size_t DFlashSelectorScratchElements(std::uint32_t vocab_size) noexcept {

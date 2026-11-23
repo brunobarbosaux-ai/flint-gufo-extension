@@ -800,15 +800,11 @@ bool DflashForward::Run(const DflashContext& context, std::uint32_t anchor,
     return false;
   }
   const std::uint32_t rows = draft_count + 1U;
-  // History the kernel reads is [window start, history_length). Its lower
-  // bound is the kernel's own (position + 1 - sliding_window), so the read is
-  // valid only when that bound is at or past history_begin. Otherwise the
-  // window would reach rows that were never injected; attend to none instead.
-  // With history_begin == 0 this is min(position, injected_context_len).
-  const std::uint32_t window_start =
-      position + 1U > c.sliding_window ? position + 1U - c.sliding_window : 0U;
-  const std::uint32_t history_length =
-      window_start >= ctx.history_begin ? ctx.injected_context_len : 0U;
+  // History the kernel reads is [max(window start, history_begin),
+  // injected_context_len): rows injected since the context last restarted at a
+  // frontier, never rows below it, which were never fed. Right after a
+  // restart the drafter therefore sees a short history that grows with each
+  // injected row; once the window passes history_begin it is the full window.
   const auto emit = [&](std::string_view name, const float* data,
                         std::size_t width, std::uint32_t row_count) {
     s.Emit(trace, name, data, std::size_t{row_count} * width);
@@ -864,9 +860,9 @@ bool DflashForward::Run(const DflashContext& context, std::uint32_t anchor,
 
     LaunchDFlashNonCausalAttention(
         s.query, ctx.injected_k[i], ctx.injected_v[i], s.key, s.value, s.attention,
-        position, history_length, rows,
+        position, ctx.injected_context_len, rows,
         c.sliding_window, c.num_attention_heads, c.num_key_value_heads, head_dim,
-        scale, s.stream, ctx.history_capacity);
+        scale, s.stream, ctx.history_capacity, ctx.history_begin);
     stage("attention", s.attention, query);
 
     s.Project(layer.attn_output, s.attention, s.projected, rows, hidden, query);

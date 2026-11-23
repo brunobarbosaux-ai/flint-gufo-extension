@@ -90,9 +90,9 @@ class DflashContext final {
 
   /// Restarts the injected context at `frontier`: the next AppendContext must
   /// start there. Rows below `frontier` were never injected (the target's
-  /// history is not re-fed), so Run attends to no history until rows at or
-  /// after the frontier fill the sliding window. ResetContext(0) is a fresh
-  /// prompt. Ring rows are not cleared; Run never reads rows below the
+  /// history is not re-fed), so Run attends only to rows injected since, a
+  /// history that grows until it fills the sliding window. ResetContext(0) is
+  /// a fresh prompt. Ring rows are not cleared; Run never reads rows below the
   /// frontier.
   void ResetContext(std::uint32_t frontier = 0) noexcept;
 

@@ -81,6 +81,15 @@
 - Gufo **0.36.0 contains `93a1d230`**, so the version guard's condition is met. The cap
   stays in 0.4.0 because raising it changes admission and memory behaviour and needs its
   own 130k A/B on the 0.36 release build.
+- Measured consequences on 0.4.0/0.36.0 (release battery): the 8 GiB cap is 8,581,545,984 B
+  of RAM cache, about 85,600 rows. At 24k two frontiers fit and RAM/disk reuse is exact.
+  At 60k an identical repeat restores in 82 ms and a follow-up still captures; after a disk
+  restart the restored 59,459-row frontier is re-captured (5,967,430,208 B), which fills
+  the cap, and the follow-up capture is refused (`cache_snapshot_bytes=0`; the disk layer
+  also logs `persistence_refused reason=min_step`). At 130k one partial 63,488-row
+  checkpoint is retained: an identical repeat restores 63,488 of 128,981 tokens in 85 ms
+  and prefills 65,493; after a restart that state is a miss. Answers stayed identical in
+  every leg.
 - Action in 0.5.0: raise or remove the cap (`kFlintMaxRetainedSnapshotBytes` in
   `runner.cpp`), re-run the 130k A/B, and update the README. The ring PR changes
   `payload_layout` to v3 in the same release, so one re-measurement covers both. Until

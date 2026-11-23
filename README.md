@@ -72,10 +72,17 @@ as append rows, so a capture copies only the valid tokens (123 MB instead of
 the new tail (25 MB at 128,981 tokens); a warm restore is 2-25 ms from RAM and
 174-577 ms from disk. Capture is still synchronous on the request thread: at
 130k it costs about 4.8 s *with* the upstream linear-time fix in
-gufo-org/gufo#1319, which Gufo 0.36.0 ships, and about 14 s before it. The
-retained-snapshot claim stays capped at 8 GiB in 0.4.0; raising it is scheduled
-for 0.5.0, together with the ring layout (v3), which changes the same
-measurements again (see `DEFERRED.md`).
+gufo-org/gufo#1319, which Gufo 0.36.0 ships, and about 14 s before it. In 0.4.0
+the retained cache stays capped at **8 GiB (~85,600 rows)**, which is two
+frontiers up to ~42.8k tokens, or one frontier beyond that. Measured on 0.36.0:
+24k reuse is exact in RAM and on disk; at 60k an identical repeat restores in
+~82 ms and a follow-up still captures, but after a **disk restart** at 60k the
+restored frontier is re-captured and fills the cap, so that follow-up capture
+is refused (`cache_snapshot_bytes=0`); at 130k one partial 63,488-row
+checkpoint is retained, an identical repeat restores 63,488 tokens in ~85 ms
+and prefills the rest, and after a restart that state is a miss. Raising the
+cap is scheduled for 0.5.0, together with the ring layout (v3), which changes
+the same measurements again (see `DEFERRED.md`).
 
 Flint can run DFlash2 speculative decoding: a small drafter proposes several
 tokens, and the target verifies them in one batched pass. Accepted tokens are

@@ -372,13 +372,18 @@ the sliding-window key-tile origin were fixed alongside.
 | `flint.tool_template` | 21 golden conversations rendered byte-identical to the pinned Jinja template | `ctest -R '^flint\.tool_template$'` |
 | `flint.tool_scan` | complete, typed, malformed and unfinished calls; streamed arguments only grow | `ctest -R '^flint\.tool_scan$'` |
 | `flint.prefill_split` | 14 even splits, 0 differing (logits and every layer's K/V); runs in plain `ctest` (41.9 s) and defaults to the Q4 artifact | `ctest -R '^flint\.prefill_split$'` |
-| GX greedy byte-identity, spec-on vs spec-off | 3/3 at depth 0, 8k and 32k on the 0.35.0 review tree; 3/3 at depth 0 on 0.36.0 | `flint_spec_gate --mode gx --prompts-limit 3 --max-tokens 128` |
+| GX greedy byte-identity, spec-on vs spec-off | 3/3 at depths 0, 8k, 32k and 131k on 0.36.0 (and 3/3 at 0, 8k, 32k on the 0.35.0 review tree) | `flint_spec_gate --mode gx --prompts-limit 3 --max-tokens 128` |
 | Cache reuse, 24k, RAM and disk | exact bounds `r1 2,390,377,280` / `r3 30,203,008`, restore 607 ms on 0.36.0 (623 ms on 0.35.0), identity `flint-rocm-session-v2:flint-kv-rows-v2` | `gates/cache_reuse.py --cache-disk … --restart --expect-identity …` |
+| Cache reuse, 24k, spec on and sparse | PASSED, 0 failed checks each (sparse via `--env FLINT_SPARSE_ATTN=1`) | same gate, `--dflash-model` / `--env` |
+| Cache reuse, 60k, RAM | exact: `r1 5,976,456,000` (captures 1), r2 restore 82 ms, r3 capture 10,836,544 | same gate, `--context 65536 --prompt-chars 295000` |
+| Cache reuse, 60k, disk restart | restore 59,458 tokens in 1,461 ms, answers identical; the follow-up capture is refused by the 8 GiB cap (`cache_snapshot_bytes=0`) | same gate; see `DEFERRED.md` cap section |
+| Cache reuse, 130k, RAM and disk | partial by cap: 63,488 of 128,981 tokens restored in 85 ms, remainder prefilled, answer identical; after a restart the first request is a miss | `--context 131072 --prompt-chars 640000`; cap-aware check |
+| Null drafter, temps 0/0.7/1.0 × seeds 1,2 | 72/72 byte-identical | `--mode null --temps 0,0.7,1.0 --seeds 1,2` |
 | Cache-on vs cache-off | identical r1, r2 and r3 output at 8,074 and 23,790 tokens, with and without the drafter | `/tmp/opencode/ab_cache_off.py` |
 | Memory, second-slot delta | 2/2; claims unchanged from the 0.3.1 build: spec-off `2,437,325,748` claimed / `2,225,848,320` measured, spec-on `2,856,756,148` / `2,645,278,720` | `flint_spec_gate --mode memory` |
 | Drafter after a restore | 8,074-token prompt, 128 tokens: cold 56.6, repeat 54.0, follow-up 68.6 t/s, vs `main` 56.5 / 41.5 / 43.5; 23,790 tokens: 60.1 / 49.2 / 57.1 | `gates/cache_reuse.py --max-tokens 128 --dflash-model …` |
 | Load memory | RSS after load 2,447 MiB, vs 26,347 MiB before #9; 2 sessions at 262144 use 78,646 MiB of device | `gufo serve llm -c 262144 -j 2 --log-progress` |
-| Suite | `engine_snapshot`, `target_adapter`, `ops`, `dflash_ops`, `dflash_forward`, `prefill_split` pass on 0.36.0 | `ctest -R '^flint\.'` |
+| Suite | all 12 `flint.*` tests build and pass on 0.36.0 (`config` and `probe` after the shim fix) | `ctest -R '^flint\.'` |
 
 ### Compatibility notes for 0.4.0
 

@@ -20,8 +20,11 @@ mapping released).
 - [x] Merge #6 (`d1bd1ce`), #8 (`cc25f82`), #9 (`31c270f`)
 - [x] Retarget docs and `extension.json` to 0.4.0 / Gufo 0.36.0 (`1c95904`, `db02932`)
 - [x] 0.36.0 smoke: prefill_split, gx depth 0 spec off/on, memory 2/2, disk 24k exact
-- [ ] Full battery on the 0.4.0 revision (gx 0/8k/32k/131k spec off+on, null,
-      settings, memory, reuse 24k/60k/130k RAM+disk+sparse+spec, loads 1x/2x)
+- [x] Full battery on the 0.4.0 revision: gx 3/3 at 0/8k/32k/131k with spec off
+      and on; null 72/72 (temps 0/0.7/1.0 × seeds 1,2); settings 8/8
+      (violations 0); memory 2/2; reuse 24k RAM/disk/spec/sparse and 60k RAM
+      exact; 60k disk and 130k cap-bound as documented in `DEFERRED.md`; loads
+      1x 8.9 s, 2x 30.7 s
 - [ ] Tag `v0.4.0`
 - [ ] Registry PR (`docs/REGISTRY-PR.md`): revision, clean-clone digest,
       `registry.py verify flint 0.4.0`

@@ -207,9 +207,10 @@ FlintContinuationAdapter::FlintContinuationAdapter(
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  // Identity version 3 (window rows for the sliding-window layers) is the compatibility epoch for this layout. It is a
-  // separate versioning from the descriptor layout_version = 1 (per-component
-  // format), and bumps whenever the component table changes.
+  // Identity version 3 (window rows for the sliding-window layers) is the
+  // compatibility epoch for this layout. It is a separate versioning from the
+  // descriptor layout_version = 1 (per-component format), and bumps whenever
+  // the component table changes.
   put(3);
   put(context_);
 }
@@ -384,11 +385,19 @@ void FlintContinuationAdapter::BeginRestore(
 
   // Rows are written in place: guard every append range the restore can
   // replace while the old slot is still readable, then drain the device.
-  for (const auto& component : components_)
-    if (cache::HasRows(component.descriptor.kind))
-      state.guard.BeforeOverwrite(
-          component.descriptor.id,
-          cache::FirstChunkRow(component.descriptor, frontier), context_);
+  // A window component restores only [FirstChunkRow, frontier); its rows past
+  // the frontier are not written by the restore, so the guard stops there.
+  for (const auto& component : components_) {
+    if (!cache::HasRows(component.descriptor.kind))
+      continue;
+    const auto first = cache::FirstChunkRow(component.descriptor, frontier);
+    const auto end =
+        component.descriptor.kind == cache::ComponentKind::kWindowRows
+            ? frontier
+            : context_;
+    if (first < end)
+      state.guard.BeforeOverwrite(component.descriptor.id, first, end);
+  }
   SyncSession(*state.session);
 
   state.expected = std::move(ordered);

@@ -18,10 +18,12 @@ Shipped and idle:
   `cb7303d5`, digest `sha256:a112bc6e…`; `registry.py verify flint 0.3.1` passes;
   post-merge `Registry checks` and `Website catalogue` both green.
 
-Release in progress:
+Released, awaiting registry review:
 - 0.4.0 (tool calls + per-layer row cache + #6 + #8 + #9) — validated on Gufo
   v0.36.0 (API 0.3.42), tagged `v0.4.0` at `cf9f7aa`; registry PR
   gufo-org/gufo-extension#27 open for review (digest `sha256:3b8e9e86…`).
+  GitHub Releases: `v0.4.0` (latest), plus `v0.3.0` and `v0.3.1` back-filled
+  from their registry revisions `b262cb6a` and `cb7303d5`.
 - 0.4.1 is reserved for hotfixes only.
 - 0.5.0 (ring + matrix attention) — waits for sebt3's rebases (#5, #7). The ring
   takes `payload_layout` v3, so 0.4.0 disk caches stop restoring at 0.5.0.

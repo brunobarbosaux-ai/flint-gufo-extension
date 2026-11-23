@@ -6,8 +6,9 @@
 // rest of the prompt is a second call). For each split row `a` the test
 // compares one call over the prompt with calls [0, a) and [a, N): logits
 // bits, and the K and V rows of every layer, rows below the split and rows at
-// or past it counted separately. It also checks that Prefill's logits equal
-// Append's on the unsplit prompt.
+// or past it counted separately. A sliding-window layer is a ring, so only its
+// last window rows are compared (through TransferRows). It also checks that
+// Prefill's logits equal Append's on the unsplit prompt.
 //
 // When rows differ, the first differing layer and the side of the split point
 // at the kernel:
@@ -84,12 +85,32 @@ std::vector<std::int32_t> EncodePrompt(const std::string& path,
   return ids;
 }
 
-std::vector<std::uint8_t> CopyRows(const flint::Session& s, std::uint32_t layer,
-                                   bool value, std::uint32_t rows) {
-  std::vector<std::uint8_t> out(std::size_t{rows} * s.KvRowBytes());
-  if (hipMemcpy(out.data(), s.KvRows(layer, value), out.size(),
-                hipMemcpyDeviceToHost) != hipSuccess)
-    throw std::runtime_error("hipMemcpy of KV rows failed");
+// The rows of one layer's K or V that the test compares: [first, end) by
+// absolute position. KvRows() serves a layer whole; a sliding-window ring
+// (KvRows() null) is read through TransferRows(), which only holds the last
+// `window` positions, so the comparison covers those.
+struct Rows {
+  std::uint32_t first{0};
+  std::vector<std::uint8_t> bytes;
+};
+
+Rows CopyRows(flint::Session& s, std::uint32_t layer, bool value,
+              std::uint32_t end, std::uint32_t window) {
+  const std::size_t row_bytes = s.KvRowBytes();
+  const void* whole = s.KvRows(layer, value);
+  Rows out;
+  out.first = whole != nullptr ? 0 : (end > window ? end - window : 0);
+  out.bytes.resize(std::size_t{end - out.first} * row_bytes);
+  if (whole != nullptr) {
+    if (hipMemcpy(out.bytes.data(), whole, out.bytes.size(),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+      throw std::runtime_error("hipMemcpy of KV rows failed");
+  } else {
+    std::string error;
+    RequireOk(s.TransferRows(layer, value, out.first, end, out.bytes, true,
+                             &error),
+              error, "transfer KV rows");
+  }
   return out;
 }
 
@@ -99,16 +120,17 @@ struct RowDiff {
   std::uint32_t first{~0U};
 };
 
-RowDiff Compare(const std::vector<std::uint8_t>& a,
-                const std::vector<std::uint8_t>& b, std::size_t row_bytes,
-                std::uint32_t rows, std::uint32_t split) {
+RowDiff Compare(const Rows& a, const Rows& b, std::size_t row_bytes,
+                std::uint32_t split) {
   RowDiff d;
+  const std::uint32_t rows = static_cast<std::uint32_t>(a.bytes.size() / row_bytes);
   for (std::uint32_t r = 0; r < rows; ++r) {
-    if (std::memcmp(a.data() + r * row_bytes, b.data() + r * row_bytes,
-                    row_bytes) == 0)
+    if (std::memcmp(a.bytes.data() + r * row_bytes,
+                    b.bytes.data() + r * row_bytes, row_bytes) == 0)
       continue;
-    (r < split ? d.below : d.above)++;
-    d.first = std::min(d.first, r);
+    const std::uint32_t at = a.first + r;
+    (at < split ? d.below : d.above)++;
+    d.first = std::min(d.first, at);
   }
   return d;
 }
@@ -173,10 +195,12 @@ int main() {
     auto ref = Prefill(*model, prompt, {});
     const std::uint32_t layers = ref->NumLayers();
     const std::size_t row_bytes = ref->KvRowBytes();
-    std::vector<std::vector<std::uint8_t>> ref_rows;
+    const std::uint32_t window = model->config().sliding_window;
+    std::vector<Rows> ref_rows;
     for (std::uint32_t il = 0; il < layers; ++il)
       for (const bool value : {false, true})
-        ref_rows.push_back(CopyRows(*ref, il, value, kPromptTokens));
+        ref_rows.push_back(
+            CopyRows(*ref, il, value, kPromptTokens, window));
     const auto ref_logits = ref->Logits();
     const std::vector<float> ref_logit(ref_logits.begin(), ref_logits.end());
     ref.reset();
@@ -215,9 +239,9 @@ int main() {
       std::string detail;
       for (std::uint32_t il = 0; il < layers; ++il) {
         for (const bool value : {false, true}) {
-          const auto rows = CopyRows(*s, il, value, kPromptTokens);
+          const Rows rows = CopyRows(*s, il, value, kPromptTokens, window);
           const RowDiff d = Compare(ref_rows[il * 2 + (value ? 1 : 0)], rows,
-                                    row_bytes, kPromptTokens, split);
+                                    row_bytes, split);
           if (d.below + d.above == 0)
             continue;
           if (first_layer < 0) {

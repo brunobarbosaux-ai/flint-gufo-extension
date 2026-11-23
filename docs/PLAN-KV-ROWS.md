@@ -477,3 +477,20 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - 0.4.0 smoke on the 0.36.0 tree: `prefill_split` 0 differing, gx 3/3 spec off and on at
   depth 0, memory 2/2, disk 24k gate exact (`r1 2,390,377,280`, `r3 30,203,008`,
   restore 607 ms, v2 identity).
+
+### 2026-11-23 — ring rebased onto main and measured at 130k
+- Sebt3's #5 rebased onto `main` (`71b1842`) as `merge/pr5-rebased` (`3630602`,
+  published as `verify/pr5-rebased`): four textual conflicts (gate, `runner.cpp` layout
+  constant, `extension.cmake`, `extension.json`); `tests/prefill_split_test.cpp` now reads
+  window layers through `TransferRows` because `KvRows()` cannot serve them.
+- Ring trees are green: `ring_snapshot` 10.5 s, `prefill_split` 42.0 s (14 splits, 0
+  differing), `engine_snapshot` 28.4 s, gx 3/3, 24k disk gate PASSED with
+  `flint-kv-rows-window-v1` (r1 `959,071,040 B` vs 2,390,377,280 B on v2; restore 181 ms).
+- **130k under the ring:** r1 snapshot `3,995,190,656 B`; identical repeat and follow-up
+  both restore **100%** (128,981 and 128,980 tokens) in **52 ms**. With v2 the cap held
+  only 63,488 rows (49%). The ring therefore makes 130k reuse fit under the existing
+  8 GiB cap, and the planned cap raise may be unnecessary.
+- **60k disk restart:** all reuse checks pass (restore 419 ms, 59,458 cached); the r3
+  capture is a whole frontier (`1,750,424,128 B`), so the `--max-r3-chunk-bytes` exact
+  form does not apply after a restore — scope that assertion to in-process runs. The
+  capture itself now happens; with v2 it was refused.

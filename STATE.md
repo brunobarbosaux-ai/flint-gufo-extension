@@ -67,3 +67,8 @@ Released, awaiting registry review:
   0.4.0 blocker; re-measure with a warmed page cache before quoting a number.
 - gufo#1317: keep open until Stage 5 numbers are posted (before/after capture size,
   restore time, follow-up-turn cost).
+- Ring (#5) rebased onto `main` at `3630602` (`verify/pr5-rebased`, scratch): at
+  128,981 tokens the retained snapshot is 3,995,190,656 B and both the repeat and
+  the follow-up restore **100%** in ~52 ms, so the 8 GiB cap no longer binds at
+  130k. Re-measure on the merged tree before planning the cap raise; with the ring
+  it may be unnecessary.

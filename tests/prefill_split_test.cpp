@@ -18,8 +18,9 @@
 // FLINT_SPLITS overrides the split rows (an odd row is outside the contract
 // and reported only), FLINT_SPLIT_TOKENS the prompt length, and
 // FLINT_SPLIT_APPEND=1 splits with Append instead. Fails (exit 1) when an even
-// split differs. The target is FLINT_TARGET; without it, or without a HIP
-// device, the test skips with exit 0.
+// split differs. The target is FLINT_TARGET, or the Q4_K_XL artifact the
+// other tools default to. If the file or a HIP device is absent the test
+// skips with exit 0.
 
 #include <hip/hip_runtime.h>
 
@@ -46,6 +47,7 @@ namespace core = gufo::core;
 
 namespace {
 
+constexpr const char* kDefaultTarget = "/home/bruno/AI/GGUF/flint-UD-Q4_K_XL.gguf";
 constexpr std::uint32_t kContext = 8192;
 const std::uint32_t kPromptTokens = [] {
   const char* e = std::getenv("FLINT_SPLIT_TOKENS");
@@ -138,8 +140,11 @@ std::unique_ptr<flint::Session> Prefill(flint::Model& model,
 
 int main() {
   const char* env = std::getenv("FLINT_TARGET");
-  if (env == nullptr || !std::filesystem::exists(env)) {
-    std::cout << "flint prefill split test skipped: FLINT_TARGET not set\n";
+  const std::string target =
+      (env != nullptr && env[0] != '\0') ? env : kDefaultTarget;
+  if (!std::filesystem::exists(target)) {
+    std::cout << "flint prefill split test skipped: no target model at "
+              << target << "\n";
     return 0;
   }
   int devices = 0;
@@ -160,9 +165,9 @@ int main() {
   }
   int differing = 0;
   try {
-    const auto prompt = EncodePrompt(env, kPromptTokens);
+    const auto prompt = EncodePrompt(target, kPromptTokens);
     std::string error;
-    auto model = flint::Model::Load(env, {}, &error);
+    auto model = flint::Model::Load(target, {}, &error);
     RequireOk(model != nullptr, error, "target model");
 
     auto ref = Prefill(*model, prompt, {});

@@ -10,6 +10,25 @@
 | 0.4.0 release (0.36.0 validation) | this file + `docs/REGISTRY-PR.md` | **IN PROGRESS — docs pinned, battery + tag + registry PR pending** |
 | Strycast serve gates | (separate repo) | PR #77 open, CI green |
 
+### 0.4.0 release checklist
+
+Target: Gufo v0.36.0 (`4a7d8c6`, API 0.3.42). Scope: native tool calls,
+per-layer row cache (`payload_layout flint-kv-rows-v2`), and the merged fixes
+#6 (split-invariant prefill), #8 (drafter history after a restore), #9 (GGUF
+mapping released).
+
+- [x] Merge #6 (`d1bd1ce`), #8 (`cc25f82`), #9 (`31c270f`)
+- [x] Retarget docs and `extension.json` to 0.4.0 / Gufo 0.36.0 (`1c95904`, `db02932`)
+- [x] 0.36.0 smoke: prefill_split, gx depth 0 spec off/on, memory 2/2, disk 24k exact
+- [ ] Full battery on the 0.4.0 revision (gx 0/8k/32k/131k spec off+on, null,
+      settings, memory, reuse 24k/60k/130k RAM+disk+sparse+spec, loads 1x/2x)
+- [ ] Tag `v0.4.0`
+- [ ] Registry PR (`docs/REGISTRY-PR.md`): revision, clean-clone digest,
+      `registry.py verify flint 0.4.0`
+- [x] Fix `tests/gguf_test_shim.hpp` for API 0.3.42 (`OpenFile`/`OpenSingleFile`/
+      `OpenSplitFileSet`/`OpenMemory`/`ParseHeaders` gained `GgufOpenOptions`),
+      so `flint.config` and `flint.probe` build and pass again
+
 ### KV-rows stage status
 
 Detail and gates: `docs/PLAN-KV-ROWS.md` §4. Update that table, not this one, for
@@ -39,7 +58,7 @@ Plan: `docs/PLAN-DFLASH2.md`. M1 (the drafter) is done; see `docs/REPORT-M1C.md`
 
 - `Session::Rewind` does not restore logits; the cycle re-appends the anchor before reading `Logits()`.
 - A multi-token prefill is not bit-identical to single-token decode, so the cycle's exactness argument (§3.3) holds only for rows written by the decode or verify path.
-- `flint.config` / `flint.probe` fail to compile in `tests/gguf_test_shim.hpp` (pre-existing SDK drift, unrelated to M2).
+- `flint.config` / `flint.probe` failed to compile in `tests/gguf_test_shim.hpp` (pre-existing SDK drift, unrelated to M2). **Fixed for API 0.3.42:** `OpenFile`, `OpenSingleFile`, `OpenSplitFileSet`, `OpenMemory` and `ParseHeaders` gained `GgufOpenOptions`; both tests build and pass again.
 
 ## Design note (deviation from the plan)
 

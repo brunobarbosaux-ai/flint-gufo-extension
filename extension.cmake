@@ -429,6 +429,30 @@ if(TARGET flint_prefill_split_test)
     PROPERTIES LABELS "flint;hip;gpu;gfx1151")
 endif()
 
+# Snapshot restore across a wrapped sliding-window ring (9000-token prefix, the
+# ring wraps twice): same-session and fresh-session restores must continue
+# bit-identically. Skips (exit 0) when the artifact or a HIP device is absent.
+gufo_extension_target(
+  NAME flint_ring_snapshot_test
+  SOURCES
+    tests/ring_snapshot_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_ring_snapshot_test)
+  target_include_directories(flint_ring_snapshot_test PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+  add_test(NAME flint.ring_snapshot COMMAND flint_ring_snapshot_test)
+  set_tests_properties(flint.ring_snapshot
+    PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+endif()
+
 if(TARGET flint_dflash_ops_test)
   # The vendored header, like its in-tree source, is gated on the backend
   # macro its real consumer defines.

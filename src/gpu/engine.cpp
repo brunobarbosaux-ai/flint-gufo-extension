@@ -229,6 +229,19 @@ struct Session::Impl {
   hipStream_t stream{nullptr};
   std::uint32_t capacity{0};
   std::uint32_t tile{0};
+  /// Set while Session::Prefill runs: every pass takes the wide (prefill)
+  /// kernels, also passes of up to kVecBatch rows, so a prompt row's numerics
+  /// do not depend on how many rows its pass has. Decode and verification
+  /// keep the vector path.
+  bool wide_prefill{false};
+  /// Rows that take the vector path: decode/verify widths outside a prefill.
+  [[nodiscard]] bool Narrow(std::uint32_t n) const noexcept {
+    return n <= kVecBatch && !wide_prefill;
+  }
+  /// Routed-expert slots that take the gather-style vector kernels.
+  [[nodiscard]] bool VecExperts(std::uint32_t slots) const noexcept {
+    return slots <= kVecExpertRows && !wide_prefill;
+  }
   std::uint32_t position{0};
   float* h_logits{nullptr};
   std::int32_t* h_tokens{nullptr};
@@ -606,7 +619,7 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
 
 bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
                           std::uint32_t n, std::string* error_msg) {
-  if (w.type == GgmlType::kQ8_0 && n > kVecBatch && w.cols < kW8A8MinK) {
+  if (w.type == GgmlType::kQ8_0 && !Narrow(n) && w.cols < kW8A8MinK) {
     rocm::NarrowRows(in, x_half, n, w.cols, w.cols, stream);
     if (!gufo::vendor::qwen38_flash_next::rocm::DenseF16Gemm(w.data, x_half, out, n, w.rows,
                                                w.cols, stream)) {
@@ -614,7 +627,7 @@ bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
     }
     return true;
   }
-  if (w.half_data != nullptr && n > kVecBatch) {
+  if (w.half_data != nullptr && !Narrow(n)) {
     rocm::NarrowRows(in, x_half, n, w.cols, w.cols, stream);
     if (!gufo::vendor::qwen38_flash_next::rocm::DenseHalfWeightGemm(
             static_cast<const __half*>(w.half_data), x_half, out, n, w.rows,
@@ -624,7 +637,7 @@ bool Session::Impl::Dense(const DeviceTensor& w, const float* in, float* out,
     return true;
   }
   if (w.type == GgmlType::kQ8_0) {
-    if (n > kVecBatch && w.rows != kStackedQkvRows) {
+    if (!Narrow(n) && w.rows != kStackedQkvRows) {
       gufo::vendor::qwen38_flash_next::rocm::QuantizeQ8Tiled(in, q8_tiled, n, w.cols, stream);
       if (gufo::vendor::qwen38_flash_next::rocm::W8A8Gemm(w.data, q8_tiled, out, n, w.rows,
                                             w.cols, stream)) {
@@ -663,7 +676,7 @@ bool Session::Impl::Experts(const DeviceTensor& w, const float* in, float* out,
   const int U = static_cast<int>(used);
   const std::int32_t* routed_ids = rt->ids.get();
   int rc = -1;
-  if (rows * used <= kVecExpertRows) {
+  if (VecExperts(rows * used)) {
     rc = flint_mmq_moe_vec(static_cast<int>(w.type), w.data, in, routed_ids, out,
                          M, K, T, E, U, stream, nullptr, nullptr);
   } else {
@@ -699,7 +712,7 @@ bool Session::Impl::Experts(const DeviceTensor& w, const float* in, float* out,
         break;
     }
   }
-  if (rows * used > kVecExpertRows) {
+  if (!VecExperts(rows * used)) {
     flint_mmq_set_routed_max_expert_rows(0);
     flint_mmq_set_routed_tile_cols(0);
   }
@@ -712,7 +725,7 @@ bool Session::Impl::Quantize(const float* x, std::uint32_t n, std::uint32_t k,
                              void* slot, Q8Rows* out, std::string* error_msg) {
   out->x = x;
   out->q = nullptr;
-  if (n > kVecBatch)
+  if (!Narrow(n))
     return true;
   if (flint_mmq_quantize_q8_1(x, slot, static_cast<int>(n), static_cast<int>(k),
                             stream) != 0) {
@@ -763,7 +776,7 @@ bool Session::Impl::Gated(const DeviceTensor& up, const DeviceTensor& gate,
 bool Session::Impl::Ffn(const DeviceLayer& layer, std::uint32_t n,
                         const float* next_gamma, std::string* error_msg) {
   const Config& c = model->config;
-  const Q8Rows in{cxn, n <= kVecBatch ? q8_a : nullptr};
+  const Q8Rows in{cxn, Narrow(n) ? q8_a : nullptr};
   if (!Gated(layer.ffn_up, layer.ffn_gate, in, dense_gate.get(), dense_up.get(),
              n, error_msg)) {
     return false;
@@ -775,7 +788,7 @@ bool Session::Impl::Ffn(const DeviceLayer& layer, std::uint32_t n,
   }
   XnChanged();
   rocm::ResidualNormQuant(cx, o.get(), next_gamma, cxn,
-                          n <= kVecBatch ? q8_a : nullptr, n, c.hidden_size,
+                          Narrow(n) ? q8_a : nullptr, n, c.hidden_size,
                           c.rms_eps, stream);
   timer.Mark(kStageDenseFfn, stream);
   return true;
@@ -886,7 +899,7 @@ bool Session::Impl::MoePre(const DeviceLayer& layer, std::uint32_t n,
                            std::string* error_msg) {
   const Config& c = model->config;
   const std::uint32_t used = c.expert_used;
-  if (n > kVecBatch && layer.router.half_data != nullptr) {
+  if (!Narrow(n) && layer.router.half_data != nullptr) {
     const __half* xh_in = XnHalf(n);
     if (!gufo::vendor::qwen38_flash_next::rocm::DenseHalfWeightGemm(
             static_cast<const __half*>(layer.router.half_data), xh_in,
@@ -901,7 +914,7 @@ bool Session::Impl::MoePre(const DeviceLayer& layer, std::uint32_t n,
                     c.expert_count, used, c.expert_weights_norm,
                     c.expert_weights_scale, stream);
   timer.Mark(kStageRouter, stream);
-  if (n * used > kVecExpertRows && !RoutedBegin(n, error_msg))
+  if (!VecExperts(n * used) && !RoutedBegin(n, error_msg))
     return false;
   return true;
 }
@@ -911,7 +924,7 @@ bool Session::Impl::ForkShared(const DeviceLayer& layer, std::uint32_t n,
   shared_forked = false;
   const Config& c = model->config;
   // Only the pre-quantized Q8_0 GEMVs, which keep no shared scratch pool.
-  if (n > kVecBatch || timer.on() || layer.up_shexp.type != GgmlType::kQ8_0 ||
+  if (!Narrow(n) || timer.on() || layer.up_shexp.type != GgmlType::kQ8_0 ||
       layer.gate_shexp.type != GgmlType::kQ8_0 ||
       layer.down_shexp.type != GgmlType::kQ8_0) {
     return true;
@@ -964,7 +977,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
                    : RoutedF16Weights(ge_check.type) &&
                          RoutedF16Weights(ue_check.type)) &&
       RoutedF16Weights(layer.down_exps.type);
-  const bool wide = n * used > kVecExpertRows && routed_f16;
+  const bool wide = !VecExperts(n * used) && routed_f16;
   const DeviceTensor& ge = layer.gate_exps;
   const DeviceTensor& ue = layer.up_exps;
   // Wide batches feed the shared down projection through F16, and non-Q8_0
@@ -974,7 +987,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
   const bool forked = shared_forked;
   shared_forked = false;
   if (!forked) {
-    const Q8Rows in{cxn, n <= kVecBatch ? q8_a : nullptr};
+    const Q8Rows in{cxn, Narrow(n) ? q8_a : nullptr};
     Q8Rows act;
     if (!Gated(layer.up_shexp, layer.gate_shexp, in, sh_gate.get(), sh_up.get(),
                n, error_msg, scale_shared ? shared_scale.get() : nullptr) ||
@@ -993,7 +1006,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
       return false;
   }
   if (!wide) {
-    const bool paired = n * used <= kVecExpertRows && ge.type == ue.type &&
+    const bool paired = VecExperts(n * used) && ge.type == ue.type &&
                         ge.rows == ue.rows && ge.cols == ue.cols;
     if (paired) {
       if (flint_mmq_moe_vec(static_cast<int>(ge.type), ge.data, cxn,
@@ -1032,7 +1045,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
       cx, down_e.get(), rt->topk.get(),
       scale_experts ? expert_scale_ptr : nullptr, sh_out.get(),
       scale_shared ? shared_scale_ptr : nullptr, used, next_gamma, cxn,
-      n <= kVecBatch ? q8_a : nullptr, n, c.hidden_size, c.rms_eps, stream);
+      Narrow(n) ? q8_a : nullptr, n, c.hidden_size, c.rms_eps, stream);
   XnChanged();
   timer.Mark(kStageCombine, stream);
   return true;
@@ -1081,7 +1094,7 @@ bool Session::Impl::AttnCore(std::uint32_t il, std::uint32_t n, bool prune,
   const DeviceLayer& L = model->device->layers()[il];
   const std::uint32_t q_row = c.num_heads * c.head_dim;
   const std::uint32_t kv_row = c.num_kv * c.head_dim;
-  const bool vec = n <= kVecBatch;
+  const bool vec = Narrow(n);
   void* const q8_in = vec ? q8_a : nullptr;
   ln = n;
   lq8 = q8_in;
@@ -1194,8 +1207,9 @@ bool Session::Impl::Enqueue(std::uint32_t n, bool all_rows,
                             std::string* error_msg) {
   const Config& c = model->config;
   const DeviceModel& dm = *model->device;
-  const bool vec = n <= kVecBatch;
+  const bool vec = Narrow(n);
   void* const q8_in = vec ? q8_a : nullptr;
+  const bool prefill_call = wide_prefill;
 
   FLINT_HIP(hipMemcpyAsync(tokens.get(), h_tokens, n * sizeof(int32_t),
                            hipMemcpyHostToDevice, stream));
@@ -1218,6 +1232,11 @@ bool Session::Impl::Enqueue(std::uint32_t n, bool all_rows,
     const bool prune = last && !all_rows && !vec;
     if (!AttnCore(il, n, prune, error_msg))
       return false;
+    // The pruned final layer and the head work on one row in the vector
+    // layout (AttnCore leaves it in cx row 0 with lq8 = q8_a), as in decode.
+    // Its input row is final already, so this does not depend on the split.
+    if (prune)
+      wide_prefill = false;
     if (!AttnOut(il, error_msg))
       return false;
     if (L.is_moe && !ForkShared(L, ln, error_msg))
@@ -1256,6 +1275,7 @@ bool Session::Impl::Enqueue(std::uint32_t n, bool all_rows,
     }
   }
   timer.Mark(kStageHead, stream);
+  wide_prefill = prefill_call;
   FLINT_HIP(
       hipMemcpyAsync(h_logits, d_logits.get(),
                      std::size_t{head_rows} * c.vocab_size * sizeof(float),
@@ -1334,12 +1354,20 @@ bool Session::Append(std::span<const std::int32_t> tokens,
   for (std::size_t off = 0; off < tokens.size();) {
     const std::size_t remaining = tokens.size() - off;
     const std::size_t n = std::min(remaining, chunk_max);
-    const bool single = tokens.size() == 1;
+    const bool single = tokens.size() == 1 && !impl_->wide_prefill;
     if (!impl_->Forward(tokens.subspan(off, n), single, error_msg))
       return false;
     off += n;
   }
   return true;
+}
+
+bool Session::Prefill(std::span<const std::int32_t> tokens,
+                      std::string* error_msg) {
+  impl_->wide_prefill = true;
+  const bool ok = Append(tokens, error_msg);
+  impl_->wide_prefill = false;
+  return ok;
 }
 
 bool Session::AppendAll(std::span<const std::int32_t> tokens,

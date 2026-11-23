@@ -971,8 +971,16 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernel(
   const std::uint32_t last_token = min(t0 + kWmmaTokens, n_tokens) - 1;
   const std::uint32_t pos_max = start + last_token;
   const std::uint32_t pos_min = start + t0;
+  // Key tiles start on a multiple of kWmmaKeys, so a key always lands in the
+  // same tile whichever pass the query belongs to: tiles anchored at the
+  // block's own window start moved with the pass start and changed the
+  // accumulation order (a prefill split at a different row gave different
+  // bits). Keys below a query's window are masked, so the extra leading keys
+  // add exactly zero.
   const std::uint32_t first_key =
-      (window > 0 && pos_min >= window) ? pos_min - window + 1 : 0;
+      (window > 0 && pos_min >= window)
+          ? (pos_min - window + 1) / kWmmaKeys * kWmmaKeys
+          : 0;
 
   // Key tiles to visit: a contiguous run, or (sparse) the sink blocks, the
   // best-scoring older blocks and the local window, each 64 keys.

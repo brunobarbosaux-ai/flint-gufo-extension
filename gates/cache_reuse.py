@@ -23,8 +23,11 @@ budget ever leaks reasoning. Content must be non-empty independently.
 The r3 assistant turn replays both fields, so the rendered prompt matches
 r1's cached prefix.
   r1  cache_snapshot_bytes is exact (Stage 3 derivation, verified on the logs):
-          cache_snapshot_bytes == prompt_tokens * row_total
+          cache_snapshot_bytes == (prompt_tokens + aligned_tail) * row_total
                                   + cache_captures * (vocab*4 + 64)
+      aligned_tail: with --prefill-alignment A, an end N that is not a
+      multiple of A also gets a checkpoint at a = N - N % A, which stores
+      its own partial chunk tail of a % 256 rows (0 when N % A == 0).
       row_total = layers * 2 * kv_heads * head_dim * 2 (fp16 K+V per token,
       from the target GGUF). The reported figure is a SUM over captures: each
       in-pass checkpoint is a prefix of the prompt, so its row chunks are
@@ -485,6 +488,9 @@ def main():
                     help="require r2 cached_tokens >= N (deep-prompt runs)")
     ap.add_argument("--min-r3-cached", type=int, default=0,
                     help="require r3 cached_tokens >= N (deep-prompt runs)")
+    ap.add_argument("--prefill-alignment", type=int, default=2,
+                    help="the runner's prefill_alignment (Session::Prefill "
+                         "needs even pass starts); 1 for a build without it")
     ap.add_argument("--max-r3-chunk-bytes", action="store_true",
                     help="require 0 < r3 capture <= rows_per_chunk * row_total "
                          "+ r3 cache_captures * (vocab*4 + 64) (follow-up turn "
@@ -616,11 +622,16 @@ def reuse_run(args, log_path, failures):
                 check(False, "r1 completed line reports cache_captures "
                       "(needed for the capture-sum size check)", failures)
             else:
-                expected = (r1["prompt_tokens"] * row_total
+                # An unaligned prompt end also gets the aligned checkpoint
+                # below it (prefill_alignment); its partial tail chunk is
+                # stored separately from the end capture's.
+                n1 = r1["prompt_tokens"]
+                extra = aligned_extra_tail(n1, args.prefill_alignment)
+                expected = ((n1 + extra) * row_total
                             + captures * (vocab * 4 + 64))
                 print(f"r1 snapshot expected exactly {expected} B = "
-                      f"prompt_tokens*{row_total} + cache_captures={captures}"
-                      f"*(vocab*4 + 64)")
+                      f"(prompt_tokens + aligned tail {extra})*{row_total} + "
+                      f"cache_captures={captures}*(vocab*4 + 64)")
                 check(snap == expected,
                       f"r1 cache_snapshot_bytes {snap} == capture-sum "
                       f"expected {expected}", failures)
@@ -644,19 +655,23 @@ def reuse_run(args, log_path, failures):
                     check(False, "r3 completed line reports cache_captures and "
                           "cache_snapshot_bytes (needed for the chunk bound)",
                           failures)
-                elif r3_captures != 1:
-                    check(False, f"r3 cache_captures={r3_captures}, expected 1: "
-                          "the request shape changed (follow-up turn is no "
-                          "longer one capture); the exact r3 bound does not "
-                          "apply", failures)
+                elif r3_captures != 1 + (aligned_extra_tail(
+                        r3["prompt_tokens"], args.prefill_alignment, True)):
+                    check(False, f"r3 cache_captures={r3_captures}, expected "
+                          "the end capture plus the aligned one below an "
+                          "unaligned end: the request shape changed; the "
+                          "exact r3 bound does not apply", failures)
                 else:
                     tail = r1_tokens % ROWS_PER_CHUNK
                     new = r3["prompt_tokens"] - r1_tokens
-                    rows = tail + new
-                    expected_r3 = rows * row_total + 1 * (vocab * 4 + 64)
-                    print(f"r3 exact = (r1 % 256 = {tail} + new {new}) = "
-                          f"{rows} rows * {row_total} + 1*(vocab*4+64) = "
-                          f"{expected_r3}; r3 capture {r3_snap}")
+                    extra = aligned_extra_tail(r3["prompt_tokens"],
+                                               args.prefill_alignment)
+                    rows = tail + new + extra
+                    expected_r3 = rows * row_total + r3_captures * (vocab * 4 + 64)
+                    print(f"r3 exact = (r1 % 256 = {tail} + new {new} + "
+                          f"aligned tail {extra}) = {rows} rows * {row_total} "
+                          f"+ {r3_captures}*(vocab*4+64) = {expected_r3}; "
+                          f"r3 capture {r3_snap}")
                     check(r3_snap == expected_r3,
                           f"r3 cache_snapshot_bytes {r3_snap} == exact "
                           f"derived {expected_r3}", failures)
@@ -673,6 +688,19 @@ def reuse_run(args, log_path, failures):
         check(rc == 0, f"clean shutdown (exit {rc})", failures)
         print(f"serve log: {log_path}")
     return finish(failures)
+
+
+def aligned_extra_tail(end, alignment, count=False):
+    """The runner's prefill_alignment makes the host also checkpoint at the
+    last aligned row below an unaligned prompt end. That capture shares the
+    end capture's full chunks but stores its own partial tail chunk. Returns
+    the extra tail rows (or, with count, 1 when the extra capture exists)."""
+    if alignment <= 1 or end % alignment == 0:
+        return 0
+    aligned = end - end % alignment
+    if count:
+        return 1
+    return aligned % ROWS_PER_CHUNK
 
 
 def finish(failures):

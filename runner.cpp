@@ -43,8 +43,10 @@ using ext::TextRunnerToken;
 
 constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v2";
 // Per-layer K/V append rows plus a metadata/logits private state. A v1
-// single-blob disk cache must not load into this layout.
-constexpr std::string_view kFlintPayloadLayout = "flint-kv-rows-v1";
+// single-blob disk cache must not load into this layout. v2: prefill is
+// split-invariant, so K/V rows a v1 build captured differ from the rows this
+// code computes for the same prefix and must not restore.
+constexpr std::string_view kFlintPayloadLayout = "flint-kv-rows-v2";
 
 // A retained snapshot is one full private state (~15.7 GiB at 130k context
 // on this model). The host captures it synchronously on the request thread,
@@ -223,7 +225,8 @@ std::string FlintRoleName(ext::ChatRole role) {
 
 class FlintTextRunner final : public ext::HipTextModelRunner {
 public:
-  static constexpr std::size_t kPrefillChunk = 8192;
+  static constexpr std::size_t kPrefillChunk =
+      FlintContinuationAdapter::kPrefillPassTokens;
   static constexpr std::size_t kWarmupTokens = 9000;
 
   FlintTextRunner(
@@ -323,6 +326,10 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .prefix_reuse = true,
+                // Pass ends and checkpoints on even rows: only those continue
+                // a prompt exactly (see FlintSession::Prefill).
+                .prefill_alignment =
+                    FlintContinuationAdapter::kPrefillAlignment,
             },
         .sampling_defaults = FlintSamplingDefaults(),
         // API 0.3: required. Flint prefills in unsplit kPrefillChunk passes
@@ -542,12 +549,13 @@ public:
     static_assert(
         FlintSession::kHiddenRingRows >= kPrefillChunk,
         "hidden ring must hold a whole prefill chunk when speculation is on");
-    const std::size_t limit = kPrefillChunk;
-    const std::size_t consumed = std::min<std::size_t>(
-        {max_input_tokens, prompt.size() - offset, limit});
+    const std::size_t stop = FlintContinuationAdapter::PrefillPassEnd(
+        offset, offset + std::min(max_input_tokens, prompt.size() - offset),
+        prompt.size());
+    const std::size_t consumed = stop - offset;
     const auto chunk = FlintEngineTokens(prompt.subspan(offset, consumed));
     std::string error;
-    if (!flint.session().Append(chunk, &error)) {
+    if (!flint.session().Prefill(chunk, &error)) {
       flint.Invalidate();
       throw std::runtime_error("Flint prefill failed: " + error);
     }

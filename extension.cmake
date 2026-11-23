@@ -388,6 +388,47 @@ if(TARGET flint_engine_snapshot_test)
     PROPERTIES LABELS "flint;hip;gpu;gfx1151")
 endif()
 
+# Row independence of the routed MMQ expert projections (random weights).
+gufo_extension_target(
+  NAME flint_moe_split_test
+  SOURCES
+    tests/moe_split_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_moe_split_test)
+  add_test(NAME flint.moe_split COMMAND flint_moe_split_test)
+  set_tests_properties(flint.moe_split PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+endif()
+
+# Prefill split invariance: one Session::Prefill call vs the same prompt split
+# at even rows, comparing logits and every layer's K/V rows. Skips without
+# FLINT_TARGET or a HIP device.
+gufo_extension_target(
+  NAME flint_prefill_split_test
+  SOURCES
+    tests/prefill_split_test.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_core
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET flint_prefill_split_test)
+  target_include_directories(flint_prefill_split_test PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+  add_test(NAME flint.prefill_split COMMAND flint_prefill_split_test)
+  set_tests_properties(flint.prefill_split
+    PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+endif()
+
 if(TARGET flint_dflash_ops_test)
   # The vendored header, like its in-tree source, is gated on the backend
   # macro its real consumer defines.

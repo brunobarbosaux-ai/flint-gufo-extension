@@ -312,13 +312,42 @@ std::vector<cache::Rows> FlintContinuationAdapter::PlanPrefill(
   const auto& state = As(slot);
   if (!state.IsValid() || first > end || end > context_)
     throw std::invalid_argument("invalid Flint prefill plan");
+  // The passes Prefill makes (runner.cpp), so planned captures land on them.
   std::vector<cache::Rows> result;
-  constexpr cache::Rows capacity = 4096;  // EngineOptions::prefill_tile.
   while (first < end) {
-    first += std::min(end - first, capacity);
+    first = PrefillPassEnd(first, end, end);
     result.push_back(first);
   }
   return result;
+}
+
+std::vector<cache::ComponentPosition>
+FlintContinuationAdapter::PrefillCheckpointPositions(
+    const cache::Slot& slot, cache::Rows boundary) const {
+  const auto& state = As(const_cast<cache::Slot&>(slot));
+  if (!state.IsValid() || boundary > context_)
+    throw std::invalid_argument("invalid Flint checkpoint boundary");
+  std::vector<cache::ComponentPosition> result;
+  result.reserve(descriptors_.size());
+  for (const auto& descriptor : descriptors_)
+    result.push_back({descriptor.id, boundary});
+  return result;
+}
+
+std::uint64_t FlintContinuationAdapter::PrefillPassEnd(std::uint64_t first,
+                                                       std::uint64_t end,
+                                                       std::uint64_t prompt) {
+  constexpr std::uint64_t kAlign = kPrefillAlignment;
+  std::uint64_t stop = std::min(end, first + kPrefillPassTokens);
+  // A pass that starts off the grid (never planned by the host) ends at the
+  // next grid row, so every later pass is aligned again.
+  if (first % kAlign != 0)
+    stop = std::min(stop, first - first % kAlign + kAlign);
+  // Short of the prompt's end, round down to the grid when that leaves a
+  // non-empty pass.
+  if (stop < prompt && stop % kAlign != 0 && stop - stop % kAlign > first)
+    stop -= stop % kAlign;
+  return stop;
 }
 
 void FlintContinuationAdapter::BeginRestore(

@@ -26,6 +26,24 @@ using FlintSession = gpu::Session;
 // Validate.
 class FlintContinuationAdapter final : public cache::Adapter {
 public:
+  // Prefill alignment. Session::Prefill gives the same K/V rows however a
+  // prompt is split into calls, provided every call starts on a multiple of
+  // FlintSession::kPrefillRowAlignment. The host rounds pass ends and
+  // checkpoints to it (TextRunnerCapabilities::prefill_alignment), so a cache
+  // restore continues exactly as the uncached prompt would.
+  static constexpr std::uint32_t kPrefillAlignment =
+      FlintSession::kPrefillRowAlignment;
+  // Most tokens one Prefill call takes: a multiple of kPrefillAlignment.
+  static constexpr std::uint32_t kPrefillPassTokens = 8192;
+  static_assert(kPrefillPassTokens % kPrefillAlignment == 0);
+
+  /// End of the prefill pass that starts at `first` and may run to `end`
+  /// (the prompt's end, or the host's limit): at most kPrefillPassTokens, and
+  /// on the alignment grid unless it reaches the prompt's end `prompt`.
+  [[nodiscard]] static std::uint64_t PrefillPassEnd(std::uint64_t first,
+                                                    std::uint64_t end,
+                                                    std::uint64_t prompt);
+
   FlintContinuationAdapter(std::shared_ptr<FlintModel> model,
                            std::uint32_t context, cache::Identity identity);
   ~FlintContinuationAdapter() override;
@@ -44,6 +62,12 @@ public:
       const cache::Slot&) const override;
   [[nodiscard]] std::vector<cache::Rows> PlanPrefill(
       const cache::Slot&, cache::Rows first, cache::Rows end) const override;
+  /// Positions a checkpoint at `boundary` will report: every component stands
+  /// at the session position, so all of them at `boundary`. The host sizes
+  /// aligned prompt checkpoints with it before the pass reaches them.
+  [[nodiscard]] std::vector<cache::ComponentPosition>
+  PrefillCheckpointPositions(const cache::Slot&,
+                             cache::Rows boundary) const override;
   void BeginRestore(cache::Slot&,
                     std::span<const cache::ComponentPosition>) override;
   [[nodiscard]] cache::Completion CapturePrivate(const cache::Slot&,

@@ -25,9 +25,10 @@ mapping released).
       (violations 0); memory 2/2; reuse 24k RAM/disk/spec/sparse and 60k RAM
       exact; 60k disk and 130k cap-bound as documented in `DEFERRED.md`; loads
       1x 8.9 s, 2x 30.7 s
-- [ ] Tag `v0.4.0`
-- [ ] Registry PR (`docs/REGISTRY-PR.md`): revision, clean-clone digest,
-      `registry.py verify flint 0.4.0`
+- [x] Tag `v0.4.0` at `cf9f7aa`
+- [x] Registry PR: gufo-org/gufo-extension#27 — revision `cf9f7aa`,
+      clean-clone digest `sha256:3b8e9e86…`, `registry.py check` and
+      `registry.py verify flint 0.4.0` pass
 - [x] Fix `tests/gguf_test_shim.hpp` for API 0.3.42 (`OpenFile`/`OpenSingleFile`/
       `OpenSplitFileSet`/`OpenMemory`/`ParseHeaders` gained `GgufOpenOptions`),
       so `flint.config` and `flint.probe` build and pass again

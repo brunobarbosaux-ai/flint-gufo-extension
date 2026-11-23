@@ -20,8 +20,8 @@ Shipped and idle:
 
 Release in progress:
 - 0.4.0 (tool calls + per-layer row cache + #6 + #8 + #9) — validated on Gufo
-  v0.36.0 (API 0.3.42). Docs and `extension.json` pinned; battery and registry PR
-  pending.
+  v0.36.0 (API 0.3.42), tagged `v0.4.0` at `cf9f7aa`; registry PR
+  gufo-org/gufo-extension#27 open for review (digest `sha256:3b8e9e86…`).
 - 0.4.1 is reserved for hotfixes only.
 - 0.5.0 (ring + matrix attention) — waits for sebt3's rebases (#5, #7). The ring
   takes `payload_layout` v3, so 0.4.0 disk caches stop restoring at 0.5.0.

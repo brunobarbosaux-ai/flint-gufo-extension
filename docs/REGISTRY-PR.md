@@ -1,41 +1,43 @@
-# Registry PR: flint 0.4.0 (draft, not opened)
+# Registry PR: flint 0.4.0 — **opened as gufo-org/gufo-extension#27**
+
+Status: PR <https://github.com/gufo-org/gufo-extension/pull/27> is open for
+review. Revision `cf9f7aa02991049647abe9487979681e8fd99e2b` (tag `v0.4.0`),
+digest `sha256:3b8e9e867fe187bb7e6fa2a18c3d7a483c8c45d16afc4e9667e685653ff07557`
+from a clean clone at that revision. `registry.py check` and
+`registry.py verify flint 0.4.0` both pass. The rest of this file is the draft
+that was posted; keep it in sync with the branch if the review asks for changes.
 
 The public registry is `github.com/gufo-org/gufo-extension` (`index.json`,
 `extensions/`, `REVIEW.md`). A release enters only after a Gufo maintainer
-reviews its source at the listed commit and approves the PR. This file is the
-draft. Do not open the PR until the 0.4.0 commit exists, is tagged, and the
-digest is computed from a clean clone at that revision.
+reviews its source at the listed commit and approves the PR.
 
-## Before opening
+## Before opening (done)
 
-- [ ] Commit 0.4.0. Record its full SHA as `revision`.
-- [ ] Tag `v0.4.0` on that commit.
-- [ ] Compute the digest with the registry's tool, from a clean clone at that
-      revision: `python3 tools/registry.py digest <clone>`. It must match the
-      tree at `revision`.
-- [ ] Confirm the Gufo build used for validation: v0.36.0
+- [x] Commit 0.4.0. Record its full SHA as `revision`.
+- [x] Tag `v0.4.0` on that commit.
+- [x] Compute the digest with the registry's tool, from a clean clone at that
+      revision: `python3 tools/registry.py digest <clone>`.
+- [x] Confirm the Gufo build used for validation: v0.36.0
       `4a7d8c6d178fc6979e5ae38c07b40e1fe89dd1ce`, extension API **0.3.42**.
-- [ ] The entry's `api_version` stays `>= 0.3.0`. 0.4.0 uses no API newer than
-      the 0.3 series and builds on any 0.3.x host (revisions only add). Do not
-      raise the floor.
-- [ ] After the PR: `python3 tools/registry.py check` and
-      `python3 tools/registry.py verify flint 0.4.0`.
+- [x] The entry's `api_version` stays `>= 0.3.0`.
+- [x] `python3 tools/registry.py check` and
+      `python3 tools/registry.py verify flint 0.4.0` pass.
 
 ## Manifest diff (`index.json`, `extensions.flint`)
 
 Add a release at the top of `releases`. The 0.3.1 entry and older ones stay.
-Replace `<COMMIT>` and `<DIGEST>` with the values from the steps above.
+The values below are the ones the branch uses.
 
 ```diff
      "releases": [
 +      {
 +        "api_version": ">= 0.3.0",
-+        "digest": "sha256:<DIGEST>",
++        "digest": "sha256:3b8e9e867fe187bb7e6fa2a18c3d7a483c8c45d16afc4e9667e685653ff07557",
 +        "notes": "Native tool calls (OpenAI tools/tool_choice, flint-glm dialect, buffered and streamed) and a per-layer row continuation cache: each layer's K/V is append rows, so a capture copies only the valid tokens and a follow-up turn only the new tail; per-session memory is unchanged from 0.3.1. Prefill is split-invariant and checkpoint-aligned; the drafter attends to history injected after a restore (8k repeat 41.5 -> 54.0 t/s, follow-up 43.5 -> 68.6); the GGUF mapping is released after upload (load RSS 26.3 -> 2.4 GB). Cache identity is flint-rocm-session-v2/flint-kv-rows-v2, so 0.3.1 disk caches are a miss by design. Greedy output is deterministic per build and spec-on equals spec-off; greedy output can differ from 0.3.1 because prefill now runs every pass on the prefill kernels and the K-quant WMMA dot uses explicit FMAs. The 8 GiB retained-snapshot cap is unchanged. Built and validated on Gufo v0.36.0 (API 0.3.42); source builds on any 0.3.x host. -c 262144: one session loads in ~10 s; two are admitted and use 78,646 MiB of device.",
 +        "platforms": [
 +          "linux"
 +        ],
-+        "revision": "<COMMIT>",
++        "revision": "cf9f7aa02991049647abe9487979681e8fd99e2b",
 +        "version": "0.4.0"
 +      },
        {
@@ -58,7 +60,7 @@ review asks for it.
 - Name: `flint` (Flint 40B MoE text generation, GGUF `flint` architecture)
 - Version: `0.4.0`
 - Source: https://github.com/brunobarbosaux-ai/flint-gufo-extension
-- Revision: `<COMMIT>`
+- Revision: `cf9f7aa02991049647abe9487979681e8fd99e2b`
 - Tag: `v0.4.0`
 - License: MIT (`LICENSE`, `THIRD_PARTY_NOTICES.md`)
 - Maintainer: @brunobarbosaux-ai
@@ -125,7 +127,7 @@ review asks for it.
   cache (`src/gpu/engine.*`, `continuation_adapter.*`, `runner.cpp`,
   `tests/prefill_split_test.cpp`, `gates/cache_reuse.py`, `tools/spec_gate.cpp`),
   the DFlash2 history fix (`src/spec/`), and the engine load changes
-  (`src/gpu/engine.cpp`). Run `git diff cb7303d5..<COMMIT> --stat` to confirm.
+  (`src/gpu/engine.cpp`). Run `git diff cb7303d5..cf9f7aa --stat` to confirm.
 - No prebuilt binaries are vendored. The model and drafter are user-supplied
   GGUFs.
 - No network access, no telemetry, no writes outside the given model paths.

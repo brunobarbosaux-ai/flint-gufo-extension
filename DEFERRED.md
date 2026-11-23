@@ -5,17 +5,18 @@
 - The M5 memory gate criterion (hidden ring + drafter accounted in `ResourceClaim`) is met: the spec-on per-session claim grows 436 MiB over spec-off and the measured growth is exactly the 320 MiB hidden ring.
 - Action before release: audit `Session::Init` allocations against `SessionBytes` and add the missing terms. Evidence: `/tmp/opencode/m5-smoke/memory2.log`.
 
-### Serve at 262144-token context: loads, but only two sessions fit (capacity, not a hang)
+### Serve at 262144-token context: loads, but advertise two sessions (capacity, not a hang)
 - History: on 2026-11-17 `gufo serve -c 262144` never completed the `sessions` load phase (11+ min, killed; blocked in KFD GPU allocation, GTT climbing past 55 GB, with AND without `--speculative`); 196608 loaded in ~62 s and the boundary was not bisected.
-- **That hang no longer reproduces** (2026-11-22, current 0.3.27 build with the row-component cache): 1 and 2 sessions at 262144 both reach `listening` in ~9 s, spec off. The original hang was never bisected, so the cause is not pinned; only the current behaviour is verified.
-- The remaining limit is device capacity, and the host refuses cleanly instead of hanging. A 262144-token session reserves 27,921,916,852 B (26.0 GiB) of request state, so a 4-session server fails at admission: "4 sessions at 262144-token context need 27921916852 bytes (26.0 GiB) each, but only 78597005312 bytes (73.2 GiB) of device memory is available; at most 2 sessions fit". The 73.2 GiB figure is the admission budget at that moment (free minus host reserve), not the device size; measured `gpu_device_used_mib` is 67.2 GiB for 1 session and 93.0 GiB for 2, of which ~25 GiB is weights and non-claim allocation outside the request-state reservation.
+- **That hang no longer reproduces** (2026-11-22 on the 0.35.0 build with the row-component cache; re-checked 2026-11-23 on Gufo 0.36.0): 1 session at 262144 reaches `listening` in ~10 s, spec off. The original hang was never bisected, so the cause is not pinned; only the current behaviour is verified.
+- **Load time is not stable at two sessions on 0.36.0**: five runs measured 10, 36, 56, 138 and 187 s. This matches the trade-off of releasing the GGUF mapping after upload (0.4.0): the artifact's pages become evictable, and a host that cannot keep 24 GB cached pays a disk read on the next load. One session stays near 10 s. Do not quote a two-session load time without a warmed page cache.
+- The remaining limit is device capacity, and the host refuses cleanly instead of hanging. A 262144-token session reserves 27,921,916,852 B (26.0 GiB) of request state. On 0.36.0 the admission budget is 93,764,722,688 B (87.3 GiB), so **three** sessions are admitted (the old build refused the third) but the third loads in ~112 s and leaves ~5.8 GiB host available; four fail at admission: "at most 3 sessions fit at this context". The budget is free memory minus the host reserve at that moment, not the device size; measured `gpu_device_used_mib` is 51.0 GiB for 1 session, 76.8 GiB for 2 and 102.6 GiB for 3, of which ~25 GiB is weights and non-claim allocation outside the request-state reservation.
 - Not verified: **262144-token requests**. Long-context requests are exercised to 130k (Stage 4/5: dense, sparse, speculative, disk restart — `docs/PLAN-KV-ROWS.md`); a 262144 prefill has not been run through serve, so no throughput claim should be made at that depth.
 - With the ring-buffer PR (sebt3 `feat/ring-kv`, #5) the same box loads 2 sessions at 262144 using 43.6 GiB and **4 sessions using 61.5 GiB** (10 s). When it lands this item collapses to "four sessions at the native context".
 
 ### Serve draft counters report zero (root-caused 2026-11-18; not a logging bug)
 - Serve drives Flint via `SelectNext()`/`Advance()` (per PLAN-DFLASH2: sampler-history correctness), so the counter-copying `DecodeStep` hook (`runner.cpp:612`) is never called; `Descriptor().multi_token_decode` is false and the host's `StepDecode` path never reads `SpecCycle::stats()`.
 - Speculation itself demonstrably runs in serve: decode 74.3 t/s at 8k ≈ spec-on (74.7) vs spec-off (63.6). A same-request A/B tps comparison (serve with vs without `--speculative dflash2`) is the accepted proof for 0.3.0 — no code change.
-- Fix options deferred to v0.4.0: (A) flip `multi_token_decode` capability — extension-only but changes the serve scheduling path (needs full re-verification); (B) host-side counter channel on `TextRunnerState` — touches Gufo core, out of extension scope.
+- Fix options deferred to 0.5.0 (was v0.4.0): (A) flip `multi_token_decode` capability — extension-only but changes the serve scheduling path (needs full re-verification); (B) host-side counter channel on `TextRunnerState` — touches Gufo core, out of extension scope.
 
 ### MMQ scratch arena never reclaimed (noted during `fb616ad` root-cause)
 - `qfn_stack_pool::reserve` allocates a 256 MiB arena per (device, stream); each session owns a private stream, and `flint_mmq_release_stream` (`flint_mmq.h:10`) is declared but never called — arenas are never returned. The claim now models this honestly, but a long-lived server with rotating sessions could accumulate arenas. Action: call `flint_mmq_release_stream` on session teardown, or share one arena under the device lock.
@@ -72,13 +73,15 @@
   installed, which this path does not do; its absence is not a pin signal. Borrow health
   is judged from the flat ledger plus continued captures.
 
-### 8 GiB snapshot cap is now a version guard, not a performance choice
+### 8 GiB snapshot cap: version guard satisfied, raise moves to 0.5.0
 - Measured 2026-11-21 with the merged linear-time fix (gufo#1319, `93a1d230`) in a
   disposable tree, cap removed: capture of a 128,981-token frontier costs **+4.8 s** on a
   104 s prefill (`cache_snapshot_bytes=12,946,504,512`), and a follow-up request restores
   in **172 ms** instead of re-prefilling for ~104 s.
-- On 0.3.27 (the API this line ships against) the same capture still costs ~14 s, so the
-  cap stays: it prevents a 14 s first-request stall for every 0.3.x user.
-- Action when the minimum supported Gufo contains `93a1d230`: raise or remove the cap
-  (`kFlintMaxRetainedSnapshotBytes` in `runner.cpp`), re-run the 130k A/B on the release
-  build, and update the README. Until then, 130k prefix reuse is unavailable by design.
+- Gufo **0.36.0 contains `93a1d230`**, so the version guard's condition is met. The cap
+  stays in 0.4.0 because raising it changes admission and memory behaviour and needs its
+  own 130k A/B on the 0.36 release build.
+- Action in 0.5.0: raise or remove the cap (`kFlintMaxRetainedSnapshotBytes` in
+  `runner.cpp`), re-run the 130k A/B, and update the README. The ring PR changes
+  `payload_layout` to v3 in the same release, so one re-measurement covers both. Until
+  then, 130k prefix reuse is unavailable by design.

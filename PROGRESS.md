@@ -5,8 +5,9 @@
 | Workstream | Plan | Status |
 |---|---|---|
 | DFlash2 speculative decoding (0.3.0, merged) | `docs/PLAN-DFLASH2.md` | COMPLETE — see "Milestone status" below |
-| Tool calls (0.4.0) | `docs/PLAN-DFLASH2.md` + PR #2 | MERGED to main; release waits for PR #3 |
-| Long-context continuation cache → per-layer `kAppendRows` | `docs/PLAN-KV-ROWS.md` | **IN PROGRESS — Stage 1** |
+| Tool calls (0.4.0) | `docs/PLAN-DFLASH2.md` + PR #2 | COMPLETE — merged; ships in 0.4.0 |
+| Long-context continuation cache → per-layer `kAppendRows` | `docs/PLAN-KV-ROWS.md` | COMPLETE — stages 1-5 done; ships in 0.4.0 as layout v2 |
+| 0.4.0 release (0.36.0 validation) | this file + `docs/REGISTRY-PR.md` | **IN PROGRESS — docs pinned, battery + tag + registry PR pending** |
 | Strycast serve gates | (separate repo) | PR #77 open, CI green |
 
 ### KV-rows stage status

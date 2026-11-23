@@ -14,9 +14,10 @@ an MIT-licensed Gufo fork, with its NPU-specific sections removed and the code
 adapted to the external extension contract. See `THIRD_PARTY_NOTICES.md`.
 
 - Maintainer: Bruno Barbosa (brunobarbosaux-ai)
-- Gufo pin: `c40862ffd740832f47187b23f615be5c5b750415` (v0.32.0). The earlier
-  `6cc8a42` (v0.31.0) pin predates `TextProvider::speculative_defaults` and
-  cannot build 0.3.0.
+- Gufo pin: `4a7d8c6d178fc6979e5ae38c07b40e1fe89dd1ce` (v0.36.0, API 0.3.42).
+  That is the tree 0.4.0 is validated on. The source builds on any 0.3-series
+  host (API revisions only add); the earlier `c40862ff` (v0.32.0, API 0.2)
+  pin cannot build 0.3-series code.
 - Gufo API floor: `>= 0.3.0`. Derived from the upstream change records this
   extension relies on: the series-0.2 component-cache-only continuation baseline
   (`0.2.0`), reasoning delimiters (`0.2.5`), provider-defined text sampling
@@ -47,14 +48,20 @@ this repository only reads the format.
 
 ## Speculative decoding (DFlash2)
 
-**Context ceiling.** Verified serve startup on 0.3.27: contexts up to
-**262144 (the model's native maximum) load**, with 1 and 2 sessions each in
-about 9 s. The 262144 hang in session setup reported on 2026-11-17 no longer
-reproduces. The remaining limit is device capacity, not a hang: a
-262144-token session reserves 26.0 GiB of request state, so with 73 GiB in the
-admission budget a 4-session server is **refused at admission** ("at most 2
-sessions fit at this context"); 2 sessions load and use 93 GiB of device
-memory, ~24 GiB of which is the weights. Advertise 2 sessions at 262144.
+**Context ceiling.** Verified serve startup on Gufo 0.36.0 (API 0.3.42):
+contexts up to **262144 (the model's native maximum) load**. One session loads
+in about 10 s. Two sessions are admitted and use 78,646 MiB of device memory
+(~24 GiB of that is the weights), but their load time is not stable on a host
+that cannot keep the 24 GB artifact in page cache: five runs on 0.36.0
+measured 10, 36, 56, 138 and 187 s. That spread is the documented trade-off of
+releasing the GGUF mapping after upload (0.4.0): the pages become evictable, so
+a load pays a disk read the old pinned mapping avoided. The remaining limit is
+capacity, not a hang: a 262144-token session reserves 26.0 GiB of request
+state, so with 87.3 GiB in 0.36.0's admission budget three sessions are
+admitted but the third loads in 111 s and leaves the host at 5.8 GiB
+available, and four are **refused at admission** ("at most 3 sessions fit at
+this context"). Advertise 2 sessions at 262144. The 262144 hang in session setup
+reported on 2026-11-17 no longer reproduces.
 
 Note that this is a **load** check. Long-context *requests* were exercised to
 130k tokens (dense, block-sparse, speculative, and disk-restart restores); a
@@ -65,9 +72,10 @@ as append rows, so a capture copies only the valid tokens (123 MB instead of
 the new tail (25 MB at 128,981 tokens); a warm restore is 2-25 ms from RAM and
 174-577 ms from disk. Capture is still synchronous on the request thread: at
 130k it costs about 4.8 s *with* the upstream linear-time fix in
-gufo-org/gufo#1319, and about 14 s on 0.3.27. The retained-snapshot claim
-therefore stays capped at 8 GiB on the 0.3.x line as a version guard until the
-minimum supported Gufo contains that fix (see `DEFERRED.md`).
+gufo-org/gufo#1319, which Gufo 0.36.0 ships, and about 14 s before it. The
+retained-snapshot claim stays capped at 8 GiB in 0.4.0; raising it is scheduled
+for 0.5.0, together with the ring layout (v3), which changes the same
+measurements again (see `DEFERRED.md`).
 
 Flint can run DFlash2 speculative decoding: a small drafter proposes several
 tokens, and the target verifies them in one batched pass. Accepted tokens are

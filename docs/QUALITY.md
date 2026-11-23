@@ -6,7 +6,9 @@ inconclusive checks stay visible until they pass.
 ## Environment
 
 - GPU: AMD Strix Halo (gfx1151), ROCm 7.2.1
-- Gufo: main `6cc8a42ca84438a0566ee498a315f35c6190dc8e`, v0.31.0 (extension API series 0.2)
+- Gufo (0.4.0 release validation): v0.36.0 `4a7d8c6`, extension API **0.3.42**
+  (series 0.3). Earlier sections below were measured on the 0.3.x line as noted
+  (v0.31.0/0.32.0 for 0.2-series gates, 0.35.0 for the 0.4.0 PR reviews).
 - Build: `gpu-test` preset (`RelWithDebInfo`, HIP on, tests on), option-aligned
   per-tier flags matching the reference fork's builds (fast-math on the vendored
   GEMM/mmq/w8a8 tiers; Flint's own kernels stay `-O3`)
@@ -288,9 +290,10 @@ off; the drafter has no default path). Greedy output is
 byte-identical to spec-off; sampled output is not guaranteed identical (see
 caveat below).
 
-- Validation target (API 0.3): Gufo main `390639b3`, API 0.3.27 (version
-  0.35.0+). The 0.3 port adds the required `TextRunnerDescriptor::scheduling`
-  profile (`pass_tokens` 8192, `max_layer_groups` 1, `max_yield_decode_width` 1)
+- Validation target for 0.3.0: Gufo main `390639b3`, API 0.3.27 (version
+  0.35.0+). 0.4.0 revalidates on v0.36.0 (API 0.3.42); see the 0.4.0 section.
+  The 0.3 port adds the required `TextRunnerDescriptor::scheduling` profile
+  (`pass_tokens` 8192, `max_layer_groups` 1, `max_yield_decode_width` 1)
   and sets `api_version >= 0.3.0`.
 - Environment: extension `0.3.0` (this revision, pending the M6 commit);
   Gufo pin `c40862ff` (v0.32.0), which carries `TextProvider::speculative_defaults`
@@ -351,3 +354,55 @@ consumes RNG draws differently, so the same seed can produce a different stream.
 The sampler distribution is preserved in design (one `Sample` per token), but
 exact per-seed reproduction across spec on/off is not promised. Keep speculation
 off where seed reproducibility is required.
+
+## Native tool calls and the per-layer row cache (0.4.0)
+
+Validated on Gufo v0.36.0 (`4a7d8c6`, API 0.3.42), gfx1151, ROCm 7.2.1;
+extension 0.4.0. Relative to 0.3.1 this release adds native tool calls, turns
+the continuation cache into one `kAppendRows` component per layer per K/V
+(`payload_layout flint-kv-rows-v2`), makes prefill split-invariant (#6), lets
+the drafter attend to history injected after a restore (#8), and releases the
+GGUF mapping once the weights are on the device (#9). The K-quant WMMA dot and
+the sliding-window key-tile origin were fixed alongside.
+
+### Passing checks
+
+| Check | Result | How |
+| --- | --- | --- |
+| `flint.tool_template` | 21 golden conversations rendered byte-identical to the pinned Jinja template | `ctest -R '^flint\.tool_template$'` |
+| `flint.tool_scan` | complete, typed, malformed and unfinished calls; streamed arguments only grow | `ctest -R '^flint\.tool_scan$'` |
+| `flint.prefill_split` | 14 even splits, 0 differing (logits and every layer's K/V); runs in plain `ctest` (41.9 s) and defaults to the Q4 artifact | `ctest -R '^flint\.prefill_split$'` |
+| GX greedy byte-identity, spec-on vs spec-off | 3/3 at depth 0, 8k and 32k on the 0.35.0 review tree; 3/3 at depth 0 on 0.36.0 | `flint_spec_gate --mode gx --prompts-limit 3 --max-tokens 128` |
+| Cache reuse, 24k, RAM and disk | exact bounds `r1 2,390,377,280` / `r3 30,203,008`, restore 607 ms on 0.36.0 (623 ms on 0.35.0), identity `flint-rocm-session-v2:flint-kv-rows-v2` | `gates/cache_reuse.py --cache-disk … --restart --expect-identity …` |
+| Cache-on vs cache-off | identical r1, r2 and r3 output at 8,074 and 23,790 tokens, with and without the drafter | `/tmp/opencode/ab_cache_off.py` |
+| Memory, second-slot delta | 2/2; claims unchanged from the 0.3.1 build: spec-off `2,437,325,748` claimed / `2,225,848,320` measured, spec-on `2,856,756,148` / `2,645,278,720` | `flint_spec_gate --mode memory` |
+| Drafter after a restore | 8,074-token prompt, 128 tokens: cold 56.6, repeat 54.0, follow-up 68.6 t/s, vs `main` 56.5 / 41.5 / 43.5; 23,790 tokens: 60.1 / 49.2 / 57.1 | `gates/cache_reuse.py --max-tokens 128 --dflash-model …` |
+| Load memory | RSS after load 2,447 MiB, vs 26,347 MiB before #9; 2 sessions at 262144 use 78,646 MiB of device | `gufo serve llm -c 262144 -j 2 --log-progress` |
+| Suite | `engine_snapshot`, `target_adapter`, `ops`, `dflash_ops`, `dflash_forward`, `prefill_split` pass on 0.36.0 | `ctest -R '^flint\.'` |
+
+### Compatibility notes for 0.4.0
+
+- **Cache identity** is `flint-rocm-session-v2` / `flint-kv-rows-v2`. Caches
+  written by 0.3.1 (layout v1) do not restore; the host treats them as a miss
+  and re-prefills. The ring PR in 0.5.0 moves to v3 and will invalidate 0.4.0
+  caches the same way.
+- **Greedy output can differ from 0.3.1.** Prefill now runs every pass on the
+  prefill kernels with even-row checkpoints, and the K-quant WMMA dot uses
+  explicit FMAs. Determinism within a build is unchanged, and the
+  spec-on == spec-off gate remains exact.
+- **The 8 GiB retained-snapshot cap is unchanged.** Gufo 0.36.0 contains the
+  linear-time fix (#1319) that makes raising it safe; that change needs its own
+  130k A/B and is scheduled for 0.5.0.
+- **0.36.0 API additions are not used yet:** shared restore
+  (`Adapter::BeginSharedRestore`), beside-decode restores on the copy engine,
+  session-state declarations, and `TextModelRunner::Idle()`. All are 0.5.0
+  candidates; none changes 0.4.0 behaviour.
+
+### Open items in 0.4.0
+
+- Two sessions at 262144 load in 10-187 s depending on how much of the 24 GB
+  artifact stays in page cache (see `DEFERRED.md`). One session is ~10 s.
+- Sampled mode (`temp > 0`) and the temp-1.0 slowdown caveats from 0.3.0 are
+  unchanged.
+- Two concurrent requests that declare the same tool name with different
+  schemas can mislead the tool scanner (documented in `README.md`).

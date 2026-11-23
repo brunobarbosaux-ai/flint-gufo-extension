@@ -28,7 +28,8 @@ again. Consequences measured in 0.3.1:
 
 The cache already supports the right shape: `ComponentKind::kAppendRows` with per-token
 `row_bytes`, `rows_per_chunk = 256`, plus `CopyRowsOut`/`CopyRowsIn`/`BorrowRowsView` and
-the `MutationGuard` hooks. All present at **API 0.3.27** — no newer API is required.
+the `MutationGuard` hooks. All present at **API 0.3.27** (validated on 0.36.0,
+API 0.3.42) — no newer API is required.
 
 ### Goal
 
@@ -453,3 +454,26 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
   (Stage 4/5). The old hang was never bisected, so no cause is attributed.
 - Ring branch (`feat/ring-kv`, #5, unmerged) on the same box: 2 sessions 43.6 GiB,
   4 sessions 61.5 GiB, 10 s.
+
+### 2026-11-23 — Gufo 0.36.0 released; 0.4.0 retargeted; cap guard satisfied
+- Gufo **v0.36.0** (`4a7d8c6`, released 2026-11-23) ships **API 0.3.42** and contains
+  `93a1d230` (#1319). The 0.4.0 release is validated on it; `api_version` stays
+  `>= 0.3.0` (same minor, additive revisions only).
+- **Q1 is unblocked:** the cap's stated condition ("minimum supported Gufo contains the
+  linear-time fix") is met. The raise is still scheduled for **0.5.0**, because it changes
+  admission and memory behaviour and needs its own 130k A/B; the ring's `payload_layout`
+  v3 lands in the same release, so one re-measurement covers both.
+- Admission on 0.36.0: budget 87.3 GiB, so **3** sessions at 262144 are admitted (the
+  third loads in ~112 s, host left at 5.8 GiB) and 4 are refused ("at most 3 sessions fit").
+  Advertise 2.
+- Load time at 2 sessions is unstable again on 0.36.0: 10/36/56/138/187 s across five runs,
+  consistent with the released GGUF mapping becoming evictable (0.4.0's #9 trade-off),
+  not with the old session-phase hang. 1 session is ~10 s.
+- 0.36.0 API additions that touch this plan: `Adapter::BeginSharedRestore` +
+  `Capabilities::shared_restore` (row sharing instead of copying; not adopted in 0.4.0),
+  `mem::Region::PrepareWrite`/`Restore`/`SettleRemaps` for shared pages, and beside-decode
+  restores on the SDMA copy engine (our restores still use `Native()`). All are 0.5.0
+  candidates; none changes 0.4.0 behaviour.
+- 0.4.0 smoke on the 0.36.0 tree: `prefill_split` 0 differing, gx 3/3 spec off and on at
+  depth 0, memory 2/2, disk 24k gate exact (`r1 2,390,377,280`, `r3 30,203,008`,
+  restore 607 ms, v2 identity).

@@ -90,7 +90,44 @@
   checkpoint is retained: an identical repeat restores 63,488 of 128,981 tokens in 85 ms
   and prefills 65,493; after a restart that state is a miss. Answers stayed identical in
   every leg.
-- Action in 0.5.0: raise or remove the cap (`kFlintMaxRetainedSnapshotBytes` in
-  `runner.cpp`), re-run the 130k A/B, and update the README. The ring PR changes
-  `payload_layout` to v3 in the same release, so one re-measurement covers both. Until
-  then, 130k prefix reuse is unavailable by design.
+- Action in 0.5.0: re-measure the 130k A/B on the merged ring tree before raising or
+  removing the cap (`kFlintMaxRetainedSnapshotBytes` in `runner.cpp`). The ring's
+  `flint-kv-rows-window-v1` layout retains 3,995,190,656 B at 128,981 tokens and restores
+  the full prefix in 52 ms, so the cap may no longer bind and the raise may be
+  unnecessary. Until the ring lands, 130k prefix reuse stays partial by design.
+
+### Ring length must carry the masked-tile slack (PR #5, required before merge)
+- slimsami's analysis: aligned SWA key tiles start at
+  `floor((pos_min - window + 1) / kWmmaKeys) * kWmmaKeys`, up to `kWmmaKeys - 1` keys
+  below the window. Those keys are masked, but a row's last bit can still depend on the
+  content of keys its wave partner masks (<= 1 ulp, hardware WMMA). In a ring such a slot
+  may already be overwritten, and what was written there depends on how the prompt was
+  split, so split invariance needs the aligned tiles to stay inside rows the ring holds.
+- A pass touches at most `tile + window + kWmmaKeys - 2` rows, i.e. `tile + window + 30`
+  with `kWmmaKeys = 32`.
+- `RingLength` (`src/gpu/engine.cpp`) is currently `round64(sliding_window + tile)`. With
+  the default tile 4096 that leaves 63 rows of slack (`round64(4609) = 4672`), which is why
+  the rebased run showed 0 differing. A `prefill_tile` with `(sliding_window + tile) % 64`
+  in 35..63 leaves fewer than 30 and splits may differ by an ulp.
+- Fix: `need = sliding_window + tile + kWmmaKeys - 1`, still rounded to 64 and still
+  rejected when it exceeds capacity. `kWmmaKeys` is a `constexpr` local to
+  `src/gpu/kernels/kernels.hip.cpp`; expose it through `kernels.hpp` or name the term in
+  the engine.
+- Regression test: run `flint.prefill_split` with `prefill_tile = 4136` (23 rows of slack
+  before the fix) and require 0 differing after it.
+- Also agreed: assert or comment in `KvRows()` that a window layer must be read through
+  `TransferRows`. Do **not** assert `RingLength == sliding_window + tile` in
+  `prefill_split_test`: comparing the last `sliding_window` rows is the contract, and the
+  extra ring rows are slack that is never read unmasked.
+
+### Drafter context floor invariant (PR #8 follow-up)
+- `history_begin` is the first row actually present in the drafter context, and the
+  kernels never read below it. A restore sets floor = length = frontier
+  (`ResetContext(frontier)`); a gap would be `ResetContext(p)`, with any future
+  `SkipContextTo` a thin wrapper over that rather than a second floor; only restoring
+  drafter rows may lower it.
+- No gap case exists today: `CopyHiddenRows` serves all 8,192 hidden-ring rows and
+  `static_assert(kHiddenRingRows >= kPrefillChunk)` keeps a pass inside it. The ring PR
+  does not touch the drafter, so nothing composes yet.
+- Revisit if `kPrefillChunk` ever grows past `kHiddenRingRows`: that `static_assert` is
+  where `ResetContext(first + skip)` becomes necessary.

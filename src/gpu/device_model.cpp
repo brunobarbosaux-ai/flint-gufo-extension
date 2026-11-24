@@ -55,6 +55,10 @@ public:
     }
   }
 
+  Uploader(const Uploader&) = delete;
+  Uploader& operator=(const Uploader&) = delete;
+  ~Uploader() { if (stage_ != nullptr) (void)hipHostFree(stage_); }
+
   [[nodiscard]] bool Measuring() const noexcept { return weights_ == nullptr; }
 
   [[nodiscard]] std::uint64_t requested() const noexcept { return requested_; }
@@ -94,9 +98,8 @@ public:
     }
     std::size_t offset = 0;
     for (const auto* t : parts) {
-      if (hipMemcpy(static_cast<char*>(out->data) + offset, t->data,
-                    t->size_bytes, hipMemcpyHostToDevice) != hipSuccess) {
-        SetError(error_, "device copy failed");
+      if (!CopyToDevice(static_cast<char*>(out->data) + offset, t->data,
+                        t->size_bytes)) {
         return false;
       }
       offset += t->size_bytes;
@@ -183,6 +186,30 @@ public:
   }
 
 private:
+  /// Copies from the memory-mapped GGUF through one pinned staging buffer: a
+  /// pageable hipMemcpy straight from the mapping can stall for minutes under
+  /// page-cache pressure (the kernel evicts and refaults the pages being read).
+  bool CopyToDevice(void* dst, const void* src, std::size_t bytes) {
+    constexpr std::size_t kStage = std::size_t{64} << 20;
+    if (stage_ == nullptr &&
+        hipHostMalloc(&stage_, kStage, hipHostMallocDefault) != hipSuccess) {
+      SetError(error_, "staging buffer allocation failed");
+      return false;
+    }
+    for (std::size_t off = 0; off < bytes; off += kStage) {
+      const std::size_t n = std::min(kStage, bytes - off);
+      std::memcpy(stage_, static_cast<const char*>(src) + off, n);
+      if (hipMemcpy(static_cast<char*>(dst) + off, stage_, n,
+                    hipMemcpyHostToDevice) != hipSuccess) {
+        SetError(error_, "device copy failed");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void* stage_ = nullptr;
+
   bool Alloc(DeviceTensor* out, std::size_t bytes) {
     requested_ += bytes;
     if (Measuring()) {
@@ -203,16 +230,7 @@ private:
       return false;
     if (Measuring())
       return true;
-    for (std::size_t off = 0; off < bytes; off += kCopyChunk) {
-      const std::size_t n = std::min(kCopyChunk, bytes - off);
-      if (hipMemcpy(static_cast<char*>(out->data) + off,
-                    static_cast<const char*>(src) + off, n,
-                    hipMemcpyHostToDevice) != hipSuccess) {
-        SetError(error_, "device copy failed");
-        return false;
-      }
-    }
-    return true;
+    return CopyToDevice(out->data, src, bytes);
   }
 
   bool ReencodeQ6KToQ8(DeviceTensor* out, const core::GgufTensorInfo& t) {

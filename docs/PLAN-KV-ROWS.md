@@ -494,3 +494,22 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
   capture is a whole frontier (`1,750,424,128 B`), so the `--max-r3-chunk-bytes` exact
   form does not apply after a restore — scope that assertion to in-process runs. The
   capture itself now happens; with v2 it was refused.
+
+### 2026-11-24 — `1bf1538` (ring + `kAttnKeyTile` slack) verified; odd tiles fail on main
+- Built sebt3's head (`1bf1538` = our `3630602` + the slack commit) in a fresh tree
+  (`/tmp/opencode/gufo036`, Gufo v0.36.0, worktree `/tmp/opencode/wt-pr5d`): `prefill_split`
+  14/14 with 0 differing; `prefill_split_tile4136` passes (41.6 s); `ring_snapshot` 10.6 s;
+  `engine_snapshot` 28.4 s; gx 3/3 byte-identical spec-on vs spec-off at depth 0 and 32k.
+- 24k disk gate with restart: `r1 959,071,040 B` — identical to the rebase — restore
+  208.7 ms, identity `flint-rocm-session-v2:flint-kv-rows-window-v1`, answers identical.
+- 130k: `r1 3,995,190,656 B` inside the window-aware bounds; repeat restores
+  128,981/128,981 in 52.1 ms, follow-up 128,980 in 51.4 ms, answers identical.
+- **Odd `prefill_tile` is broken on `main` without the ring.** With the same
+  `FLINT_SPLIT_PREFILL_TILE` hook on `8d70c09`: 4157 fails at row 4156, 4159 fails at row
+  4158 (the last row of the first pass in both cases), while 4096, 4158, 4162 and 4160 on
+  the ring pass. At 4159 the per-split max |diff| values on `main` are the same as on the
+  ring to the digit, so this is pass-length parity, not the ring. Action: validate
+  `prefill_tile` in `Model::Load` (round up or reject) after #5 merges.
+- Asked sebt3 to tighten the rewind guard to `ring_len - sliding_window - kAttnKeyTile + 2`
+  (4129 vs 4160 at the default tile); `tools/drafter_parity.cpp`'s `Rewind(0)` needs
+  `Reset()`/restore once that lands.

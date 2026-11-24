@@ -12,6 +12,11 @@
 /// from device memory so a captured decode graph replays at any depth.
 namespace gufo::models::flint::gpu::rocm {
 
+/// Keys per attention key tile. Sliding-window attention starts its tiles on a
+/// multiple of this, up to `kAttnKeyTile - 1` keys below the window, so a
+/// sliding-window KV ring needs that many rows beyond window + prefill tile.
+constexpr std::uint32_t kAttnKeyTile = 32;
+
 /// out[t] = dequantized Q8_0 row tokens[t] of the embedding table.
 void EmbedQ8(const void* table, const std::int32_t* tokens, float* out,
              std::uint32_t n_tokens, std::uint32_t hidden, hipStream_t stream);

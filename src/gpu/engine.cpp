@@ -228,11 +228,19 @@ struct ModelState {
 // the layer keeps every position. A ring must hold the window plus the rows of
 // one launch (a prefill tile): the launch writes its rows before attention
 // reads, and the earliest query still needs the `window` keys that precede it.
+// It also holds `kAttnKeyTile - 1` extra rows: attention key tiles start on a
+// multiple of kAttnKeyTile, up to that many keys below the window. Those keys
+// are masked, but a row's last bit can depend on the content of the keys its
+// wave partner masks (<= 1 ulp, hardware WMMA). A masked key whose slot was
+// already overwritten would make that content depend on how the prompt was
+// split, so the ring must still hold them. A pass touches at most
+// `tile + window + kAttnKeyTile - 2` rows.
 std::uint32_t RingLength(const Config& c, std::uint32_t tile,
                          std::uint32_t capacity) {
   if (c.sliding_window == 0)
     return 0;
-  const std::uint64_t need = std::uint64_t{c.sliding_window} + tile;
+  const std::uint64_t need =
+      std::uint64_t{c.sliding_window} + tile + rocm::kAttnKeyTile - 1;
   const std::uint64_t rounded = (need + 63) / 64 * 64;
   return rounded < capacity ? static_cast<std::uint32_t>(rounded) : 0;
 }

@@ -846,7 +846,7 @@ __device__ __forceinline__ v16h LoadFrag(const __half* p) {
   return r;
 }
 
-constexpr int kWmmaKeys = 32;
+constexpr int kWmmaKeys = kAttnKeyTile;  // see kernels.hpp: sizes the SWA ring
 constexpr int kNb = kWmmaKeys / 16;
 constexpr int kWmmaHeadDim = 128;
 constexpr int kWmmaGroup = 8;

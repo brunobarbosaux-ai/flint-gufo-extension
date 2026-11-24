@@ -427,6 +427,16 @@ if(TARGET flint_prefill_split_test)
   add_test(NAME flint.prefill_split COMMAND flint_prefill_split_test)
   set_tests_properties(flint.prefill_split
     PROPERTIES LABELS "flint;hip;gpu;gfx1151")
+  # prefill_tile 4136 leaves 23 rows of ring slack from rounding alone, fewer
+  # than the 30 masked key rows below the window that an aligned key tile can
+  # read. Guard for the RingLength slack; it passes with and without the extra
+  # rows on gfx1151 (the <= 1 ulp effect did not reproduce), so it does not
+  # discriminate. Odd tiles (4157, 4159, 4161, 4223) differ for another reason,
+  # with and without the extra rows.
+  add_test(NAME flint.prefill_split_tile4136 COMMAND flint_prefill_split_test)
+  set_tests_properties(flint.prefill_split_tile4136
+    PROPERTIES LABELS "flint;hip;gpu;gfx1151"
+               ENVIRONMENT "FLINT_SPLIT_PREFILL_TILE=4136")
 endif()
 
 # Snapshot restore across a wrapped sliding-window ring (9000-token prefix, the

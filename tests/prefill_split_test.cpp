@@ -189,7 +189,12 @@ int main() {
   try {
     const auto prompt = EncodePrompt(target, kPromptTokens);
     std::string error;
-    auto model = flint::Model::Load(target, {}, &error);
+    flint::EngineOptions options;
+    // FLINT_SPLIT_PREFILL_TILE: run with a prefill tile that leaves little ring
+    // slack (see RingLength), e.g. 4136.
+    if (const char* t = std::getenv("FLINT_SPLIT_PREFILL_TILE"))
+      options.prefill_tile = static_cast<std::uint32_t>(std::atoi(t));
+    auto model = flint::Model::Load(target, options, &error);
     RequireOk(model != nullptr, error, "target model");
 
     auto ref = Prefill(*model, prompt, {});

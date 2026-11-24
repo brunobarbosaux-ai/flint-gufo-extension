@@ -131,3 +131,25 @@
   does not touch the drafter, so nothing composes yet.
 - Revisit if `kPrefillChunk` ever grows past `kHiddenRingRows`: that `static_assert` is
   where `ResetContext(first + skip)` becomes necessary.
+
+### `prefill_tile` must be even (pre-existing, found by sebt3 while reviewing #5)
+- A prefill pass with an odd row count leaves its last row wrong. On `main` (`8d70c09`, no
+  ring) tile 4157 first differs at row 4156 and tile 4159 at row 4158 — the last row of
+  the first pass — while 4096, 4158, 4162 and 4160 all give 0 differing. At 4159 the
+  per-split max |diff| values are the same on `main` and on the ring, so the ring does not
+  cause it.
+- Default 4096 hides it; nothing validates the option, so a user-set odd tile silently
+  produces rows that disagree with an unpaged prefill.
+- Fix after #5 merges: validate in `Model::Load` — round an odd `prefill_tile` up to even,
+  or reject it with a clear message (sebt3's call, his finding). Regression: load with an
+  odd tile in `flint.config` or `EngineOptions` and assert the rounded/rejected value, and
+  keep `flint.prefill_split_tile4136` as the near-boundary leg.
+
+### Rewind guard and `tools/drafter_parity.cpp` under the ring (PR #5)
+- `Session::Rewind` flags `ring_broken` when a rewind exceeds
+  `ring_len - sliding_window + 1` (4160 at the default tile). The strict bound also pays
+  for the masked aligned key tiles: `ring_len - sliding_window - kAttnKeyTile + 2` = 4129.
+- Production rewinds are <= 7 rows, so the tighter guard costs nothing and fails loudly
+  instead of serving silently wrong rows.
+- `tools/drafter_parity.cpp` calls `Rewind(0)` after a long prompt and will trip the guard:
+  it should `Reset()` or restore a snapshot instead.

@@ -405,8 +405,12 @@ the sliding-window key-tile origin were fixed alongside.
 
 ### Open items in 0.4.0
 
-- Two sessions at 262144 load in 10-187 s depending on how much of the 24 GB
-  artifact stays in page cache (see `DEFERRED.md`). One session is ~10 s.
+- Two sessions at 262144 load in 10-187 s because the weight upload copies
+  straight out of the memory-mapped artifact and refaults its pages under cache
+  pressure; releasing the mapping after upload makes those pages evictable but is
+  not the cause, and it is not a stall fix (issue #10). A staged pinned copy,
+  measured on `main` at 24.6-25.6 s against 32.9-51.4 s, is expected in 0.5.0.
+  One session is ~10 s.
 - Sampled mode (`temp > 0`) and the temp-1.0 slowdown caveats from 0.3.0 are
   unchanged.
 - Two concurrent requests that declare the same tool name with different

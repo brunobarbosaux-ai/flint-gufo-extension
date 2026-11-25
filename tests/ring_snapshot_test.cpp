@@ -126,6 +126,22 @@ int main() {
               std::string(name) + ": logits after the decode steps");
       std::cout << "  " << name << " ok\n";
     }
+
+    // Rewind: a speculative cycle rewinds a few rows, which the ring must
+    // serve; a rewind of a whole prefix has lost keys and must fail loudly
+    // instead of reading overwritten rows.
+    Require(fresh->RestoreSnapshot(snapshot, &error),
+            "rewind legs restore: " + error);
+    fresh->Rewind(kPrefix - 7);
+    Require(fresh->Append({prefix.data() + kPrefix - 7, 7}, &error),
+            "append after a 7-row rewind: " + error);
+    Require(fresh->Position() == kPrefix, "position after the short rewind");
+    fresh->Rewind(0);
+    Require(!fresh->Append({prefix.data(), 1}, &error),
+            "append after rewinding past the ring must fail");
+    Require(fresh->RestoreSnapshot(snapshot, &error),
+            "restore clears the broken ring: " + error);
+    std::cout << "  rewind ok\n";
     std::cout << "flint ring snapshot tests passed\n";
   } catch (const std::exception& e) {
     std::cerr << "flint ring snapshot test FAILED: " << e.what() << "\n";

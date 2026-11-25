@@ -1477,11 +1477,14 @@ void Session::Rewind(std::uint32_t position) noexcept {
   if (position >= impl_->position)
     return;
   // A ring holds the last `ring_len` positions: a query at `position` needs the
-  // `sliding_window` keys before it, so a rewind of more than the slack between
-  // the two has lost keys that the next append would read.
+  // `sliding_window` keys before it, and the aligned key tile it lands in may
+  // start up to `kAttnKeyTile - 1` keys earlier still (masked, but the ring
+  // keeps them, see RingLength). A rewind of more than the slack left by those
+  // two has lost keys that the next append would read.
   if (impl_->ring_len != 0) {
-    const std::uint32_t slack =
-        impl_->ring_len - impl_->model->config.sliding_window + 1;
+    const std::uint32_t slack = impl_->ring_len -
+                                impl_->model->config.sliding_window -
+                                rocm::kAttnKeyTile + 2;
     if (impl_->position - position > slack)
       impl_->ring_broken = true;
   }

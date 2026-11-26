@@ -26,6 +26,7 @@
 #include "hip/vendor/qwen/tokenizer.hpp"
 #include "src/chat_template.hpp"
 #include "src/gpu/dflash/dflash_forward.hpp"
+#include "src/gpu/kernels/kernels.hpp"
 #include "src/gpu/dflash/dflash_weights.hpp"
 #include "src/gpu/engine.hpp"
 #include "src/runtime/config.hpp"
@@ -47,7 +48,12 @@ constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v2";
 // split-invariant, so K/V rows a v1 build captured differ from the rows this
 // code computes for the same prefix and must not restore. window-v1: window
 // layers are a ring of kWindowRows, so v2 full-row captures do not restore.
-constexpr std::string_view kFlintPayloadLayout = "flint-kv-rows-window-v1";
+// -matrix: a FLINT_MATRIX_ATTENTION build computes rows that differ from a
+// default build's, so the two must not restore each other's captures.
+std::string_view FlintPayloadLayout() {
+  return gpu::rocm::MatrixAttentionBuild() ? "flint-kv-rows-window-v1-matrix"
+                                           : "flint-kv-rows-window-v1";
+}
 
 // A retained snapshot is one full private state (~15.7 GiB at 130k context
 // on this model). The host captures it synchronously on the request thread,
@@ -73,7 +79,7 @@ std::vector<std::uint8_t> FlintCompatibilityIdentity(
            << "context_tokens=" << max_context << '\n'
            << "chat_template=flint-glm-compiled-v1\n"
            << "state_abi=" << kFlintStateAbi << '\n'
-           << "payload_layout=" << kFlintPayloadLayout << '\n';
+           << "payload_layout=" << FlintPayloadLayout() << '\n';
   const auto canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -88,7 +94,7 @@ std::vector<std::uint8_t> ComponentIdentity(const FlintModel* model,
            << "model_instance=" << model << '\n'
            << "context_tokens=" << max_context << '\n'
            << "state_abi=" << kFlintStateAbi << '\n'
-           << "payload_layout=" << kFlintPayloadLayout << '\n';
+           << "payload_layout=" << FlintPayloadLayout() << '\n';
   const auto canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -265,7 +271,7 @@ public:
     // store only a digest of the identity, so this line is the only readable
     // record of it.
     Log("event=cache_identity state_abi=" + std::string(kFlintStateAbi) +
-        " payload_layout=" + std::string(kFlintPayloadLayout) +
+        " payload_layout=" + std::string(FlintPayloadLayout()) +
         " context_tokens=" + std::to_string(max_context_) +
         " identity_bytes=" + std::to_string(component_identity_.size()));
     Warmup();

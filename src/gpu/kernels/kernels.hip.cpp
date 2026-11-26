@@ -1874,15 +1874,20 @@ void PoolKeyBlocks(const __half* k_cache, __half* kmm,
 }
 
 namespace {
-// 0: the matrix-core slice kernel where it applies; 1: the scalar kernels.
-int g_attention_mode = []() {
-  const char* e = std::getenv("FLINT_ATTN_OLD");
-  return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
-}();
+#ifdef FLINT_MATRIX_ATTENTION
+constexpr bool kMatrixAttentionBuild = true;
+#else
+constexpr bool kMatrixAttentionBuild = false;
+#endif
+bool g_matrix_attention = kMatrixAttentionBuild;
 }  // namespace
 
-void SetAttentionMode(int mode) {
-  g_attention_mode = mode;
+bool MatrixAttentionBuild() noexcept {
+  return kMatrixAttentionBuild;
+}
+
+void SetMatrixAttention(bool enabled) noexcept {
+  g_matrix_attention = enabled;
 }
 
 void AttentionSplit(const float* q, const __half* k_cache,
@@ -1893,7 +1898,7 @@ void AttentionSplit(const float* q, const __half* k_cache,
                     std::uint32_t window, std::uint32_t splits,
                     hipStream_t stream, std::uint32_t ring) {
   const std::uint32_t group = heads / kv_heads;
-  if (g_attention_mode == 0 && window == 0 && head_dim == 128 && group == 8 &&
+  if (g_matrix_attention && window == 0 && head_dim == 128 && group == 8 &&
       n_tokens >= 1 && n_tokens <= 8) {
     AttentionSliceWmmaKernel<<<dim3(kv_heads, splits,
                                     (n_tokens + kSliceRows - 1) / kSliceRows),

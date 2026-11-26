@@ -106,6 +106,21 @@ if(TARGET gufo_flint_hip)
     target_sources(gufo_flint_hip PRIVATE hip/vendor/quant/ggml_dequant.cpp)
   endif()
   target_compile_definitions(gufo_flint_hip PRIVATE ENGINE_ENABLE_HIP=1)
+  # Matrix-core decode attention for the global layers (docs/ATTENTION-WMMA.md):
+  # off by default, it is not bit-exact to the scalar kernels. A build-time
+  # choice, so one binary has one numerics mode. `gufo extension install` passes
+  # no CMake variable, hence the environment variable of the same name.
+  set(_flint_matrix_default OFF)
+  if(DEFINED ENV{FLINT_MATRIX_ATTENTION})
+    set(_flint_matrix_default "$ENV{FLINT_MATRIX_ATTENTION}")
+  endif()
+  option(FLINT_MATRIX_ATTENTION
+    "Flint: matrix-core decode attention for the global layers"
+    ${_flint_matrix_default})
+  if(FLINT_MATRIX_ATTENTION)
+    message(STATUS "Flint: matrix-core decode attention ON")
+    target_compile_definitions(gufo_flint_hip PRIVATE FLINT_MATRIX_ATTENTION=1)
+  endif()
   target_compile_options(gufo_flint_hip PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>

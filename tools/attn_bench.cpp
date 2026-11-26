@@ -85,7 +85,7 @@ int main() {
       const std::uint32_t start = depth - n;
       hipMemcpy(dpos, &start, 4, hipMemcpyHostToDevice);
       const auto run = [&](int mode, std::uint32_t splits) {
-        rk::SetAttentionMode(mode);
+        rk::SetMatrixAttention(mode == 0);
         rk::AttentionSplit(dq, dk, dv, dsink, dout, nullptr, dpart, n, dpos,
                            heads, kv_heads, d, 0, splits, nullptr);
       };
@@ -129,7 +129,7 @@ int main() {
     // pair and alone, bit for bit (64 rows per depth, and per pair size).
     for (const int mode : {1, 0}) {
       const std::uint32_t splits = mode == 1 ? 32 : 64;
-      rk::SetAttentionMode(mode);
+      rk::SetMatrixAttention(mode == 0);
       std::uint32_t bad_pair = 0, bad_single = 0, total = 0;
       for (std::uint32_t offs = 0; offs < 8; ++offs) {
         const std::uint32_t start8 = depth - 8 + offs;
@@ -170,7 +170,7 @@ int main() {
     // 0 (it is masked for row 0 and live for row 1) and see what moves.
     {
       const std::uint32_t start8 = depth - 8;
-      rk::SetAttentionMode(0);
+      rk::SetMatrixAttention(true);
       hipMemcpy(dpos, &start8, 4, hipMemcpyHostToDevice);
       const auto pair_run = [&](std::vector<float>* out) {
         rk::AttentionSplit(dq, dk, dv, dsink, dout, nullptr, dpart, 2, dpos,
@@ -208,7 +208,7 @@ int main() {
       Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
           " leak_probe " + out_line);
     }
-    rk::SetAttentionMode(0);
+    rk::SetMatrixAttention(rk::MatrixAttentionBuild());
     hipEventDestroy(t0);
     hipEventDestroy(t1);
     hipFree(dk);

@@ -3,8 +3,18 @@
 `AttentionSliceWmmaKernel` (`src/gpu/kernels/kernels.hip.cpp`) replaces the
 scalar slice kernels for a global layer (no window, `head_dim` 128, a group of 8
 query heads per KV head) when the pass carries 1 to 8 rows: plain decode and the
-verification pass of speculative decoding. `FLINT_ATTN_OLD=1` selects the scalar
-kernels again.
+verification pass of speculative decoding.
+
+It is **off by default** and chosen at build time:
+
+```sh
+FLINT_MATRIX_ATTENTION=1 gufo extension install <source>
+```
+
+(or `-DFLINT_MATRIX_ATTENTION=ON` in a CMake build). Such a build writes its
+continuation cache as `flint-kv-rows-window-v1-matrix`, so it never restores
+rows a default build computed, nor the reverse. A default build runs the scalar
+kernels with 32 key slices.
 
 ## Why
 
@@ -74,12 +84,13 @@ real engine.
 
 * **Not bit-exact against the scalar kernels.** The query and the probabilities
   are rounded to F16, so outputs differ by ~1e-4 relative (max 1.8e-4 at 8k,
-  ~1e-4 at 32k). Greedy outputs therefore change against the scalar path; the
-  scalar path stays available with `FLINT_ATTN_OLD=1` and then matches `main`.
+  ~1e-4 at 32k). Greedy outputs therefore change against the scalar path; a
+  default build runs the scalar path and matches `main`.
   What does hold is row invariance (a row in a block of 64 equals the row alone)
   and drafter-on == drafter-off with this kernel.
-* `kGlobalSplits` goes from 32 to 64 for the global layers. That alone changes
-  the greedy output at ~28k tokens, even on the scalar path.
+* A matrix-core build runs `kGlobalSplits` 64 instead of 32 for the global
+  layers. That alone changes the greedy output at ~28k tokens, even on the
+  scalar path.
 * Measured on gfx1151 at 0 / ~6k / ~29k tokens, plain one-row decode is the same
   as the scalar kernel (within 2 %); the gain is for the multi-row verification
   pass of speculative decoding.

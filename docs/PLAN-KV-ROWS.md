@@ -513,3 +513,21 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Asked sebt3 to tighten the rewind guard to `ring_len - sliding_window - kAttnKeyTile + 2`
   (4129 vs 4160 at the default tile); `tools/drafter_parity.cpp`'s `Rewind(0)` needs
   `Reset()`/restore once that lands.
+
+### 2026-11-26 — #5 merged (ring KV for sliding-window layers)
+- sebt3's rewind guard landed as `968b720` on top of `1bf1538`: `Rewind()` slack is
+  `ring_len - sliding_window - kAttnKeyTile + 2` (4129 at the default tile), plus a
+  `ring_snapshot_test` leg — a 7-row rewind re-appends, `Rewind(0)` fails the next
+  `Append`, and a restore clears it.
+- Verified before merge on a fresh 0.36.0 build: `ring_snapshot` passes with `rewind ok`
+  (direct run prints `same session ok / fresh session ok / rewind ok`); `prefill_split`
+  14/14 in 42.4 s; `tile4136` 41.4 s; `engine_snapshot` 28.1 s; gx 3/3 byte-identical at
+  depth 0 and 32k; 24k disk gate `r1 959,071,040 B`, restore 272 ms; 130k
+  `r1 3,995,190,656 B`, repeat 128,981/128,981 in 51.5 ms, follow-up 128,980 in 52.7 ms.
+- Timing note: `prefill_split` showed 168 s twice when started straight after a build;
+  warm runs are 42-43 s, and tiles 4096/4128/4160 all give 41-43 s with 14/14 identical.
+  The number was cold-start noise, not a tile-dependent path.
+- Merged as `c47ce23` with a merge commit: ten commits, sebt3's authorship preserved.
+- Post-merge on `main`: `tools/drafter_parity.cpp`'s `Rewind(0)` becomes `Reset()` (the
+  ring rejects a deep rewind), and `prefill_tile` must be even — validated in
+  `Model::Load`, since an odd pass leaves its last row wrong.

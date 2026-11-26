@@ -19,6 +19,17 @@ Shipped and idle:
   `cb7303d5`, digest `sha256:a112bc6e…`; `registry.py verify flint 0.3.1` passes;
   post-merge `Registry checks` and `Website catalogue` both green.
 
+Merged for 0.5.0:
+- **Ring KV (#5) merged 2026-11-26 as `c47ce23`** (merge commit, sebt3's ten
+  commits keep their authorship). Head verified before merge (`968b720`): own
+  battery green — `ring_snapshot` with the `rewind ok` leg, `prefill_split`
+  14/14 (42.4 s), `tile4136` (41.4 s), `engine_snapshot` (28.1 s), gx 3/3 at
+  depth 0 and 32k, 24k disk gate `r1 959,071,040 B` restore 272 ms, 130k
+  `r1 3,995,190,656 B` restoring fully in ~52 ms.
+- Post-merge fixes landing on `main`: `tools/drafter_parity.cpp` `Rewind(0)` to
+  `Reset()` (the ring makes a deep rewind illegal), and `prefill_tile` parity
+  validation in `Model::Load` (odd tiles were silently wrong on `main`).
+
 Released, awaiting registry review:
 - 0.4.0 (tool calls + per-layer row cache + #6 + #8 + #9) — validated on Gufo
   v0.36.0 (API 0.3.42), tagged `v0.4.0` at `cf9f7aa`; registry PR
@@ -30,6 +41,8 @@ Released, awaiting registry review:
   renames `payload_layout` from `flint-kv-rows-v2` to `flint-kv-rows-window-v1`
   and keeps `state_abi` at `flint-rocm-session-v2`; the identity string changes,
   so 0.4.0 disk caches stop restoring and are re-prefilled.
+- Also queued for 0.5.0: the staged weight copy (#10, sebt3's
+  `fix/staged-weight-copy`) once his PR is up and our A/B passes.
 
 ## Decisions in force
 

@@ -6,7 +6,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "gufo/ext/experimental/ggml_dequant.hpp"
 #include "gufo/ext/experimental/managed_alloc.hpp"
@@ -36,6 +38,28 @@ std::uint16_t FloatToHalf(float f) {
   std::uint16_t bits = 0;
   std::memcpy(&bits, &h, sizeof(bits));
   return bits;
+}
+
+/// memcpy over up to four threads. Out of the mapped GGUF the copy also faults
+/// the pages in, and one thread then takes about three times as long as the
+/// transfer to the device.
+void ParallelCopy(void* dst, const void* src, std::size_t bytes) {
+  constexpr std::size_t kThreads = 4;
+  constexpr std::size_t kMinPerThread = std::size_t{4} << 20;
+  const std::size_t parts = std::clamp<std::size_t>(bytes / kMinPerThread, 1,
+                                                    kThreads);
+  const std::size_t step = bytes / parts;
+  std::vector<std::jthread> workers;
+  workers.reserve(parts - 1);
+  for (std::size_t i = 1; i < parts; ++i) {
+    const std::size_t off = i * step;
+    const std::size_t n = i + 1 == parts ? bytes - off : step;
+    workers.emplace_back([=] {
+      std::memcpy(static_cast<char*>(dst) + off,
+                  static_cast<const char*>(src) + off, n);
+    });
+  }
+  std::memcpy(dst, src, parts == 1 ? bytes : step);
 }
 
 class Uploader {
@@ -198,7 +222,7 @@ private:
     }
     for (std::size_t off = 0; off < bytes; off += kStage) {
       const std::size_t n = std::min(kStage, bytes - off);
-      std::memcpy(stage_, static_cast<const char*>(src) + off, n);
+      ParallelCopy(stage_, static_cast<const char*>(src) + off, n);
       if (hipMemcpy(static_cast<char*>(dst) + off, stage_, n,
                     hipMemcpyHostToDevice) != hipSuccess) {
         SetError(error_, "device copy failed");

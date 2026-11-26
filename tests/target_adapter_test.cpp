@@ -6,6 +6,9 @@
 //      same prefix, and the packed layout is row-major by position then tap.
 //   3. Rewind() leaves the session in the state of a fresh session that
 //      appended exactly that prefix: position, logits, and the next append.
+//   4. At 8k and 32k, each row of a 7-row verify pass is bit-identical to the
+//      same row decoded alone, with stale rows past the position, for both
+//      decode attention kernels of the global layers.
 //
 // The target is FLINT_TARGET, or the Q4_K_XL artifact the other tools default
 // to. If the file or a HIP device is absent the test skips with exit 0.
@@ -27,6 +30,7 @@
 
 #include "hip/vendor/qwen/tokenizer.hpp"
 #include "src/gpu/engine.hpp"
+#include "src/gpu/kernels/kernels.hpp"
 #include "src/spec/target_adapter.hpp"
 
 namespace flint = gufo::models::flint::gpu;
@@ -221,6 +225,32 @@ void TestRewind(const Fixture& fx) {
             << " matches a fresh session (position and next 4 appends)\n";
 }
 
+void TestRowsAtDepth(const Fixture& fx, const std::string& target,
+                     std::uint32_t depth, bool matrix) {
+  namespace kernels = gufo::models::flint::gpu::rocm;
+  constexpr std::uint32_t kWidth = 7, kStale = 32;
+  std::string error;
+  const auto prompt = EncodePrompt(target, depth + kStale + kWidth);
+  kernels::SetMatrixAttention(matrix);
+  auto session = fx.model->CreateSession(depth + kStale + 16, &error);
+  RequireOk(session != nullptr, error, "deep session");
+  auto adapter = spec::TargetAdapter::Create(*session, kTaps, fx.hidden, &error);
+  RequireOk(adapter != nullptr, error, "deep adapter");
+  RequireOk(adapter->AppendPrompt({prompt.data(), depth}, &error), error,
+            "deep prefix");
+  // Leave other tokens' keys past the position, as an abandoned draft does.
+  for (std::uint32_t k = 0; k < kStale; k += 8)
+    RequireOk(adapter->VerifyRows({prompt.data() + depth + k, 8}, &error),
+              error, "stale rows");
+  adapter->Rewind(depth);
+  RequireOk(adapter->CheckRowsBitIdentical(
+                {prompt.data() + depth + kStale, kWidth}, &error),
+            error, "deep rows bit-identical");
+  kernels::SetMatrixAttention(kernels::MatrixAttentionBuild());
+  std::cout << "  rows bit-identical, width " << kWidth << " at " << depth
+            << ", " << (matrix ? "matrix" : "scalar") << " kernel\n";
+}
+
 }  // namespace
 
 int main() {
@@ -246,6 +276,9 @@ int main() {
     TestRowsBitIdentical(fx);
     TestFeatures(fx);
     TestRewind(fx);
+    for (const std::uint32_t depth : {8192U, 32768U})
+      for (const bool matrix : {false, true})
+        TestRowsAtDepth(fx, target, depth, matrix);
   } catch (const std::exception& error) {
     std::cerr << "flint target adapter tests failed: " << error.what() << "\n";
     return 1;

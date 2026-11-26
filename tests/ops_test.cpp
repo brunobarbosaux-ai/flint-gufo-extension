@@ -6,14 +6,17 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "hip/vendor/rocm/kernels.hpp"
+#include "src/gpu/kernels/kernels.hpp"
 
 namespace rocm = gufo::vendor::qwen38_flash_next::rocm;
+namespace flint_rocm = gufo::models::flint::gpu::rocm;
 namespace {
 
 void Check(hipError_t error, const char* operation) {
@@ -111,6 +114,99 @@ void TestSiluScale(float* x_dev, hipStream_t stream) {
   Near(got, want, 1e-4F, "SiluScale");
 }
 
+/// Decode attention of a global layer: each row of a 7-row pass must equal,
+/// bit for bit, the same row computed alone. Every K/V row of the buffer holds
+/// random data, so the keys past a row's position are the stale cache a real
+/// session has there: a kernel that lets a masked key reach a row fails here.
+/// The 32 start offsets move the rows across every position in a key tile.
+void TestAttentionRowInvariance(std::uint32_t depth, bool matrix) {
+  constexpr std::uint32_t kHeads = 32, kKvHeads = 4, kDim = 128, kRows = 7;
+  constexpr std::uint32_t kOffsets = 32;
+  const std::uint32_t splits = matrix ? 64 : 32;
+  const std::size_t kv_elems =
+      std::size_t{depth + kOffsets + kRows + 64} * kKvHeads * kDim;
+  const std::size_t row_floats = std::size_t{kHeads} * kDim;
+
+  const auto random_half = [](std::size_t n, std::uint32_t x) {
+    std::vector<__half> v(n);
+    for (auto& h : v) {
+      x = x * 1664525U + 1013904223U;
+      h = __float2half((static_cast<float>(x >> 9) / 4194304.0F - 1.0F) * 0.5F);
+    }
+    return v;
+  };
+  const auto k = random_half(kv_elems, 1);
+  const auto v = random_half(kv_elems, 2);
+  const auto q = Data(kRows * row_floats, 1.0F);
+  const std::vector<float> sinks(kHeads, 0.0F);
+
+  __half *k_dev = nullptr, *v_dev = nullptr;
+  float *q_dev = nullptr, *sink_dev = nullptr, *out_dev = nullptr,
+        *part_dev = nullptr;
+  std::uint32_t* pos_dev = nullptr;
+  Check(hipMalloc(&k_dev, kv_elems * sizeof(__half)), "malloc k");
+  Check(hipMalloc(&v_dev, kv_elems * sizeof(__half)), "malloc v");
+  Check(hipMalloc(&q_dev, q.size() * 4), "malloc q");
+  Check(hipMalloc(&sink_dev, sinks.size() * 4), "malloc sinks");
+  Check(hipMalloc(&out_dev, q.size() * 4), "malloc attention out");
+  Check(hipMalloc(&part_dev,
+                  std::size_t{kRows} * kHeads * splits * (kDim + 2) * 4),
+        "malloc partial");
+  Check(hipMalloc(&pos_dev, 4), "malloc position");
+  Check(hipMemcpy(k_dev, k.data(), kv_elems * sizeof(__half),
+                  hipMemcpyHostToDevice),
+        "copy k");
+  Check(hipMemcpy(v_dev, v.data(), kv_elems * sizeof(__half),
+                  hipMemcpyHostToDevice),
+        "copy v");
+  Check(hipMemcpy(q_dev, q.data(), q.size() * 4, hipMemcpyHostToDevice),
+        "copy q");
+  Check(hipMemcpy(sink_dev, sinks.data(), sinks.size() * 4,
+                  hipMemcpyHostToDevice),
+        "copy sinks");
+
+  flint_rocm::SetMatrixAttention(matrix);
+  const auto run = [&](std::uint32_t start, std::uint32_t first,
+                       std::uint32_t count) {
+    const std::uint32_t position = start + first;
+    Check(hipMemcpy(pos_dev, &position, 4, hipMemcpyHostToDevice),
+          "copy position");
+    flint_rocm::AttentionSplit(
+        q_dev + first * row_floats, k_dev, v_dev, sink_dev, out_dev, nullptr,
+        part_dev, count, pos_dev, kHeads, kKvHeads, kDim, 0, splits, nullptr);
+    Check(hipDeviceSynchronize(), "sync attention");
+    std::vector<float> got(count * row_floats);
+    Check(hipMemcpy(got.data(), out_dev, got.size() * 4,
+                    hipMemcpyDeviceToHost),
+          "copy attention out");
+    return got;
+  };
+  for (std::uint32_t offset = 0; offset < kOffsets; ++offset) {
+    const std::uint32_t start = depth + offset;
+    const auto block = run(start, 0, kRows);
+    for (std::uint32_t row = 0; row < kRows; ++row) {
+      const auto alone = run(start, row, 1);
+      if (std::memcmp(block.data() + row * row_floats, alone.data(),
+                      row_floats * 4) != 0) {
+        throw std::runtime_error(
+            std::string("attention row invariance (") +
+            (matrix ? "matrix" : "scalar") + "): depth " +
+            std::to_string(depth) + " offset " + std::to_string(offset) +
+            " row " + std::to_string(row) + " differs from the row alone");
+      }
+    }
+  }
+  flint_rocm::SetMatrixAttention(flint_rocm::MatrixAttentionBuild());
+
+  for (void* p : {static_cast<void*>(k_dev), static_cast<void*>(v_dev),
+                  static_cast<void*>(q_dev), static_cast<void*>(sink_dev),
+                  static_cast<void*>(out_dev), static_cast<void*>(part_dev),
+                  static_cast<void*>(pos_dev)})
+    (void)hipFree(p);
+  std::cout << "  attention rows invariant, depth " << depth << ", "
+            << (matrix ? "matrix" : "scalar") << " kernel\n";
+}
+
 }  // namespace
 
 int main() {
@@ -129,6 +225,9 @@ int main() {
     (void)hipFree(x_dev);
     (void)hipFree(gamma_dev);
     (void)hipFree(out_dev);
+    for (const std::uint32_t depth : {8192U, 32768U})
+      for (const bool matrix : {false, true})
+        TestAttentionRowInvariance(depth, matrix);
   } catch (const std::exception& error) {
     std::cerr << "flint ops tests failed: " << error.what() << "\n";
     return 1;

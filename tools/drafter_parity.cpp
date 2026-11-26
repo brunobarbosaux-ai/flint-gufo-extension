@@ -881,8 +881,10 @@ struct AcceptanceResult {
   };
 
   // Each prompt starts from an empty target cache and an empty drafter
-  // context.
-  session.Rewind(0);
+  // context. Reset(), not Rewind(0): a rewind deeper than the sliding-window
+  // ring loses keys and marks the session broken, while Reset() just rewinds
+  // the position and lets the new prompt overwrite the ring.
+  session.Reset();
   ctx.ResetContext();
   // The hidden ring keeps only kHiddenRingRows positions. Prefill in chunks and
   // let the drafter take each chunk's rows before the next chunk can push them

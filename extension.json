@@ -22,6 +22,7 @@
     "flint_engine_snapshot_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_prefill_split_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_moe_split_test": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_ring_snapshot_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_draft_policy_test": { "requires": ["testing"], "role": "test" },
     "flint_drafter_probe": { "requires": ["testing"], "role": "test" },
     "flint_drafter_parity": { "requires": ["hip", "testing"], "role": "test" },

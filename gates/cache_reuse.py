@@ -34,6 +34,26 @@ r1's cached prefix.
       shared with the final checkpoint; each additional capture adds only its
       private payload (logits row + metadata). Missing cache_captures on the
       completed line fails the check; it is never skipped.
+      That form assumes every layer keeps every row. Sliding-window layers
+      (attention.sliding_window_pattern, True = window) keep a ring of the
+      window, so the r1 check is window-aware (the ring layout, PR #5):
+          global layers   rows = prompt_tokens
+          window layers   rows in [rows_low, rows_high], where
+            rows_low  = prompt - FirstChunkRow(prompt)   one full final window
+            rows_high = captures * (window + 256)        each in-pass capture
+                                                         publishes at most one
+                                                         window plus a chunk,
+                                                         and captures share no
+                                                         window chunks
+          FirstChunkRow(p) = (p - window) - (p - window) % 256 (clamped at 0)
+          cache_snapshot_bytes in
+            [global_layers*global_rows*2*row_layer + rows_low*swa_layers*2*row_layer
+               + captures*(vocab*4+64),
+             same with rows_high]
+      row_layer = kv_heads * head_dim * 2 (one layer's K or V row, fp16).
+      The 24k run (23,790 tokens, 5 captures, window 513, 14 global / 35 window
+      layers) gives global 682,106,880 B and window 53,760,000 .. 275,609,600 B
+      (rows_low = 23,790 - FirstChunkRow(23,790) = 23,790 - 23,040 = 750).
       The GGUF-unparseable fallback is the weak bound
       cache_snapshot_bytes < 0.25 * 822684216 (old single-blob size at 8k).
 
@@ -114,8 +134,24 @@ _SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?",
            10: "Q", 11: "q", 12: "d"}
 
 
+def first_chunk_row(position, window):
+    """Lowest row a window layer retains for a capture at `position`.
+
+    The window keeps [position - window, position), and rows are stored in
+    256-row chunks, so the retained range starts at the chunk holding
+    position - window. Clamped at 0 for prompts shorter than the window.
+    """
+    start = max(0, position - window)
+    return start - start % ROWS_PER_CHUNK
+
+
 def read_gguf_geometry(path):
-    """Return (num_layers, per_layer_kv_heads, head_dim, vocab) or None."""
+    """Return the target geometry, or None when the GGUF is unreadable.
+
+    Result: (num_layers, kv_heads, head_dim, vocab, sliding_window, swa_pattern)
+    where swa_pattern is a list of bools (True = sliding-window layer, as in
+    src/runtime/config.cpp) or None when the key is absent.
+    """
     try:
         with open(path, "rb") as fh:
             def take(fmt):
@@ -127,9 +163,10 @@ def read_gguf_geometry(path):
                 return fh.read(n).decode("utf-8", "replace")
 
             def read_value(vtype):
-                # Returns the scalar, or for arrays only the element count
-                # (the tokenizer vocabulary is large and only its length is
-                # needed).
+                # Returns the scalar; for arrays only the element count, except
+                # bool arrays, which are returned in full (the SWA pattern).
+                # The tokenizer vocabulary is large and only its length is
+                # needed.
                 if vtype in _SCALAR:
                     return take(_SCALAR[vtype])
                 if vtype == 8:
@@ -140,6 +177,8 @@ def read_gguf_geometry(path):
                     if elem == 8:
                         for _ in range(count):
                             read_string()
+                    elif elem == 7:
+                        return [b != 0 for b in fh.read(count)]
                     elif elem in _SCALAR:
                         fh.seek(struct.calcsize(_SCALAR[elem]) * count, 1)
                     else:
@@ -184,7 +223,12 @@ def read_gguf_geometry(path):
                 return None
             if not isinstance(vocab, int) or vocab <= 0:
                 return None
-            return int(layers), int(kv), int(key_len), int(vocab)
+            window = get("attention.sliding_window") or 0
+            pattern = get("attention.sliding_window_pattern")
+            if not (isinstance(pattern, list) and len(pattern) == layers):
+                pattern = None
+            return (int(layers), int(kv), int(key_len), int(vocab),
+                    int(window), pattern)
     except (OSError, ValueError, TypeError, struct.error):
         return None
 
@@ -614,27 +658,44 @@ def reuse_run(args, log_path, failures):
         if not snap:
             check(False, "r1 cache_snapshot_bytes reported", failures)
         elif geometry:
-            layers, kv, head_dim, vocab = geometry
-            # Per token: every layer's K and V row, fp16 (num_kv*head_dim*2 each).
-            row_total = layers * 2 * kv * head_dim * 2
+            layers, kv, head_dim, vocab, window, pattern = geometry
+            # Per token: one layer's K and V row, fp16 (num_kv*head_dim*2 each).
+            layer_bytes = 2 * kv * head_dim * 2
+            row_total = layers * layer_bytes
             captures = captures_of(r1.get("line", ""))
-            if captures is None:
+            if window and pattern is None:
+                check(False, "GGUF has a sliding window but no readable "
+                      "attention.sliding_window_pattern", failures)
+            elif captures is None:
                 check(False, "r1 completed line reports cache_captures "
                       "(needed for the capture-sum size check)", failures)
             else:
                 # An unaligned prompt end also gets the aligned checkpoint
                 # below it (prefill_alignment); its partial tail chunk is
-                # stored separately from the end capture's.
-                n1 = r1["prompt_tokens"]
-                extra = aligned_extra_tail(n1, args.prefill_alignment)
-                expected = ((n1 + extra) * row_total
-                            + captures * (vocab * 4 + 64))
-                print(f"r1 snapshot expected exactly {expected} B = "
-                      f"(prompt_tokens + aligned tail {extra})*{row_total} + "
-                      f"cache_captures={captures}*(vocab*4 + 64)")
-                check(snap == expected,
-                      f"r1 cache_snapshot_bytes {snap} == capture-sum "
-                      f"expected {expected}", failures)
+                # stored separately from the end capture's, on global layers
+                # too, so the tail rows join the global rows.
+                swa_layers = sum(pattern) if window else 0
+                global_layers = layers - swa_layers
+                prompt = r1["prompt_tokens"]
+                extra = aligned_extra_tail(prompt, args.prefill_alignment)
+                global_rows = prompt + extra
+                # An extra capture only adds rows, so the window lower bound
+                # from the end capture still holds.
+                rows_low = prompt - first_chunk_row(prompt, window)
+                rows_high = captures * (window + ROWS_PER_CHUNK)
+                private = captures * (vocab * 4 + 64)
+                fixed = global_rows * global_layers * layer_bytes + private
+                low = fixed + rows_low * swa_layers * layer_bytes
+                high = fixed + rows_high * swa_layers * layer_bytes
+                print(f"r1 snapshot bounds: global {global_layers} layers x "
+                      f"{global_rows} rows (prompt {prompt} + aligned tail "
+                      f"{extra}); window {swa_layers} layers "
+                      f"(window {window}) x [{rows_low}, {rows_high}] rows; "
+                      f"captures={captures} private={private}")
+                print(f"r1 snapshot range [{low}, {high}] B, measured {snap} B")
+                check(low <= snap <= high,
+                      f"r1 cache_snapshot_bytes {snap} within window-aware "
+                      f"bounds [{low}, {high}]", failures)
             # OLD_BLOB_BYTES was measured at -c 8192 with a 1223-token prompt;
             # it is not a bound for other contexts or prompt sizes.
             if args.context == 8192 and args.prompt_chars <= 6000:
@@ -667,14 +728,29 @@ def reuse_run(args, log_path, failures):
                     extra = aligned_extra_tail(r3["prompt_tokens"],
                                                args.prefill_alignment)
                     rows = tail + new + extra
-                    expected_r3 = rows * row_total + r3_captures * (vocab * 4 + 64)
-                    print(f"r3 exact = (r1 % 256 = {tail} + new {new} + "
-                          f"aligned tail {extra}) = {rows} rows * {row_total} "
-                          f"+ {r3_captures}*(vocab*4+64) = {expected_r3}; "
-                          f"r3 capture {r3_snap}")
-                    check(r3_snap == expected_r3,
-                          f"r3 cache_snapshot_bytes {r3_snap} == exact "
-                          f"derived {expected_r3}", failures)
+                    # The exact form assumes each window layer's r3 capture
+                    # starts at or below the r1 chunk boundary, so the tail
+                    # is rewritten and nothing older is. If the window's first
+                    # chunk for the r3 prompt lies above that boundary, the
+                    # request shape changed and the exact form does not apply.
+                    boundary = ROWS_PER_CHUNK * (r1_tokens // ROWS_PER_CHUNK)
+                    r3_first = (first_chunk_row(r3["prompt_tokens"], window)
+                                if window else 0)
+                    if r3_first > boundary:
+                        check(False, f"r3 window first chunk {r3_first} > r1 "
+                              f"chunk boundary {boundary}: the request shape "
+                              "changed; the exact r3 bound does not apply",
+                              failures)
+                    else:
+                        expected_r3 = (rows * row_total
+                                       + r3_captures * (vocab * 4 + 64))
+                        print(f"r3 exact = (r1 % 256 = {tail} + new {new} + "
+                              f"aligned tail {extra}) = {rows} rows * "
+                              f"{row_total} + {r3_captures}*(vocab*4+64) = "
+                              f"{expected_r3}; r3 capture {r3_snap}")
+                        check(r3_snap == expected_r3,
+                              f"r3 cache_snapshot_bytes {r3_snap} == exact "
+                              f"derived {expected_r3}", failures)
         else:
             bound = 0.25 * OLD_BLOB_BYTES
             check(snap < bound,

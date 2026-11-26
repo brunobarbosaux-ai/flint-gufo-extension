@@ -12,6 +12,11 @@
 /// from device memory so a captured decode graph replays at any depth.
 namespace gufo::models::flint::gpu::rocm {
 
+/// Keys per attention key tile. Sliding-window attention starts its tiles on a
+/// multiple of this, up to `kAttnKeyTile - 1` keys below the window, so a
+/// sliding-window KV ring needs that many rows beyond window + prefill tile.
+constexpr std::uint32_t kAttnKeyTile = 32;
+
 /// out[t] = dequantized Q8_0 row tokens[t] of the embedding table.
 void EmbedQ8(const void* table, const std::int32_t* tokens, float* out,
              std::uint32_t n_tokens, std::uint32_t hidden, hipStream_t stream);
@@ -33,13 +38,20 @@ void StoreKv(const float* k, const float* v, __half* k_cache, __half* v_cache,
              std::uint32_t n_tokens, std::uint32_t row_dim,
              const std::uint32_t* start_pos, hipStream_t stream);
 
+/// Rows of a K/V cache. `ring` is 0 when the cache holds every position (row =
+/// position) and otherwise the length of a sliding-window ring: position p
+/// lives at row p % ring, so the cache only needs the last `ring` positions.
+/// A ring must be at least `window` + the rows of one launch long, so that the
+/// keys a launch reads are not overwritten by the rows it writes.
+///
 /// Causal attention with per-head sink logits. `window` > 0 limits each query
 /// to its last `window` keys. out is [t][heads][head_dim].
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const float* sinks, float* out, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t head_dim,
-               std::uint32_t window, hipStream_t stream);
+               std::uint32_t window, hipStream_t stream,
+               std::uint32_t ring = 0);
 
 /// Prefill causal attention on the matrix cores (F16 query rows): 16-row WMMA
 /// tiles pack two tokens of one KV head's eight query heads. Needs head_dim 128
@@ -49,7 +61,7 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
                    std::uint32_t n_tokens, const std::uint32_t* start_pos,
                    std::uint32_t heads, std::uint32_t kv_heads,
                    std::uint32_t head_dim, std::uint32_t window,
-                   hipStream_t stream);
+                   hipStream_t stream, std::uint32_t ring = 0);
 
 /// The same over a block-sparse key set (global layers): each 16-token group
 /// reads two sink blocks, the 32 blocks before its first token and its own
@@ -82,7 +94,7 @@ void AttentionSplit(const float* q, const __half* k_cache,
                     const std::uint32_t* start_pos, std::uint32_t heads,
                     std::uint32_t kv_heads, std::uint32_t head_dim,
                     std::uint32_t window, std::uint32_t splits,
-                    hipStream_t stream);
+                    hipStream_t stream, std::uint32_t ring = 0);
 
 /// x[t] += delta[t] (when delta is not null), then xn[t] = rmsnorm(x[t]) *
 /// gamma and, when q8 is not null, xn's Q8_1 rows (block_q8_1 layout, 36 bytes
@@ -122,7 +134,8 @@ void SwigluScaled(float* gate, const float* up, float* scale,
 /// Per-head QK RMSNorm, NEOX rope (when `rope`) and the KV store in one launch.
 /// Each source is (pointer, row stride in floats): q holds `heads` heads, k and
 /// v `kv_heads` heads of `head_dim`. Q lands in q_out [t][heads * head_dim];
-/// K and V land in the F16 caches at row *start_pos + t.
+/// K and V land in the F16 caches at row *start_pos + t (modulo `ring` for a
+/// sliding-window ring cache, see Attention).
 struct QkvSources {
   const float* q;
   std::uint32_t q_stride;
@@ -136,7 +149,8 @@ void QkvPrepare(const QkvSources& src, const float* q_gamma,
                 __half* v_cache, std::uint32_t n_tokens, std::uint32_t heads,
                 std::uint32_t kv_heads, std::uint32_t head_dim,
                 const std::uint32_t* start_pos, float base, float eps,
-                bool rope, hipStream_t stream, __half* q_half = nullptr);
+                bool rope, hipStream_t stream, __half* q_half = nullptr,
+                std::uint32_t ring = 0);
 
 /// Sigmoid gating, top-k, optional renormalization and scale per token.
 void SigmoidTopK(const float* logits, std::int32_t* ids, float* weights,

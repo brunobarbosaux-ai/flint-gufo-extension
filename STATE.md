@@ -45,18 +45,25 @@ Released, awaiting registry review:
 ## Environment
 
 - Extension repo: `/home/bruno/Projects/flint-gufo-extension`
-- Gufo reference tree: `/tmp/opencode/gufo036` (v0.36.0, tag `4a7d8c6`, API 0.3.42);
-  `/home/bruno/AI/Gufo-api03` is the older 0.35.0 tree and stays untouched
-- Build dir: `/tmp/opencode/gufo036/build/host-036` (targets `gufo`, `flint_spec_gate`)
+- Work root (**persistent**; this box reboots often and `/tmp` is wiped):
+  `/home/bruno/Projects/.flint-work`
+  - Gufo tree: `.flint-work/gufo036` (v0.36.0, tag `4a7d8c6`, API 0.3.42);
+    `/home/bruno/AI/Gufo-api03` is the older 0.35.0 tree and stays untouched
+  - Build dirs: `.flint-work/gufo036/build/host-{036,pr5d,...}` (targets `gufo`,
+    `flint_spec_gate`, the `flint_*_test` binaries)
+  - Extension worktrees: `.flint-work/wt-pr5d`, `wt-pr7`, ...
+  - Battery: `.flint-work/battery-pr5d.sh` (writes logs to `.flint-work/battery-<dir>/`)
+  - **Cleanup debt:** delete `.flint-work` once 0.5.0 ships and no branch is under
+    verification; it holds a full clone plus build trees (~30 GB).
 - Target model: `/home/bruno/AI/GGUF/flint-UD-Q4_K_XL.gguf`
 - Drafters: `/home/bruno/AI/GGUF/mtp/Flint-DFlash2-{BF16,Q6_K}.gguf`
-- Oracle (disposable): `/tmp/opencode/llamacpp-oracle/llama-b11804`
+- Oracle (disposable, `/tmp` is fine): `/tmp/opencode/llamacpp-oracle/llama-b11804`
 
 ## Open questions
 
 - gufo#1319 (O(n²) `ReserveBacking` fix) **MERGED** 2026-11-21 (`93a1d230`) and
   **released in Gufo 0.36.0**. The cap-removed 130k A/B is runnable on the 0.36
-  tree (`/tmp/opencode/gufo036`, never modify `/home/bruno/AI/Gufo-api03`), point
+  tree (`.flint-work/gufo036`, never modify `/home/bruno/AI/Gufo-api03`), point
   `GUFO_EXTENSION_DIRS` at this repo, and measure with the 8 GiB cap temporarily
   removed. Result decides PLAN-KV-ROWS §7 Q1; scheduled for 0.5.0.
 - 0.36.0 moved the 262144 admission budget to 87.3 GiB: three sessions are now

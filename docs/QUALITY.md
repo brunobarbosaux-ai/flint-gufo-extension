@@ -388,9 +388,10 @@ the sliding-window key-tile origin were fixed alongside.
 ### Compatibility notes for 0.4.0
 
 - **Cache identity** is `flint-rocm-session-v2` / `flint-kv-rows-v2`. Caches
-  written by 0.3.1 (layout v1) do not restore; the host treats them as a miss
-  and re-prefills. The ring PR in 0.5.0 moves to v3 and will invalidate 0.4.0
-  caches the same way.
+  written by 0.3.1 (layout `flint-kv-rows-v1`) do not restore; the host treats
+  them as a miss and re-prefills. The ring in 0.5.0 renames the layout to
+  `flint-kv-rows-window-v1` (the state ABI string is unchanged) and invalidates
+  0.4.0 caches the same way.
 - **Greedy output can differ from 0.3.1.** Prefill now runs every pass on the
   prefill kernels with even-row checkpoints, and the K-quant WMMA dot uses
   explicit FMAs. Determinism within a build is unchanged, and the

@@ -9,7 +9,8 @@ Stage 4 (position assertion + 130k A/B) COMPLETE (`9ceaa4d`).
 Stage 5 (long-context validation) COMPLETE. All five stages done (`47cab02`, `dff1a01`
 for the gate; `9ceaa4d` for the runner check).
 Open follow-ups: post the #1317 before/after comment; raise the 8 GiB cap now that
-Gufo 0.36.0 contains #1319 (`93a1d230`) — scheduled for 0.5.0 with the ring's v3 layout;
+Gufo 0.36.0 contains #1319 (`93a1d230`) — scheduled for 0.5.0 with the ring's
+`flint-kv-rows-window-v1` payload layout;
 full battery at the 0.4.0 release gate.
 
 Shipped and idle:
@@ -25,8 +26,10 @@ Released, awaiting registry review:
   GitHub Releases: `v0.4.0` (latest), plus `v0.3.0` and `v0.3.1` back-filled
   from their registry revisions `b262cb6a` and `cb7303d5`.
 - 0.4.1 is reserved for hotfixes only.
-- 0.5.0 (ring + matrix attention) — waits for sebt3's rebases (#5, #7). The ring
-  takes `payload_layout` v3, so 0.4.0 disk caches stop restoring at 0.5.0.
+- 0.5.0 (ring; matrix attention moved to 0.5.1 after the #7 dry run). The ring
+  renames `payload_layout` from `flint-kv-rows-v2` to `flint-kv-rows-window-v1`
+  and keeps `state_abi` at `flint-rocm-session-v2`; the identity string changes,
+  so 0.4.0 disk caches stop restoring and are re-prefilled.
 
 ## Decisions in force
 

@@ -14,6 +14,7 @@
     "gufo_flint_hip": { "requires": ["hip"] },
     "gufo_flint_text": { "requires": ["hip"] },
     "flint_config_test": { "requires": ["testing"], "role": "test" },
+    "flint_engine_options_test": { "requires": ["testing"], "role": "test" },
     "flint_probe_test": { "requires": ["testing"], "role": "test" },
     "flint_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "flint_dflash_ops_test": { "requires": ["hip", "testing"], "role": "test" },

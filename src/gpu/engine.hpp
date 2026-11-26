@@ -12,9 +12,14 @@
 namespace gufo::models::flint::gpu {
 
 struct EngineOptions {
-  /// Tokens one prefill pass processes.
+  /// Tokens one prefill pass processes. Must be even and at least 2.
   std::uint32_t prefill_tile{4096};
 };
+
+/// Checks `options` without a GPU or a model. Returns false and sets
+/// `*error_msg` (when given) on the first invalid field.
+[[nodiscard]] bool ValidateEngineOptions(const EngineOptions& options,
+                                         std::string* error_msg);
 
 class Model;
 struct ModelState;

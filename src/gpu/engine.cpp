@@ -1873,6 +1873,8 @@ Model::~Model() = default;
 std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const EngineOptions& options,
                                    std::string* error_msg) {
+  if (!ValidateEngineOptions(options, error_msg))
+    return nullptr;
   std::shared_ptr<Model> model(new Model());
   auto impl = std::make_shared<ModelState>();
   impl->options = options;

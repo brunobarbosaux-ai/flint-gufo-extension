@@ -15,6 +15,7 @@ gufo_extension_target(
     src/tool_dialect.cpp
     src/tool_dialect_register.cpp
     src/reference.cpp
+    src/gpu/engine_options.cpp
     src/gpu/dflash/dflash_weights.cpp
     probe.cpp
     extension.cpp
@@ -249,6 +250,20 @@ gufo_extension_target(
 if(TARGET flint_config_test)
   add_test(NAME flint.config COMMAND flint_config_test)
   set_tests_properties(flint.config PROPERTIES LABELS "flint;cpu")
+endif()
+
+gufo_extension_target(
+  NAME flint_engine_options_test
+  SOURCES
+    tests/engine_options_test.cpp
+  LINK_LIBRARIES
+    gufo_flint
+    gufo_ext_runtime
+)
+
+if(TARGET flint_engine_options_test)
+  add_test(NAME flint.engine_options COMMAND flint_engine_options_test)
+  set_tests_properties(flint.engine_options PROPERTIES LABELS "flint;cpu")
 endif()
 
 gufo_extension_target(

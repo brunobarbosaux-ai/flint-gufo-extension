@@ -218,6 +218,21 @@ if(TARGET flint_spec_gate)
 endif()
 
 # ---------------------------------------------------------------------------
+# Decode attention bench: scalar against matrix-core kernels on synthetic KV.
+# GPU, no artifact.
+# ---------------------------------------------------------------------------
+gufo_extension_target(
+  NAME flint_attn_bench
+  SOURCES
+    tools/attn_bench.cpp
+  LINK_LIBRARIES
+    gufo_flint_hip
+    gufo_flint
+    gufo_ext_runtime
+    hip::host
+)
+
+# ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
 # The draft policy (M4): pure host code, no device or weights.

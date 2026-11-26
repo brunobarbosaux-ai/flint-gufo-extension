@@ -28,6 +28,7 @@
     "flint_drafter_probe": { "requires": ["testing"], "role": "test" },
     "flint_drafter_parity": { "requires": ["hip", "testing"], "role": "test" },
     "flint_spec_gate": { "requires": ["hip", "testing"], "role": "test" },
+    "flint_attn_bench": { "requires": ["hip", "testing"], "role": "test" },
     "flint_tool_template_test": { "requires": ["testing"], "role": "test" },
     "flint_tool_scan_test": { "requires": ["testing"], "role": "test" }
   },

@@ -45,8 +45,9 @@ then sees exactly what a lone row sees. Staging keys one pair further, tried
 first, fixed a synthetic test and failed on the real engine, whose cache holds
 stale rows.
 
-`FLINT_ATTN_BENCH=1` runs the check at start-up (64 rows per depth against a
-pair and a lone row) and the timings below.
+`flint_attn_bench` (`tools/attn_bench.cpp`) runs the check on synthetic KV (64
+rows per depth against a pair and a lone row) and the timings below. The server
+runs none of it.
 
 ## Measured (global layer, F16 KV, 4 KV heads, 268 MB at 131k)
 

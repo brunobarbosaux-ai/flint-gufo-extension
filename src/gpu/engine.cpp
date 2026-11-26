@@ -35,7 +35,7 @@ constexpr std::uint32_t kVecExpertRows = 48;
 constexpr std::uint32_t kMaxTopK = 16;
 constexpr std::uint32_t kMaxExperts = 256;
 constexpr std::uint32_t kSwaSplits = 8;
-constexpr std::uint32_t kGlobalSplits = 32;
+constexpr std::uint32_t kGlobalSplits = 64;
 constexpr std::uint32_t kQ8MaxK = 6144;
 // The W8A8 kernel mis-computes the stacked Q/K/V matrix; it takes mmq.
 constexpr std::uint32_t kStackedQkvRows = 5120;

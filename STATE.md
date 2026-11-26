@@ -67,7 +67,8 @@ Released, awaiting registry review:
     `/home/bruno/AI/Gufo-api03` is the older 0.35.0 tree and stays untouched
   - Build dirs: `.flint-work/gufo036/build/host-{036,pr5d,...}` (targets `gufo`,
     `flint_spec_gate`, the `flint_*_test` binaries)
-  - Extension worktrees: `.flint-work/wt-pr5d`, `wt-pr7`, ...
+  - Extension worktrees: `.flint-work/wt-pr5d`, `wt-main-fix`, `wt-pr7`, ...
+  - `main` build (matches merged `main`): `.flint-work/gufo036/build/host-main-fix`
   - Battery: `.flint-work/battery-pr5d.sh` (writes logs to `.flint-work/battery-<dir>/`)
   - **Cleanup debt:** delete `.flint-work` once 0.5.0 ships and no branch is under
     verification; it holds a full clone plus build trees (~30 GB).

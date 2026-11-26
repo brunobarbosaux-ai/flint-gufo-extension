@@ -141,10 +141,14 @@
   cause it.
 - Default 4096 hides it; nothing validates the option, so a user-set odd tile silently
   produces rows that disagree with an unpaged prefill.
-- Fix after #5 merges: validate in `Model::Load` — round an odd `prefill_tile` up to even,
-  or reject it with a clear message (sebt3's call, his finding). Regression: load with an
-  odd tile in `flint.config` or `EngineOptions` and assert the rounded/rejected value, and
-  keep `flint.prefill_split_tile4136` as the near-boundary leg.
+- **FIXED** on `main` (`c10c70c`): `ValidateEngineOptions` rejects `prefill_tile < 2` and
+  odd values at the top of `Model::Load`, with the measurement in the message and the
+  unpinned mechanism stated as such. It lives in `src/gpu/engine_options.cpp` (host tier)
+  so `flint.engine_options` covers it without a GPU. Nothing in the extension set
+  `prefill_tile`, so no caller changes behaviour.
+- Still open: the mechanism is not pinned. If a future pass shape (verify width, a
+  different tile) can end on an odd row for another reason, the same symptom returns
+  without this guard firing. `flint.prefill_split_tile4136` remains the near-boundary leg.
 
 ### Rewind guard and `tools/drafter_parity.cpp` under the ring (PR #5)
 - `Session::Rewind` flags `ring_broken` when a rewind exceeds
@@ -152,5 +156,6 @@
   for the masked aligned key tiles: `ring_len - sliding_window - kAttnKeyTile + 2` = 4129.
 - Production rewinds are <= 7 rows, so the tighter guard costs nothing and fails loudly
   instead of serving silently wrong rows.
-- `tools/drafter_parity.cpp` calls `Rewind(0)` after a long prompt and will trip the guard:
-  it should `Reset()` or restore a snapshot instead.
+- **FIXED** on `main` (`e3913e7`): `tools/drafter_parity.cpp` starts each prompt from
+  `Reset()` instead of `Rewind(0)`, so the ring is overwritten as the prompt is written and
+  no deep rewind is attempted. Verified: the tool runs all 14 prompts, 58 s, exit 0.

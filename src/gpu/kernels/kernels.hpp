@@ -184,6 +184,15 @@ void ExpandQ8ToHalf(const void* q8, __half* out, std::size_t count,
 void AddInPlace(float* x, const float* y, std::size_t count,
                 hipStream_t stream);
 
+/// True when this build routes the decode attention of the global layers
+/// (head_dim 128, group 8, up to 8 rows) to the matrix-core slice kernel
+/// (FLINT_MATRIX_ATTENTION at build time, off by default). The two kernels are
+/// not bit-exact to each other, so this is part of the cache identity.
+[[nodiscard]] bool MatrixAttentionBuild() noexcept;
+/// Overrides the build's choice, for tests and tools that compare both kernels
+/// in one binary. Not for the serving path.
+void SetMatrixAttention(bool enabled) noexcept;
+
 }  // namespace gufo::models::flint::gpu::rocm
 
 #endif  // GUFO_MODELS_FLINT_GPU_KERNELS_KERNELS_HPP_

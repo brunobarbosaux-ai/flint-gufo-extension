@@ -1288,6 +1288,231 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernel(
   }
 }
 
+// Decode / verify attention of a global layer over one key slice, on the matrix
+// cores. One block per (kv head, key slice, group of 8 rows); each of the eight
+// waves owns ONE row: its 8 query heads fill columns 0-7 of the 16-wide matrix
+// (the other 8 columns idle: the pass is bound by memory, not by the matrix
+// cores), and the eight waves share every K/V tile, which the block stages in
+// LDS once: a width-8 verify pass reads the global KV once, not once per row.
+// A wave computes S^T = K Q^T in registers (the softmax needs no cross-lane
+// traffic beyond one max) and accumulates O^T = V^T P^T. Output is the same
+// partial the scalar slice kernels write (numerator, natural-log maximum,
+// denominator), merged by AttentionMergeKernel, which also applies the sink.
+//
+// Bit-exactness against a row computed alone. The partition is by block index
+// (block b belongs to slice b % splits), never by position; a row masks the keys
+// past its own position and carries its own running maximum. The one thing a
+// shared tile would otherwise leak is the V of keys the row masks: a zero-weight
+// product still moves the accumulator by an ulp, and those keys hold whatever
+// the batch or the stale cache has there. So a wave zeroes, when it reads V, the
+// keys past its own position: it sees exactly what a lone row sees. A tile wholly
+// past the row's position is skipped, which changes nothing (zero weights, zero V).
+constexpr int kSliceWaves = 8;
+constexpr int kSliceThreads = kSliceWaves * 32;
+constexpr int kSliceRows = kSliceWaves;
+
+__global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
+    const float* __restrict__ q, const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache, float* __restrict__ partial,
+    const std::uint32_t* __restrict__ start_pos, std::uint32_t heads,
+    std::uint32_t kv_heads, std::uint32_t splits, std::uint32_t rows_total) {
+  constexpr int kKBytes = kWmmaKeys * kWmmaKStride * 2;
+  constexpr int kVBytes = kWmmaHeadDim * kWmmaVtStride * 2;
+  __shared__ __align__(16) char smem[kKBytes + kVBytes];
+  auto* k_s = reinterpret_cast<__half*>(smem);
+  auto* v_t = reinterpret_cast<__half*>(smem + kKBytes);
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t wave = tid >> 5U;
+  const std::uint32_t sub = lane & 15U;
+  const std::uint32_t half_id = lane >> 4U;
+  const std::uint32_t kv_head = blockIdx.x;
+  const std::uint32_t split = blockIdx.y;
+  const std::uint32_t t0 = blockIdx.z * kSliceRows;
+  const std::uint32_t start = *start_pos;
+  const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * kWmmaHeadDim;
+  constexpr float kLog2e = 1.4426950408889634F;
+  constexpr float kLn2 = 0.6931471805599453F;
+  const float scale = 0.08838834764831845F * kLog2e;  // log2(e) / sqrt(128)
+
+  // This wave's row, and this lane's query: columns 0-7 are the eight heads of
+  // the group, columns 8-15 are idle.
+  const std::uint32_t token = t0 + wave;
+  const bool wave_live = token < rows_total;
+  const bool live = wave_live && sub < kWmmaGroup;
+  const std::uint32_t head = kv_head * kWmmaGroup + (sub & (kWmmaGroup - 1));
+  const std::uint32_t qpos = start + token;
+
+  v16h q_frag[8];
+  {
+    const float* qr =
+        q + (static_cast<std::size_t>(live ? token : 0) * heads + head) *
+                kWmmaHeadDim;
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+#pragma unroll
+      for (int i = 0; i < 16; ++i)
+        q_frag[ks][i] =
+            live ? static_cast<_Float16>(qr[ks * 16 + i]) : _Float16(0);
+    }
+  }
+  std::uint32_t perm_sel[2];
+#pragma unroll
+  for (int x = 0; x < 2; ++x) {
+    const std::uint32_t own_pair = (2 * x) | ((2 * x + 1) << 8);
+    const std::uint32_t partner_pair = (4 + 2 * x) | ((5 + 2 * x) << 8);
+    perm_sel[x] = half_id == 0 ? (own_pair | (partner_pair << 16))
+                               : (partner_pair | (own_pair << 16));
+  }
+
+  // A large finite value, not -inf: a query whose first tiles are all masked
+  // must not compute -inf - -inf.
+  float run_max = -1.0e30F;
+  float run_sum = 0.0F;
+  v8f o_acc[8];
+#pragma unroll
+  for (int t = 0; t < 8; ++t)
+    o_acc[t] = v8f{};
+
+  const std::uint32_t last_row = min(t0 + kSliceRows, rows_total) - 1;
+  const std::uint32_t pos_max = start + last_row;
+  const std::uint32_t nblocks = (pos_max + kWmmaKeys) / kWmmaKeys;
+  const bool odd = (lane & 1U) != 0;
+  constexpr int kLoads = kWmmaKeys * 16 / kSliceThreads;  // uint4 per thread
+  for (std::uint32_t b = split; b < nblocks; b += splits) {
+    const std::uint32_t kt = b * kWmmaKeys;
+    __syncthreads();
+    // Lanes run along keys: lane = key, and the waves take interleaved 16-byte
+    // chunks of the row (chunk c = wave + 8u).
+    const std::uint32_t key_pos = kt + lane;
+#pragma unroll
+    for (int u = 0; u < kLoads; ++u) {
+      const std::uint32_t c = wave + kSliceWaves * u;
+      uint4 kv = make_uint4(0, 0, 0, 0);
+      uint4 vv = kv;
+      if (key_pos <= pos_max) {
+        const std::size_t src =
+            std::size_t{key_pos} * kv_row + kv_head * kWmmaHeadDim + c * 8;
+        kv = *reinterpret_cast<const uint4*>(k_cache + src);
+        vv = *reinterpret_cast<const uint4*>(v_cache + src);
+      }
+      *reinterpret_cast<uint4*>(k_s + lane * kWmmaKStride + c * 8) = kv;
+      const std::uint32_t words[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const std::uint32_t mine = words[j];
+        const std::uint32_t other = __shfl_xor(mine, 1);
+        const std::uint32_t lo_dim = odd ? (mine >> 16) : (mine & 0xffffU);
+        const std::uint32_t lo_other = odd ? (other >> 16) : (other & 0xffffU);
+        const std::uint32_t dim = c * 8 + 2 * j + (odd ? 1U : 0U);
+        const std::uint32_t pair =
+            odd ? (lo_other | (lo_dim << 16)) : (lo_dim | (lo_other << 16));
+        *reinterpret_cast<std::uint32_t*>(v_t + dim * kWmmaVtStride +
+                                          (lane & ~1U)) = pair;
+      }
+    }
+    __syncthreads();
+    // A wave without a row, or a tile wholly past this row: nothing to add.
+    if (!wave_live || kt > qpos)
+      continue;
+    const bool boundary = kt + kWmmaKeys - 1 > qpos;
+    const int lim = static_cast<int>(qpos) - static_cast<int>(kt);
+
+    v8f s_acc[kNb];
+#pragma unroll
+    for (int nb = 0; nb < kNb; ++nb) {
+      s_acc[nb] = v8f{};
+#pragma unroll
+      for (int ks = 0; ks < 8; ++ks) {
+        const v16h k_frag =
+            LoadFrag(k_s + (nb * 16 + sub) * kWmmaKStride + ks * 16);
+        s_acc[nb] = Wmma(k_frag, q_frag[ks], s_acc[nb]);
+      }
+    }
+    float val[kNb][8];
+    float tile_max = kNegInf;
+#pragma unroll
+    for (int nb = 0; nb < kNb; ++nb) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const std::uint32_t key = kt + nb * 16 + 2 * i + half_id;
+        const bool valid = live && key <= qpos;
+        val[nb][i] = valid ? s_acc[nb][i] * scale : kNegInf;
+        tile_max = fmaxf(tile_max, val[nb][i]);
+      }
+    }
+    tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 16));
+    const float m_new = fmaxf(run_max, tile_max);
+    const float alpha = __builtin_amdgcn_exp2f(run_max - m_new);
+    float psum = 0.0F;
+    v16h p_frag[kNb];
+#pragma unroll
+    for (int nb = 0; nb < kNb; ++nb) {
+      std::uint32_t own[4];
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        const float p0 = __builtin_amdgcn_exp2f(val[nb][2 * m] - m_new);
+        const float p1 = __builtin_amdgcn_exp2f(val[nb][2 * m + 1] - m_new);
+        psum += p0 + p1;
+        const __half2 h2 = __floats2half2_rn(p0, p1);
+        own[m] = *reinterpret_cast<const std::uint32_t*>(&h2);
+      }
+      std::uint32_t partner[4];
+#pragma unroll
+      for (int m = 0; m < 4; ++m)
+        partner[m] = static_cast<std::uint32_t>(
+            __shfl_xor(static_cast<int>(own[m]), 16));
+      std::uint32_t dw[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dw[i] =
+            __builtin_amdgcn_perm(partner[i / 2], own[i / 2], perm_sel[i & 1]);
+      __builtin_memcpy(&p_frag[nb], dw, 32);
+    }
+    run_sum = run_sum * alpha + psum;
+    run_max = m_new;
+    if (__builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0) {
+#pragma unroll
+      for (int t = 0; t < 8; ++t)
+        o_acc[t] *= alpha;
+    }
+#pragma unroll
+    for (int nb = 0; nb < kNb; ++nb) {
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        v16h v_frag =
+            LoadFrag(v_t + (t * 16 + sub) * kWmmaVtStride + nb * 16);
+        if (boundary) {
+#pragma unroll
+          for (int k = 0; k < 16; ++k) {
+            if (nb * 16 + k > lim)
+              v_frag[k] = _Float16(0);
+          }
+        }
+        o_acc[t] = Wmma(v_frag, p_frag[nb], o_acc[t]);
+      }
+    }
+  }
+
+  const float total = run_sum + __shfl_xor(run_sum, 16);
+  if (!live)
+    return;
+  float* dst = partial +
+               ((static_cast<std::size_t>(token) * heads + head) * splits +
+                split) *
+                   (kWmmaHeadDim + 2);
+#pragma unroll
+  for (int t = 0; t < 8; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      dst[t * 16 + 2 * i + half_id] = o_acc[t][i];
+  }
+  if (half_id == 0) {
+    dst[kWmmaHeadDim] = run_max * kLn2;
+    dst[kWmmaHeadDim + 1] = total;
+  }
+}
+
 __global__ void SigmoidTopKKernel(const float* logits, std::int32_t* ids,
                                   float* weights, std::uint32_t n_experts,
                                   std::uint32_t k, bool normalize,
@@ -1648,6 +1873,23 @@ void PoolKeyBlocks(const __half* k_cache, __half* kmm,
                                   nblk);
 }
 
+namespace {
+#ifdef FLINT_MATRIX_ATTENTION
+constexpr bool kMatrixAttentionBuild = true;
+#else
+constexpr bool kMatrixAttentionBuild = false;
+#endif
+bool g_matrix_attention = kMatrixAttentionBuild;
+}  // namespace
+
+bool MatrixAttentionBuild() noexcept {
+  return kMatrixAttentionBuild;
+}
+
+void SetMatrixAttention(bool enabled) noexcept {
+  g_matrix_attention = enabled;
+}
+
 void AttentionSplit(const float* q, const __half* k_cache,
                     const __half* v_cache, const float* sinks, float* out,
                     void* out_q8, float* partial, std::uint32_t n_tokens,
@@ -1656,7 +1898,14 @@ void AttentionSplit(const float* q, const __half* k_cache,
                     std::uint32_t window, std::uint32_t splits,
                     hipStream_t stream, std::uint32_t ring) {
   const std::uint32_t group = heads / kv_heads;
-  if (window == 0 && n_tokens > 1 && head_dim == 128) {
+  if (g_matrix_attention && window == 0 && head_dim == 128 && group == 8 &&
+      n_tokens >= 1 && n_tokens <= 8) {
+    AttentionSliceWmmaKernel<<<dim3(kv_heads, splits,
+                                    (n_tokens + kSliceRows - 1) / kSliceRows),
+                               kSliceThreads, 0, stream>>>(
+        q, k_cache, v_cache, partial, start_pos, heads, kv_heads, splits,
+        n_tokens);
+  } else if (window == 0 && n_tokens > 1 && head_dim == 128) {
     // Two rows per block: the K/V tile is shared by both, while the block's
     // shared memory stays small enough for two blocks per CU, which the
     // compute-bound score pass needs more than the extra traffic saving.

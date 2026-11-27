@@ -110,13 +110,43 @@ if(TARGET gufo_flint_hip)
   # off by default, it is not bit-exact to the scalar kernels. A build-time
   # choice, so one binary has one numerics mode. `gufo extension install` passes
   # no CMake variable, hence the environment variable of the same name.
-  set(_flint_matrix_default OFF)
-  if(DEFINED ENV{FLINT_MATRIX_ATTENTION})
-    set(_flint_matrix_default "$ENV{FLINT_MATRIX_ATTENTION}")
+  # option() applies its default only on a fresh configure, so an environment
+  # value is also checked against the cache: a build directory configured once
+  # with the variable set must not silently keep that mode after it is unset.
+  # The environment sets the initial value on a fresh configure and overrides a
+  # cache that disagrees with it; with no environment value the cache stands.
+  set(_flint_matrix_preset OFF)
+  if(DEFINED CACHE{FLINT_MATRIX_ATTENTION})
+    set(_flint_matrix_preset ON)
   endif()
   option(FLINT_MATRIX_ATTENTION
-    "Flint: matrix-core decode attention for the global layers"
-    ${_flint_matrix_default})
+    "Flint: matrix-core decode attention for the global layers" OFF)
+  if(DEFINED ENV{FLINT_MATRIX_ATTENTION})
+    if("$ENV{FLINT_MATRIX_ATTENTION}" MATCHES "^(1|ON|on|On|TRUE|true|YES|yes)$")
+      set(_flint_matrix_env ON)
+    else()
+      set(_flint_matrix_env OFF)
+    endif()
+    if(NOT _flint_matrix_preset)
+      set(FLINT_MATRIX_ATTENTION ${_flint_matrix_env} CACHE BOOL
+        "Flint: matrix-core decode attention for the global layers" FORCE)
+    else()
+      if(FLINT_MATRIX_ATTENTION)
+        set(_flint_matrix_cached ON)
+      else()
+        set(_flint_matrix_cached OFF)
+      endif()
+      if(NOT _flint_matrix_env STREQUAL _flint_matrix_cached)
+        message(WARNING
+          "Flint: FLINT_MATRIX_ATTENTION=$ENV{FLINT_MATRIX_ATTENTION} in the "
+          "environment overrides the cached value (${_flint_matrix_cached}); "
+          "the matrix-core mode changes numerics and the KV payload layout "
+          "(flint-kv-rows-window-v1 vs -matrix). Use one build directory per mode.")
+        set(FLINT_MATRIX_ATTENTION ${_flint_matrix_env} CACHE BOOL
+          "Flint: matrix-core decode attention for the global layers" FORCE)
+      endif()
+    endif()
+  endif()
   if(FLINT_MATRIX_ATTENTION)
     message(STATUS "Flint: matrix-core decode attention ON")
     target_compile_definitions(gufo_flint_hip PRIVATE FLINT_MATRIX_ATTENTION=1)

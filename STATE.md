@@ -66,13 +66,16 @@ Released:
   `r1 3,995,190,656 B` restoring in 50.9 ms. Greedy output byte-identical to
   `main` on two prompts (48 and 160 tokens).
   - A/B 2026-11-26 (`.flint-work/pr11-pressure-ab.py`, three arms, three
-    interleaved reps, sessions 2 × 131072): healthy node `main` 8.0/8.0/8.5 s,
-    staged one-thread 9.5/9.5/10.0 s, staged four-thread 8.5/8.5/9.0 s; under
-    pressure (`posix_fadvise(DONTNEED)` plus a 44 GiB anonymous hog)
-    132.6/132.6/134.6, 138.1/138.1/138.6 and 64.0/64.5/64.5 s. The four-thread
-    head is 2.05× the direct mapping under pressure and within 0.5 s healthy;
-    the one-thread commit alone is slower than `main` on both, so a bisect that
-    lands on `c8e059b` reads as a regression (historical only).
+    interleaved reps, one session at 131072 — the script's `-s 2` is `--seed`,
+    every log reports `sessions=1`; sessions are `-j`): healthy node `main`
+    8.0/8.0/8.5 s, staged one-thread 9.5/9.5/10.0 s, staged four-thread
+    8.5/8.5/9.0 s; under pressure (`posix_fadvise(DONTNEED)` plus a 44 GiB
+    anonymous hog) 132.6/132.6/134.6, 138.1/138.1/138.6 and 64.0/64.5/64.5 s.
+    The four-thread head is 2.05× the direct mapping under pressure and within
+    0.5 s healthy (the weight upload happens once, so the result is
+    session-independent); the one-thread commit alone is slower than `main` on
+    both, so a bisect that lands on `c8e059b` reads as a regression (historical
+    only).
   - Caveat: `workingset_refault_file` stayed at 0 in every run, so the effect is
     measured but not attributed to file refaults from that instrumentation. The
     pressure condition itself is unambiguous (8 s healthy against 133 s under it).

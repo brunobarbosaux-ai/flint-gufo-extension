@@ -24,15 +24,31 @@ matrix attention (#7) shipped **inert** (option OFF).
 - [x] Cap decision recorded: 8 GiB ships unchanged, and the ring makes it
       non-binding at 130k (`r1 3,995,190,656 B` restoring all 128,981 tokens in
       50.9 ms); raising it is its own release
-- [ ] Clean clone of the release commit + scoped build (proves the tagged
-      revision builds; the registry digest comes from a clone anyway)
-- [ ] Gap battery only, reusing the runs on the identical tree (`64d37ed`
-      differs from the release commit in docs only): gx 3/3 at 8k and 131k
-      spec off/on, null 72/72, settings 8/8, 24k RAM/spec/sparse reuse, 60k
-      reuse, all `flint.*` ctests
-- [ ] 0.4.0 → 0.5.0 disk-cache miss check (identity
-      `flint-rocm-session-v2:flint-kv-rows-window-v1`)
-- [ ] Last, with nothing else running: 262144 capacity and 1x/2x load times
+- [x] Clean clone of the release commit + scoped build (proves the tagged
+      revision builds; the registry digest comes from a clone anyway):
+      `.flint-work/rel050` at `58bc87c` (the tagged release differs in docs
+      only), `gufo036/build/rel050`, 506/506 scoped
+      targets, `gufo diagnose` reports flint 0.5.0 available
+- [x] Gap battery only, reusing the runs on the identical tree (`64d37ed`
+      differs from the release commit in docs only): 15/15 `flint.*` ctests;
+      gx 3/3 at 8k (44 s) and 131k (11m41s); null 72/72; settings 8/8; 24k
+      RAM/spec/sparse reuse PASSED (restores 12.5/13.4/19.7 ms); 60k RAM
+      PASSED; 60k disk restart PASSED (0.4.0 was cap-refused); 130k disk
+      restart PASSED (128,980 tokens restored from disk in 1,394 ms)
+- [x] 0.4.0 → 0.5.0 disk-cache miss check (identity
+      `flint-rocm-session-v2:flint-kv-rows-window-v1`): the 0.4.0 cache is a
+      miss for 0.5.0 (`cache_miss_reason=no_checkpoint`, r1 re-prefills and
+      captures 959,071,040 B), and r2 restores in 11.8 ms
+- [x] Cross-version greedy check: 0.4.0 and 0.5.0 emit byte-identical text on
+      three accept prompts (128 tokens, temp 0)
+- [x] Last, with nothing else running: 262144 capacity and 1x/2x load times.
+      262144 (`-j`, warm cache): 4 sessions 9.5 s / 60.0 GiB, 5 -> 12.0 s /
+      68.8 GiB, 6 -> 12.5 s / 77.5 GiB, 8 -> 14.0 s / 94.9 GiB (22.6 GiB host
+      left); 7 once at 41.0 s (outlier). 131072: 1 session 8.0/8.0/8.0 s, 2
+      sessions 8.5/8.0/8.0 s, 36,479 MiB
+- [x] Flag correction: the #11 A/B used `-s 2`, which is `--seed`; every log
+      reports `sessions=1`. DEFERRED/STATE corrected and the public comments
+      need a correction note
 - [ ] `docs/QUALITY.md` (0.5.0) section, README numbers, `docs/REGISTRY-PR.md`
 - [ ] Tag `v0.5.0` + GitHub Release
 - [ ] Registry PR against gufo-org/gufo-extension (new PR; #27 is merged)

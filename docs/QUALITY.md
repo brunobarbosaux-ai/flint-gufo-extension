@@ -398,7 +398,8 @@ the sliding-window key-tile origin were fixed alongside.
   spec-on == spec-off gate remains exact.
 - **The 8 GiB retained-snapshot cap is unchanged.** Gufo 0.36.0 contains the
   linear-time fix (#1319) that makes raising it safe; that change needs its own
-  130k A/B and is scheduled for 0.5.0.
+  130k A/B and was scheduled for 0.5.0 (0.5.0 closed it as no longer needed:
+  the ring keeps both 130k frontiers under the cap).
 - **0.36.0 API additions are not used yet:** shared restore
   (`Adapter::BeginSharedRestore`), beside-decode restores on the copy engine,
   session-state declarations, and `TextModelRunner::Idle()`. All are 0.5.0
@@ -414,5 +415,82 @@ the sliding-window key-tile origin were fixed alongside.
   One session is ~10 s.
 - Sampled mode (`temp > 0`) and the temp-1.0 slowdown caveats from 0.3.0 are
   unchanged.
+- Two concurrent requests that declare the same tool name with different
+  schemas can mislead the tool scanner (documented in `README.md`).
+
+## Ring KV window and steadier loads (0.5.0)
+
+Validated on Gufo v0.36.0 (`4a7d8c6`, API 0.3.42), gfx1151, ROCm 7.2.1;
+extension 0.5.0. Relative to 0.4.0 this release keeps sliding-window layers as
+a **ring** in the continuation cache (`payload_layout
+flint-kv-rows-window-v1`, `state_abi` unchanged): a window layer retains only
+the rows a pass can still read, so a frontier snapshot is a fraction of the
+full-row layout, and a 130k frontier fits the 8 GiB retained-snapshot cap with
+room for a follow-up. Alongside it: `drafter_parity` starts each prompt from
+`Reset()` (a deep rewind is illegal with a ring), `Model::Load` rejects an odd
+`prefill_tile` instead of silently producing wrong logits, and weights load
+through a pinned staging buffer on four threads (#11). Matrix-core decode
+attention (#7) is compiled but **off by default**: the shipped build behaves
+like 0.4.0, and flipping `FLINT_MATRIX_ATTENTION` is gated on the `DEFERRED.md`
+prerequisites.
+
+### Passing checks
+
+All legs below ran on the release code, built from a clean clone at `58bc87c`
+(`.flint-work/rel050`, build `gufo036/build/rel050`); that tree differs from the
+tagged release (`v0.5.0`) in docs only, and the registry digest is computed from
+a clone at the release commit. Legs marked as reused ran on the earlier battery
+on the identical tree (`git diff 64d37ed 58bc87c -- src tests tools gates
+*.cpp *.hpp extension.cmake extension.json *.nix` is empty).
+
+| Check | Result | How |
+| --- | --- | --- |
+| Suite | **15/15** `flint.*` tests pass | `ctest -R '^flint\.'` |
+| GX greedy byte-identity, spec-on vs spec-off | 3/3 at depths 0, 8k, 32k and 131k | `--mode gx --depth {0,8192,32768,131072} --prompts-limit 3 --max-tokens 128`; 0 and 32k reused from the identical-tree battery |
+| Null drafter, temps 0/0.7/1.0 × seeds 1,2 | **72/72** byte-identical | `--mode null --temps 0,0.7,1.0 --seeds 1,2` |
+| Settings matrix | **8/8** pass (grammar `violations=0/12`, budget-cut outputs not evaluated) | `--mode settings` |
+| Cache reuse, 24k, RAM / spec-on / sparse | PASSED ×3: `r1 959,071,040 B`, `r2` restores 23,790 in 12.5 / 13.4 / 19.7 ms, answers identical | `gates/cache_reuse.py --context 32768 --prompt-chars 118000 [--dflash-model … \| --env FLINT_SPARSE_ATTN=1]` |
+| Cache reuse, 24k, disk restart | PASSED: `r1 959,071,040 B`, restore 267 ms, identity `flint-rocm-session-v2:flint-kv-rows-window-v1` | same gate, `--cache-disk … --restart`; reused from the identical-tree battery |
+| Cache reuse, 60k, RAM | PASSED: `r1 1,921,088,320 B`, `r2` restores 59,459 in 25.9 ms, `r3` restores 59,458 and captures 10,836,544 B | `--context 65536 --prompt-chars 295000` |
+| Cache reuse, 60k, disk restart | **PASSED** (0.4.0 was cap-refused): `r1 1,921,088,320 B`; after restart `r2` restores 59,458 in 671 ms and captures 1,746,911,808 B; `r3` restores and captures again, 1,750,424,128 B | same gate, `--cache-disk … --restart` |
+| Cache reuse, 130k, RAM | PASSED: `r1 3,995,190,656 B`; `r2` restores **all** 128,981 tokens in 50.9 ms; `r3` restores 128,980 and captures 47,864,960 B | `--context 131072 --prompt-chars 640000`; reused from the identical-tree battery |
+| Cache reuse, 130k, disk restart | **PASSED** (0.4.0 was a miss): after restart `r2` restores 128,980 of 128,981 tokens from disk in 1,394 ms, `r3` restores and captures 3,776,601,216 B — both frontiers fit the cap (`3.995 + 3.777 GB`) | same gate, `--cache-disk … --restart` |
+| Memory, second-slot delta | 2/2; spec-off `2,143,724,468` claimed / `2,074,083,328` measured, spec-on `2,563,154,868` / `2,493,513,728` | `--mode memory`; reused from the identical-tree battery |
+| `flint.ops` / `flint.target_adapter` | 2.05 s / 90.1 s, all cases pass | `ctest`; reused from the identical-tree battery |
+| Decode bench, default build | tolerance and row-invariance assertions pass | `flint_attn_bench`; reused from the #7 battery on the identical tree, default kernel unchanged from 0.4.0 |
+| Capacity at 262144 | 4 sessions admit and load in **9.5 s** using 60.0 GiB (`gpu_device_used_mib=61,491`); 5 in 12.0 s / 68.8 GiB; 6 in 12.5 s / 77.5 GiB; 8 in 14.0 s / 94.9 GiB with 22.6 GiB host available (7 measured once at 41.0 s / 86.2 GiB — the one outlier, in the same memory-pressure regime the staged copy addresses). Per-session request state is about 8.7 GiB, against 26.0 GiB in the full-row layout, so on this 128 GB box eight sessions now fit where 0.4.0 refused a fourth | `rel050-capacity.py --capacity 4,5` plus a 6/7/8 probe with the same loader |
+| Load time at 131072, warm cache, 3 reps | one session 8.0 / 8.0 / 8.0 s, 31,141 MiB; two sessions 8.5 / 8.0 / 8.0 s, 36,479 MiB | `rel050-capacity.py`, `-j 1` and `-j 2` |
+| 0.4.0 → 0.5.0 disk cache | the 0.4.0 cache (identity line `flint-kv-rows-v2`, valid for its own build: r2 restores 23,790) is a **miss** for 0.5.0: r1 `cache=miss cached_tokens=0 cache_miss_reason=no_checkpoint`, re-prefill, capture `959,071,040 B`; r2 then restores 23,790 in 11.8 ms. The 0.4.0 binary writing it fails the 0.5.0 gate's window-aware r1 bound (`2,390,377,280 B` against ≤`960,719,680 B`) — the layout difference, measured | `gates/cache_reuse.py` with a shared `--cache-disk` directory, one run per binary |
+| Greedy output, 0.4.0 vs 0.5.0 | byte-identical on three accept prompts, 128 tokens, temp 0 (588/592/618 B each) | `gufo prompt` with the 0.4.0 and 0.5.0 binaries, same host build |
+
+### Compatibility notes for 0.5.0
+
+- **Cache identity** is `flint-rocm-session-v2` / `flint-kv-rows-window-v1`.
+  Caches written by 0.4.0 (`flint-kv-rows-v2`) do not restore; the host treats
+  them as a miss and re-prefills (`cache_miss_reason=no_checkpoint` in the
+  measured check, with the 0.4.0 cache otherwise valid for 0.4.0 itself).
+- **The 8 GiB retained-snapshot cap is unchanged** and is now non-binding at
+  130k: the ring retains `3,995,190,656 B` for the 130k frontier and
+  `3,776,601,216 B` for its follow-up, so both fit and restart reuse works.
+  Raising the cap is no longer needed for long-context reuse and is deferred.
+- **Greedy output** is unchanged versus 0.4.0 on short prompts: the 0.4.0 and
+  0.5.0 binaries emit byte-identical text on three accept prompts at 128 tokens,
+  temp 0. Spec-on equals spec-off within the build at every depth tested, and
+  the #11 A/B found greedy output byte-identical to `main` on two prompts (48
+  and 160 tokens). No 0.4.0-vs-0.5.0 comparison at 100k+ depth was run.
+- **Matrix attention is inert.** The default build compiles the scalar path;
+  the `-matrix` layout suffix blocks cross-restore with a non-matrix build in
+  both directions.
+- **Loads are steadier, not uniform.** The staged copy halves the pressure case
+  (133 s → 64 s) for 0.3-0.5 s on a healthy node; the spread itself remains,
+  so quote load times only with a warmed page cache.
+
+### Open items in 0.5.0
+
+- The 262144 load spread is mitigated, not eliminated; the old hang remains a
+  known unknown (24 loads across two nodes produced none, `DEFERRED.md`).
+- Flipping `FLINT_MATRIX_ATTENTION` on by default waits on the `DEFERRED.md`
+  prerequisites (M1 setter vs layout, M2 V-zeroing unproven, L1-L4).
+- Sampled mode (`temp > 0`) and temp-1.0 caveats from 0.3.0 are unchanged.
 - Two concurrent requests that declare the same tool name with different
   schemas can mislead the tool scanner (documented in `README.md`).

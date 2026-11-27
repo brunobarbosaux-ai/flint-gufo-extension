@@ -49,19 +49,18 @@ this repository only reads the format.
 ## Speculative decoding (DFlash2)
 
 **Context ceiling.** Verified serve startup on Gufo 0.36.0 (API 0.3.42):
-contexts up to **262144 (the model's native maximum) load**. One session loads
-in about 10 s. Two sessions are admitted and use 78,646 MiB of device memory
-(~24 GiB of that is the weights), but their load time is not stable on a host
-that cannot keep the 24 GB artifact in page cache: five runs on 0.36.0
-measured 10, 36, 56, 138 and 187 s. That spread is the documented trade-off of
-releasing the GGUF mapping after upload (0.4.0): the pages become evictable, so
-a load pays a disk read the old pinned mapping avoided. The remaining limit is
-capacity, not a hang: a 262144-token session reserves 26.0 GiB of request
-state, so with 87.3 GiB in 0.36.0's admission budget three sessions are
-admitted but the third loads in 111 s and leaves the host at 5.8 GiB
-available, and four are **refused at admission** ("at most 3 sessions fit at
-this context"). Advertise 2 sessions at 262144. The 262144 hang in session setup
-reported on 2026-11-17 no longer reproduces.
+contexts up to **262144 (the model's native maximum) load**. At 131072 one
+session loads in 8.0 s and two in 8.0-8.5 s (36,479 MiB of device, about 25 GiB
+of that the weights). The ring cuts the per-session request state at 262144 from
+26.0 GiB to about 8.7 GiB, so on this 128 GB box four sessions load in 9.5 s
+using 60.0 GiB and eight fit (94.9 GiB of the 114,688 MiB device, 22.6 GiB host
+left); 0.4.0 refused a fourth session outright. Load time still depends on the
+page cache: releasing the GGUF mapping after upload (0.4.0) makes those pages
+evictable, so a cold or pressured load pays a disk read, and the staged weight
+copy (#11) halves that case (133 s -> 64 s in our A/B) without removing the
+spread. Quote load times only with a warmed page cache. The 262144 hang in
+session setup reported on 2026-11-17 has not reproduced in 24 loads across two
+nodes.
 
 Note that this is a **load** check. Long-context *requests* were exercised to
 130k tokens (dense, block-sparse, speculative, and disk-restart restores); a
@@ -70,19 +69,20 @@ made at that depth. The continuation cache stores the K/V of each layer
 as append rows, so a capture copies only the valid tokens (123 MB instead of
 822 MB for a 1.2k-token prompt at any context) and a follow-up turn copies only
 the new tail (25 MB at 128,981 tokens); a warm restore is 2-25 ms from RAM and
-174-577 ms from disk. Capture is still synchronous on the request thread: at
-130k it costs about 4.8 s *with* the upstream linear-time fix in
-gufo-org/gufo#1319, which Gufo 0.36.0 ships, and about 14 s before it. In 0.4.0
-the retained cache stays capped at **8 GiB (~85,600 rows)**, which is two
-frontiers up to ~42.8k tokens, or one frontier beyond that. Measured on 0.36.0:
-24k reuse is exact in RAM and on disk; at 60k an identical repeat restores in
-~82 ms and a follow-up still captures, but after a **disk restart** at 60k the
-restored frontier is re-captured and fills the cap, so that follow-up capture
-is refused (`cache_snapshot_bytes=0`); at 130k one partial 63,488-row
-checkpoint is retained, an identical repeat restores 63,488 tokens in ~85 ms
-and prefills the rest, and after a restart that state is a miss. Raising the
-cap is scheduled for 0.5.0, together with the ring layout (v3), which changes
-the same measurements again (see `DEFERRED.md`).
+about 175 ms-1.4 s from disk, growing with depth. Capture is still synchronous
+on the request thread: the upstream linear-time fix in gufo-org/gufo#1319,
+which Gufo 0.36.0 ships, is what keeps a 130k capture near 5 s instead of
+about 14 s. The retained cache stays capped at **8 GiB** (~85,600 full rows),
+and in 0.5.0 the ring makes that cap non-binding: a window layer keeps only the
+rows a pass can still read, so the 130k frontier retains 3,995,190,656 B and
+its follow-up 3,776,601,216 B, both inside the cap. Measured on 0.36.0 with the
+0.5.0 build: 24k reuse is exact in RAM and on disk (snapshot 959 MB, restore
+12.5 ms); at 60k the snapshot drops to 1.92 GB, an identical repeat restores in
+26 ms and, after a **disk restart**, the restored frontier plus the follow-up
+both fit, so the follow-up capture that 0.4.0 refused now succeeds; at 130k an
+identical repeat restores all 128,981 tokens from RAM in 51 ms, and after a
+**disk restart** 128,980 tokens restore from disk in 1.4 s. Raising the cap is
+no longer needed and is not part of 0.5.0 (see `DEFERRED.md`).
 
 Flint can run DFlash2 speculative decoding: a small drafter proposes several
 tokens, and the target verifies them in one batched pass. Accepted tokens are

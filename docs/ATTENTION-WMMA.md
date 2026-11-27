@@ -78,7 +78,8 @@ End to end, 4 sessions x 262144, drafter on, T=1, decode tok/s:
 | 128k | 25 | 43.5 |
 
 Greedy output with the drafter is identical to the output without it, on the
-real engine.
+real engine, verified at 8k and 32k (the `flint.target_adapter` legs). Not
+checked at 131k.
 
 ## Limits (to be read before merging)
 
@@ -91,6 +92,7 @@ real engine.
 * A matrix-core build runs `kGlobalSplits` 64 instead of 32 for the global
   layers. That alone changes the greedy output at ~28k tokens, even on the
   scalar path.
-* Measured on gfx1151 at 0 / ~6k / ~29k tokens, plain one-row decode is the same
-  as the scalar kernel (within 2 %); the gain is for the multi-row verification
-  pass of speculative decoding.
+* Measured on gfx1151 at 0 / ~6k / ~29k tokens, plain one-row decode is within
+  2 % of the scalar kernel. At 131k it is faster by ~8 % (1.31 ms against
+  1.43 ms, table above). The gain is for the multi-row verification pass of
+  speculative decoding.

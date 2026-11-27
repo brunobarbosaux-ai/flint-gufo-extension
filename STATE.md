@@ -47,27 +47,33 @@ Released, awaiting registry review:
   GitHub Releases: `v0.4.0` (latest), plus `v0.3.0` and `v0.3.1` back-filled
   from their registry revisions `b262cb6a` and `cb7303d5`.
 - 0.4.1 is reserved for hotfixes only.
-- 0.5.0 (ring; matrix attention ships in 0.5.0 with the option OFF, as merged in
+- 0.5.0 (ring + staged weight copy; matrix attention ships with the option OFF, as merged in
   `c9ca909`; flipping the default is a later release gated on the `DEFERRED.md`
   prerequisites). The ring
   renames `payload_layout` from `flint-kv-rows-v2` to `flint-kv-rows-window-v1`
   and keeps `state_abi` at `flint-rocm-session-v2`; the identity string changes,
   so 0.4.0 disk caches stop restoring and are re-prefilled.
-- Also queued for 0.5.0: the staged weight copy (#10, sebt3's
-  `fix/staged-weight-copy`) once his PR is up and our A/B passes.
-  - A/B 2026-11-26 (`.flint-work/pr11-pressure-ab.py`, three arms, three interleaved
-    reps, sessions 2 × 131072). Merge decision pending the maintainer/owner's call.
-    - Healthy node: `main` 8.0/8.0/8.5 s, staged one-thread 9.5/9.5/10.0 s, staged
-      four-thread 8.5/8.5/9.0 s. One-session healthy runs: 8.0-8.5 / 9.5-10.0 /
-      8.5-9.0 s.
-    - Under pressure (page cache dropped with `posix_fadvise(DONTNEED)` plus a 44 GiB
-      anonymous hog): `main` 132.6/132.6/134.6 s, staged one-thread 138.1/138.1/138.6 s,
-      staged four-thread 64.0/64.5/64.5 s.
-    - Caveat: `workingset_refault_file` stayed at 0 in every run, so the slowdown
-      cannot be attributed to file refaults from this instrumentation. The pressure
-      condition itself is unambiguous (8 s healthy against 133 s under it).
-    - Correctness: greedy output of `main` and the four-thread build is byte-identical
-      on two prompts (48 and 160 tokens).
+- **Staged weight copy (#11) merged 2026-11-27 as `cbd1075`** (merge commit,
+  sebt3's two commits keep authorship; head `fe46d2b`). Weights load through a
+  pinned staging buffer with a four-thread copy. Verified on the merge tree
+  (`main` `6cb866d` + `fe46d2b`, tree identical to what shipped): `flint.ops`
+  2.05 s, `flint.target_adapter` 90.1 s, gx 3/3 byte-identical at depth 0 and
+  32k, memory gate PASS both modes (spec-off claimed 2,143,724,468 / measured
+  2,074,083,328 B; spec-on 2,563,154,868 / 2,493,513,728 B), 24k disk gate
+  PASSED on `flint-rocm-session-v2:flint-kv-rows-window-v1`, 130k
+  `r1 3,995,190,656 B` restoring in 50.9 ms. Greedy output byte-identical to
+  `main` on two prompts (48 and 160 tokens).
+  - A/B 2026-11-26 (`.flint-work/pr11-pressure-ab.py`, three arms, three
+    interleaved reps, sessions 2 × 131072): healthy node `main` 8.0/8.0/8.5 s,
+    staged one-thread 9.5/9.5/10.0 s, staged four-thread 8.5/8.5/9.0 s; under
+    pressure (`posix_fadvise(DONTNEED)` plus a 44 GiB anonymous hog)
+    132.6/132.6/134.6, 138.1/138.1/138.6 and 64.0/64.5/64.5 s. The four-thread
+    head is 2.05× the direct mapping under pressure and within 0.5 s healthy;
+    the one-thread commit alone is slower than `main` on both, so a bisect that
+    lands on `c8e059b` reads as a regression (historical only).
+  - Caveat: `workingset_refault_file` stayed at 0 in every run, so the effect is
+    measured but not attributed to file refaults from that instrumentation. The
+    pressure condition itself is unambiguous (8 s healthy against 133 s under it).
 
 ## Decisions in force
 
@@ -93,7 +99,8 @@ Released, awaiting registry review:
   - Build dirs: `.flint-work/gufo036/build/host-{036,pr5d,...}` (targets `gufo`,
     `flint_spec_gate`, the `flint_*_test` binaries)
   - Extension worktrees: `.flint-work/wt-pr5d`, `wt-main-fix`, `wt-pr7`, ...
-  - `main` build (matches merged `main`): `.flint-work/gufo036/build/host-main-fix`
+  - `main` build: `.flint-work/gufo036/build/host-main-fix` — rebuilt per change;
+    it predates the #11 merge, so rebuild before the 0.5.0 gate
   - Battery: `.flint-work/battery-pr5d.sh` (writes logs to `.flint-work/battery-<dir>/`)
   - **Cleanup debt:** delete `.flint-work` once 0.5.0 ships and no branch is under
     verification; it holds a full clone plus build trees (~30 GB).

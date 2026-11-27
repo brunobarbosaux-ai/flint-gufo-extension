@@ -119,12 +119,13 @@ void TestSiluScale(float* x_dev, hipStream_t stream) {
 /// random data, so the keys past a row's position are the stale cache a real
 /// session has there: a kernel that lets a masked key reach a row fails here.
 /// The 32 start offsets move the rows across every position in a key tile.
-void TestAttentionRowInvariance(std::uint32_t depth, bool matrix) {
-  constexpr std::uint32_t kHeads = 32, kKvHeads = 4, kDim = 128, kRows = 7;
+void TestAttentionRowInvariance(std::uint32_t depth, std::uint32_t rows,
+                                bool matrix) {
+  constexpr std::uint32_t kHeads = 32, kKvHeads = 4, kDim = 128;
   constexpr std::uint32_t kOffsets = 32;
   const std::uint32_t splits = matrix ? 64 : 32;
   const std::size_t kv_elems =
-      std::size_t{depth + kOffsets + kRows + 64} * kKvHeads * kDim;
+      std::size_t{depth + kOffsets + rows + 64} * kKvHeads * kDim;
   const std::size_t row_floats = std::size_t{kHeads} * kDim;
 
   const auto random_half = [](std::size_t n, std::uint32_t x) {
@@ -137,7 +138,7 @@ void TestAttentionRowInvariance(std::uint32_t depth, bool matrix) {
   };
   const auto k = random_half(kv_elems, 1);
   const auto v = random_half(kv_elems, 2);
-  const auto q = Data(kRows * row_floats, 1.0F);
+  const auto q = Data(rows * row_floats, 1.0F);
   const std::vector<float> sinks(kHeads, 0.0F);
 
   __half *k_dev = nullptr, *v_dev = nullptr;
@@ -150,7 +151,7 @@ void TestAttentionRowInvariance(std::uint32_t depth, bool matrix) {
   Check(hipMalloc(&sink_dev, sinks.size() * 4), "malloc sinks");
   Check(hipMalloc(&out_dev, q.size() * 4), "malloc attention out");
   Check(hipMalloc(&part_dev,
-                  std::size_t{kRows} * kHeads * splits * (kDim + 2) * 4),
+                  std::size_t{rows} * kHeads * splits * (kDim + 2) * 4),
         "malloc partial");
   Check(hipMalloc(&pos_dev, 4), "malloc position");
   Check(hipMemcpy(k_dev, k.data(), kv_elems * sizeof(__half),
@@ -183,8 +184,8 @@ void TestAttentionRowInvariance(std::uint32_t depth, bool matrix) {
   };
   for (std::uint32_t offset = 0; offset < kOffsets; ++offset) {
     const std::uint32_t start = depth + offset;
-    const auto block = run(start, 0, kRows);
-    for (std::uint32_t row = 0; row < kRows; ++row) {
+    const auto block = run(start, 0, rows);
+    for (std::uint32_t row = 0; row < rows; ++row) {
       const auto alone = run(start, row, 1);
       if (std::memcmp(block.data() + row * row_floats, alone.data(),
                       row_floats * 4) != 0) {
@@ -203,8 +204,8 @@ void TestAttentionRowInvariance(std::uint32_t depth, bool matrix) {
                   static_cast<void*>(out_dev), static_cast<void*>(part_dev),
                   static_cast<void*>(pos_dev)})
     (void)hipFree(p);
-  std::cout << "  attention rows invariant, depth " << depth << ", "
-            << (matrix ? "matrix" : "scalar") << " kernel\n";
+  std::cout << "  attention rows invariant, rows " << rows << ", depth " << depth
+            << ", " << (matrix ? "matrix" : "scalar") << " kernel\n";
 }
 
 }  // namespace
@@ -226,8 +227,9 @@ int main() {
     (void)hipFree(gamma_dev);
     (void)hipFree(out_dev);
     for (const std::uint32_t depth : {8192U, 32768U})
-      for (const bool matrix : {false, true})
-        TestAttentionRowInvariance(depth, matrix);
+      for (const std::uint32_t rows : {7U, 8U})
+        for (const bool matrix : {false, true})
+          TestAttentionRowInvariance(depth, rows, matrix);
   } catch (const std::exception& error) {
     std::cerr << "flint ops tests failed: " << error.what() << "\n";
     return 1;

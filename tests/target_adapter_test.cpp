@@ -226,11 +226,11 @@ void TestRewind(const Fixture& fx) {
 }
 
 void TestRowsAtDepth(const Fixture& fx, const std::string& target,
-                     std::uint32_t depth, bool matrix) {
+                     std::uint32_t depth, std::uint32_t width, bool matrix) {
   namespace kernels = gufo::models::flint::gpu::rocm;
-  constexpr std::uint32_t kWidth = 7, kStale = 32;
+  constexpr std::uint32_t kStale = 32;
   std::string error;
-  const auto prompt = EncodePrompt(target, depth + kStale + kWidth);
+  const auto prompt = EncodePrompt(target, depth + kStale + width);
   kernels::SetMatrixAttention(matrix);
   auto session = fx.model->CreateSession(depth + kStale + 16, &error);
   RequireOk(session != nullptr, error, "deep session");
@@ -244,10 +244,10 @@ void TestRowsAtDepth(const Fixture& fx, const std::string& target,
               error, "stale rows");
   adapter->Rewind(depth);
   RequireOk(adapter->CheckRowsBitIdentical(
-                {prompt.data() + depth + kStale, kWidth}, &error),
+                {prompt.data() + depth + kStale, width}, &error),
             error, "deep rows bit-identical");
   kernels::SetMatrixAttention(kernels::MatrixAttentionBuild());
-  std::cout << "  rows bit-identical, width " << kWidth << " at " << depth
+  std::cout << "  rows bit-identical, width " << width << " at " << depth
             << ", " << (matrix ? "matrix" : "scalar") << " kernel\n";
 }
 
@@ -277,8 +277,9 @@ int main() {
     TestFeatures(fx);
     TestRewind(fx);
     for (const std::uint32_t depth : {8192U, 32768U})
-      for (const bool matrix : {false, true})
-        TestRowsAtDepth(fx, target, depth, matrix);
+      for (const std::uint32_t width : {7U, 8U})
+        for (const bool matrix : {false, true})
+          TestRowsAtDepth(fx, target, depth, width, matrix);
   } catch (const std::exception& error) {
     std::cerr << "flint target adapter tests failed: " << error.what() << "\n";
     return 1;

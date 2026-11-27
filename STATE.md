@@ -29,6 +29,16 @@ Merged for 0.5.0:
 - Post-merge fixes landing on `main`: `tools/drafter_parity.cpp` `Rewind(0)` to
   `Reset()` (the ring makes a deep rewind illegal), and `prefill_tile` parity
   validation in `Model::Load` (odd tiles were silently wrong on `main`).
+- **Matrix-core decode attention (#7) merged 2026-11-26 as `c9ca909`** (merge commit,
+  sebt3's six commits keep their authorship; head `fbdadd0`). Matrix attention ships
+  inert: the default build behaves like `main`. Cross-restore is blocked in both
+  directions by the payload layout suffix `-matrix`.
+- Follow-ups on `main`, not yet pushed:
+  - `370855a`: `FLINT_MATRIX_ATTENTION` from the environment overrides a disagreeing
+    cached value (verified by configure, five cases).
+  - `bb2557e`: eight-row (all-live wave) case in both gate legs.
+  - `2ed4c8b`: narrows two doc claims.
+  - `91cdf29`: records the flip prerequisites in `DEFERRED.md`.
 
 Released, awaiting registry review:
 - 0.4.0 (tool calls + per-layer row cache + #6 + #8 + #9) — validated on Gufo
@@ -37,12 +47,27 @@ Released, awaiting registry review:
   GitHub Releases: `v0.4.0` (latest), plus `v0.3.0` and `v0.3.1` back-filled
   from their registry revisions `b262cb6a` and `cb7303d5`.
 - 0.4.1 is reserved for hotfixes only.
-- 0.5.0 (ring; matrix attention moved to 0.5.1 after the #7 dry run). The ring
+- 0.5.0 (ring; matrix attention ships in 0.5.0 with the option OFF, as merged in
+  `c9ca909`; flipping the default is a later release gated on the `DEFERRED.md`
+  prerequisites). The ring
   renames `payload_layout` from `flint-kv-rows-v2` to `flint-kv-rows-window-v1`
   and keeps `state_abi` at `flint-rocm-session-v2`; the identity string changes,
   so 0.4.0 disk caches stop restoring and are re-prefilled.
 - Also queued for 0.5.0: the staged weight copy (#10, sebt3's
   `fix/staged-weight-copy`) once his PR is up and our A/B passes.
+  - A/B 2026-11-26 (`.flint-work/pr11-pressure-ab.py`, three arms, three interleaved
+    reps, sessions 2 × 131072). Merge decision pending the maintainer/owner's call.
+    - Healthy node: `main` 8.0/8.0/8.5 s, staged one-thread 9.5/9.5/10.0 s, staged
+      four-thread 8.5/8.5/9.0 s. One-session healthy runs: 8.0-8.5 / 9.5-10.0 /
+      8.5-9.0 s.
+    - Under pressure (page cache dropped with `posix_fadvise(DONTNEED)` plus a 44 GiB
+      anonymous hog): `main` 132.6/132.6/134.6 s, staged one-thread 138.1/138.1/138.6 s,
+      staged four-thread 64.0/64.5/64.5 s.
+    - Caveat: `workingset_refault_file` stayed at 0 in every run, so the slowdown
+      cannot be attributed to file refaults from this instrumentation. The pressure
+      condition itself is unambiguous (8 s healthy against 133 s under it).
+    - Correctness: greedy output of `main` and the four-thread build is byte-identical
+      on two prompts (48 and 160 tokens).
 
 ## Decisions in force
 

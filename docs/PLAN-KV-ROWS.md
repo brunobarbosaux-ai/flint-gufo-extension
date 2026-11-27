@@ -531,3 +531,35 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
 - Post-merge on `main`: `tools/drafter_parity.cpp`'s `Rewind(0)` becomes `Reset()` (the
   ring rejects a deep rewind), and `prefill_tile` must be even — validated in
   `Model::Load`, since an odd pass leaves its last row wrong.
+
+### 2026-11-26 — #7 merged (matrix-core decode attention, off by default)
+- Merged as `c9ca909`, a merge commit, six commits from sebt3 with authorship preserved.
+  Branch `feat/wmma-attention-on-ring`, head `fbdadd0`.
+- Default build (`host-pr7`, option OFF), Gufo 0.36.0, gfx1151:
+  - Battery: `flint.ops` 1.12 s, `flint.target_adapter` 172.9 s, `flint.engine_snapshot`
+    28.9 s, `flint.prefill_split` 42.9 s, `flint.ring_snapshot` 10.7 s.
+  - gx 3/3 byte-identical at depth 0 and 32k.
+  - Memory gate PASS in both modes. Spec-off claimed 2,143,724,468 B and measured
+    2,074,083,328 B for the second slot; spec-on 2,563,154,868 B and 2,493,513,728 B.
+  - 24k disk gate PASSED on identity `flint-rocm-session-v2:flint-kv-rows-window-v1`.
+  - 130k gate `r1 3,995,190,656 B`, restore 52.0 ms.
+- Matrix build (`host-pr7m`, `FLINT_MATRIX_ATTENTION=1`):
+  - `flint.ops` pass; gx 3/3 at depth 0 and 32k.
+  - 24k gate PASSED on identity `flint-rocm-session-v2:flint-kv-rows-window-v1-matrix`.
+  - 130k gate same bytes, restore 51.4 ms.
+- Bench, default build: 8 rows 0.524 → 0.133 ms at 8k, 2.164 → 0.485 ms at 32k,
+  8.367 → 1.821 ms at 131k (3.9x / 4.5x / 4.6x). One row at 131k 1.532 → 1.470 ms.
+  `max_rel_diff` 7.4e-5 to 1.84e-4. Row invariance and the leak probe clean at all
+  three depths, both kernels.
+- Post-merge follow-ups on `main`, not yet pushed:
+  - `370855a` forces `FLINT_MATRIX_ATTENTION` from the environment when it disagrees
+    with a cached value. Verified by configure: fresh + env=1 yields ON silently;
+    cached ON + env unset keeps ON; cached ON + env=1 is quiet; cached ON + env=0
+    warns and forces OFF.
+  - `bb2557e` adds the eight-row (all-live wave) case to both gate legs. `flint.ops`
+    prints eight invariant lines in 2.1 s; `flint.target_adapter` passes widths 7 and
+    8 on both kernels at 8k and 32k in 89.4 s.
+  - `2ed4c8b` narrows two doc claims.
+  - `91cdf29` records the flip prerequisites in `DEFERRED.md`.
+- The default build stays inert: `g_matrix_attention` false, `kGlobalSplits` 32,
+  payload layout unchanged, so its caches stay interchangeable with `main`'s.

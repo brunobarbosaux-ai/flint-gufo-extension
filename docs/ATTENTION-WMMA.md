@@ -56,7 +56,9 @@ first, fixed a synthetic test and failed on the real engine, whose cache holds
 stale rows.
 
 `flint_attn_bench` (`tools/attn_bench.cpp`) runs the check on synthetic KV (64
-rows per depth against a pair and a lone row) and the timings below. The server
+rows per depth against a pair and a lone row) and the timings below. It asserts
+its own numbers: relative difference to the scalar kernel at most 1e-3, row
+invariance at zero, and the leak probe. It exits non-zero on a breach. The server
 runs none of it.
 
 ## Measured (global layer, F16 KV, 4 KV heads, 268 MB at 131k)

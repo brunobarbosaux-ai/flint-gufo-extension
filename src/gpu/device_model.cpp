@@ -6,7 +6,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "gufo/ext/experimental/ggml_dequant.hpp"
 #include "gufo/ext/experimental/managed_alloc.hpp"
@@ -38,6 +40,28 @@ std::uint16_t FloatToHalf(float f) {
   return bits;
 }
 
+/// memcpy over up to four threads. Out of the mapped GGUF the copy also faults
+/// the pages in, and one thread then takes about three times as long as the
+/// transfer to the device.
+void ParallelCopy(void* dst, const void* src, std::size_t bytes) {
+  constexpr std::size_t kThreads = 4;
+  constexpr std::size_t kMinPerThread = std::size_t{4} << 20;
+  const std::size_t parts = std::clamp<std::size_t>(bytes / kMinPerThread, 1,
+                                                    kThreads);
+  const std::size_t step = bytes / parts;
+  std::vector<std::jthread> workers;
+  workers.reserve(parts - 1);
+  for (std::size_t i = 1; i < parts; ++i) {
+    const std::size_t off = i * step;
+    const std::size_t n = i + 1 == parts ? bytes - off : step;
+    workers.emplace_back([=] {
+      std::memcpy(static_cast<char*>(dst) + off,
+                  static_cast<const char*>(src) + off, n);
+    });
+  }
+  std::memcpy(dst, src, parts == 1 ? bytes : step);
+}
+
 class Uploader {
 public:
   /// With `weights` null the walk only measures: it sums the bytes every
@@ -54,6 +78,10 @@ public:
       tensors_.emplace(std::string(t.name), &t);
     }
   }
+
+  Uploader(const Uploader&) = delete;
+  Uploader& operator=(const Uploader&) = delete;
+  ~Uploader() { if (stage_ != nullptr) (void)hipHostFree(stage_); }
 
   [[nodiscard]] bool Measuring() const noexcept { return weights_ == nullptr; }
 
@@ -94,9 +122,8 @@ public:
     }
     std::size_t offset = 0;
     for (const auto* t : parts) {
-      if (hipMemcpy(static_cast<char*>(out->data) + offset, t->data,
-                    t->size_bytes, hipMemcpyHostToDevice) != hipSuccess) {
-        SetError(error_, "device copy failed");
+      if (!CopyToDevice(static_cast<char*>(out->data) + offset, t->data,
+                        t->size_bytes)) {
         return false;
       }
       offset += t->size_bytes;
@@ -183,6 +210,30 @@ public:
   }
 
 private:
+  /// Copies from the memory-mapped GGUF through one pinned staging buffer: a
+  /// pageable hipMemcpy straight from the mapping can stall for minutes under
+  /// page-cache pressure (the kernel evicts and refaults the pages being read).
+  bool CopyToDevice(void* dst, const void* src, std::size_t bytes) {
+    constexpr std::size_t kStage = std::size_t{64} << 20;
+    if (stage_ == nullptr &&
+        hipHostMalloc(&stage_, kStage, hipHostMallocDefault) != hipSuccess) {
+      SetError(error_, "staging buffer allocation failed");
+      return false;
+    }
+    for (std::size_t off = 0; off < bytes; off += kStage) {
+      const std::size_t n = std::min(kStage, bytes - off);
+      ParallelCopy(stage_, static_cast<const char*>(src) + off, n);
+      if (hipMemcpy(static_cast<char*>(dst) + off, stage_, n,
+                    hipMemcpyHostToDevice) != hipSuccess) {
+        SetError(error_, "device copy failed");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void* stage_ = nullptr;
+
   bool Alloc(DeviceTensor* out, std::size_t bytes) {
     requested_ += bytes;
     if (Measuring()) {
@@ -203,16 +254,7 @@ private:
       return false;
     if (Measuring())
       return true;
-    for (std::size_t off = 0; off < bytes; off += kCopyChunk) {
-      const std::size_t n = std::min(kCopyChunk, bytes - off);
-      if (hipMemcpy(static_cast<char*>(out->data) + off,
-                    static_cast<const char*>(src) + off, n,
-                    hipMemcpyHostToDevice) != hipSuccess) {
-        SetError(error_, "device copy failed");
-        return false;
-      }
-    }
-    return true;
+    return CopyToDevice(out->data, src, bytes);
   }
 
   bool ReencodeQ6KToQ8(DeviceTensor* out, const core::GgufTensorInfo& t) {

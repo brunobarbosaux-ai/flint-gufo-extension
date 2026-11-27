@@ -8,7 +8,7 @@
 | Tool calls (0.4.0) | `docs/PLAN-DFLASH2.md` + PR #2 | COMPLETE — merged; ships in 0.4.0 |
 | Long-context continuation cache → per-layer `kAppendRows` | `docs/PLAN-KV-ROWS.md` | COMPLETE — stages 1-5 done; ships in 0.4.0 as layout v2 |
 | 0.4.0 release (0.36.0 validation) | this file + `docs/REGISTRY-PR.md` | COMPLETE — tagged `cf9f7aa`, registry #27 merged and published |
-| 0.5.0 release (ring KV, staged weight copy) | this file + `docs/REGISTRY-PR.md` | **IN PROGRESS — scope frozen, gate starting** |
+| 0.5.0 release (ring KV, staged weight copy) | this file + `docs/REGISTRY-PR.md` | COMPLETE — tagged `dcccec1`, registry PR #41 open |
 | Strycast serve gates | (separate repo) | PR #77 open, CI green |
 
 ### 0.5.0 release checklist
@@ -49,9 +49,13 @@ matrix attention (#7) shipped **inert** (option OFF).
 - [x] Flag correction: the #11 A/B used `-s 2`, which is `--seed`; every log
       reports `sessions=1`. DEFERRED/STATE corrected and the public comments
       need a correction note
-- [ ] `docs/QUALITY.md` (0.5.0) section, README numbers, `docs/REGISTRY-PR.md`
-- [ ] Tag `v0.5.0` + GitHub Release
-- [ ] Registry PR against gufo-org/gufo-extension (new PR; #27 is merged)
+- [x] `docs/QUALITY.md` (0.5.0) section, README numbers, `docs/REGISTRY-PR.md`
+- [x] Tag `v0.5.0` + GitHub Release (`dcccec1`, "v0.5.0 — Ring KV window and
+      steadier loads")
+- [x] Registry PR against gufo-org/gufo-extension (new PR; #27 is merged):
+      gufo-org/gufo-extension#41, revision `dcccec1`, digest
+      `sha256:8508f149…`, `registry.py check` and `verify flint 0.5.0` pass;
+      merge needs a maintainer
 
 ### 0.4.0 release checklist
 

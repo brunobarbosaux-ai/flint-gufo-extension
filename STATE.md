@@ -2,15 +2,16 @@
 
 ## Current workstream
 
-**0.5.0 release.** Scope frozen: ring KV (#5, `payload_layout
-flint-kv-rows-window-v1`), `drafter_parity` `Reset()` + odd `prefill_tile`
-rejection, staged weight copy (#11), matrix attention (#7) inert (option OFF).
-The 8 GiB retained-snapshot cap ships unchanged — the ring restores all 128,981
-tokens of the 130k frontier from `3,995,190,656 B` in 50.9 ms, so the cap is
-non-binding at 130k and raising it is a separate feature.
-Release plan and remaining legs: `PROGRESS.md`, "0.5.0 release checklist".
-The KV-rows stages (`docs/PLAN-KV-ROWS.md`) are all COMPLETE and shipped in
-0.4.0/0.5.0; the #1317 before/after comment is posted.
+**0.5.0 released, awaiting registry review.** Tagged `v0.5.0` at `dcccec1`,
+GitHub Release published, registry PR gufo-org/gufo-extension#41 open — a Gufo
+maintainer's review is the only open step. Scope as shipped: ring KV (#5,
+`payload_layout flint-kv-rows-window-v1`), `drafter_parity` `Reset()` + odd
+`prefill_tile` rejection, staged weight copy (#11), matrix attention (#7) inert
+(option OFF). The 8 GiB retained-snapshot cap shipped unchanged and no longer
+binds at 130k. Evidence: `docs/QUALITY.md` (0.5.0); checklist:
+`PROGRESS.md`.
+Next, if picked up: matrix attention's `DEFERRED.md` prerequisites (M1/M2,
+L1-L4) — a separate release, not a hotfix.
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — **merged** into gufo-org/gufo-extension
@@ -49,12 +50,22 @@ Released:
   GitHub Releases: `v0.4.0` (latest), plus `v0.3.0` and `v0.3.1` back-filled
   from their registry revisions `b262cb6a` and `cb7303d5`.
 - 0.4.1 is reserved for hotfixes only.
-- 0.5.0 (ring + staged weight copy; matrix attention ships with the option OFF, as merged in
-  `d64cc43`; flipping the default is a later release gated on the `DEFERRED.md`
-  prerequisites). The ring
-  renames `payload_layout` from `flint-kv-rows-v2` to `flint-kv-rows-window-v1`
-  and keeps `state_abi` at `flint-rocm-session-v2`; the identity string changes,
-  so 0.4.0 disk caches stop restoring and are re-prefilled.
+- **0.5.0 released.** Ring + staged weight copy; matrix attention ships with the
+  option OFF, as merged in `d64cc43`; flipping the default is a later release
+  gated on the `DEFERRED.md` prerequisites. Tag `v0.5.0` at `dcccec1`, digest
+  `sha256:8508f149…` from a clean clone at the tag, GitHub Release
+  `v0.5.0 — Ring KV window and steadier loads`, registry PR
+  gufo-org/gufo-extension#41 open for review. The ring renames `payload_layout`
+  from `flint-kv-rows-v2` to `flint-kv-rows-window-v1` and keeps `state_abi` at
+  `flint-rocm-session-v2`; the identity changes, so 0.4.0 disk caches are a
+  measured miss (`cache_miss_reason=no_checkpoint`).
+  - Release gate on the clean-clone build: 15/15 tests, gx 3/3 at 0/8k/32k/131k
+    spec off+on, null 72/72, settings 8/8, reuse 24k RAM/spec/sparse/disk, 60k
+    RAM/disk restart (0.4.0 was cap-refused), 130k RAM/disk restart (128,980
+    tokens from disk in 1.4 s where 0.4.0 was a miss). Capacity at 262144:
+    4 sessions 9.5 s / 60.0 GiB, 8 sessions 14.0 s / 94.9 GiB. Greedy output
+    byte-identical to 0.4.0 on three prompts. Full table: `docs/QUALITY.md`
+    (0.5.0).
 - **Staged weight copy (#11) merged 2026-11-26 as `cbd1075`** (merge commit,
   sebt3's two commits keep authorship; head `fe46d2b`). Weights load through a
   pinned staging buffer with a four-thread copy. Verified on the merge tree

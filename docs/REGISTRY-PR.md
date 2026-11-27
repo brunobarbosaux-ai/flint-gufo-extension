@@ -1,27 +1,27 @@
-# Registry PR: flint 0.5.0 — **pending**
+# Registry PR: flint 0.5.0 — **opened as gufo-org/gufo-extension#41**
 
-Status: not opened yet. Revision `REVISION` (tag `v0.5.0`), digest `DIGEST`
-computed from a clean clone at that revision with
-`python3 tools/registry.py digest <clone>`. `registry.py check` and
-`registry.py verify flint 0.5.0` must pass before the PR is opened. The rest of
-this file is the draft to post; keep it in sync with the branch if the review
-asks for changes.
+Status: PR <https://github.com/gufo-org/gufo-extension/pull/41> is open for
+review. Revision `dcccec1bec9941973c6e6e0e66273b8db1953c89` (tag `v0.5.0`),
+digest `sha256:8508f149c1f80429cdf584c84737a38892bc6589ee1b4bd92f900ecf704ebac6`
+from a clean clone at that revision. `registry.py check` and
+`registry.py verify flint 0.5.0` both pass. The rest of this file is the draft
+that was posted; keep it in sync with the branch if the review asks for changes.
 
 The public registry is `github.com/gufo-org/gufo-extension` (`index.json`,
 `extensions/`, `REVIEW.md`). A release enters only after a Gufo maintainer
 reviews its source at the listed commit and approves the PR. 0.4.0 entered the
 same way (PR #27, merged).
 
-## Before opening
+## Before opening (done)
 
 - [x] Commit 0.5.0. Record its full SHA as `revision`.
-- [ ] Tag `v0.5.0` on that commit.
-- [ ] Compute the digest with the registry's tool, from a clean clone at that
+- [x] Tag `v0.5.0` on that commit.
+- [x] Compute the digest with the registry's tool, from a clean clone at that
       revision: `python3 tools/registry.py digest <clone>`.
 - [x] Confirm the Gufo build used for validation: v0.36.0
       `4a7d8c6d178fc6979e5ae38c07b40e1fe89dd1ce`, extension API **0.3.42**.
 - [x] The entry's `api_version` stays `>= 0.3.0`.
-- [ ] `python3 tools/registry.py check` and
+- [x] `python3 tools/registry.py check` and
       `python3 tools/registry.py verify flint 0.5.0` pass.
 
 Note: the digest covers every file in the tree, so the tagged commit must not
@@ -37,12 +37,12 @@ The values below are the ones the branch uses.
      "releases": [
 +      {
 +        "api_version": ">= 0.3.0",
-+        "digest": "DIGEST",
++        "digest": "sha256:8508f149c1f80429cdf584c84737a38892bc6589ee1b4bd92f900ecf704ebac6",
 +        "notes": "Sliding-window layers become a ring in the continuation cache (payload_layout flint-kv-rows-window-v1; state_abi unchanged), so a 130k frontier retains 4.0 GB instead of 12.9 GB: an identical repeat restores all 128,981 tokens from RAM in 51 ms and, after a disk restart, 128,980 tokens from disk in 1.4 s; the 8 GiB retained-snapshot cap is unchanged and no longer binds. Cache identity changes, so 0.4.0 disk caches are a miss by design and re-prefill. Weights load through a pinned staging buffer on four threads (#11): under page-cache pressure a 131072 load drops from 133 to 64 s for 0.3-0.5 s on a healthy node (8.0-8.5 -> 8.5-9.0 s). At 262144 the per-session request state falls from 26.0 GiB to about 8.7 GiB, so four sessions load in 9.5 s using 60.0 GiB and eight fit on this 128 GB box. Matrix-core decode attention (#7) is compiled but OFF by default; the shipped build behaves like 0.4.0 and flipping it is gated on documented prerequisites. Also: drafter_parity starts each prompt from Reset(), and Model::Load rejects an odd prefill_tile instead of producing wrong logits. Built and validated on Gufo v0.36.0 (API 0.3.42); source builds on any 0.3.x host.",
 +        "platforms": [
 +          "linux"
 +        ],
-+        "revision": "REVISION",
++        "revision": "dcccec1bec9941973c6e6e0e66273b8db1953c89",
 +        "version": "0.5.0"
 +      },
 ```
@@ -52,7 +52,7 @@ The values below are the ones the branch uses.
 - Name: `flint` (Flint 40B MoE text generation, GGUF `flint` architecture)
 - Version: `0.5.0`
 - Source: https://github.com/brunobarbosaux-ai/flint-gufo-extension
-- Revision: `REVISION`
+- Revision: `dcccec1bec9941973c6e6e0e66273b8db1953c89`
 - Tag: `v0.5.0`
 - License: MIT (`LICENSE`, `THIRD_PARTY_NOTICES.md`)
 - Maintainer: @brunobarbosaux-ai
@@ -122,7 +122,7 @@ The values below are the ones the branch uses.
   (`src/gpu/kernels/`, `extension.cmake`), the window-aware cache gate
   (`gates/cache_reuse.py`), `tests/ring_snapshot_test.cpp`, `tests/ops_test.cpp`,
   `tests/target_adapter_test.cpp`, `tools/attn_bench.cpp`, plus docs. Run
-  `git diff cf9f7aa..REVISION --stat` to confirm.
+  `git diff cf9f7aa..dcccec1bec9941973c6e6e0e66273b8db1953c89 --stat` to confirm.
 - No prebuilt binaries are vendored. The model and drafter are user-supplied
   GGUFs.
 - No network access, no telemetry, no writes outside the given model paths.

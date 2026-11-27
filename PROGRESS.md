@@ -7,8 +7,35 @@
 | DFlash2 speculative decoding (0.3.0, merged) | `docs/PLAN-DFLASH2.md` | COMPLETE — see "Milestone status" below |
 | Tool calls (0.4.0) | `docs/PLAN-DFLASH2.md` + PR #2 | COMPLETE — merged; ships in 0.4.0 |
 | Long-context continuation cache → per-layer `kAppendRows` | `docs/PLAN-KV-ROWS.md` | COMPLETE — stages 1-5 done; ships in 0.4.0 as layout v2 |
-| 0.4.0 release (0.36.0 validation) | this file + `docs/REGISTRY-PR.md` | **IN PROGRESS — docs pinned, battery + tag + registry PR pending** |
+| 0.4.0 release (0.36.0 validation) | this file + `docs/REGISTRY-PR.md` | COMPLETE — tagged `cf9f7aa`, registry #27 merged and published |
+| 0.5.0 release (ring KV, staged weight copy) | this file + `docs/REGISTRY-PR.md` | **IN PROGRESS — scope frozen, gate starting** |
 | Strycast serve gates | (separate repo) | PR #77 open, CI green |
+
+### 0.5.0 release checklist
+
+Target: Gufo v0.36.0 (`4a7d8c6`, API 0.3.42). Scope frozen to: ring KV (#5,
+`payload_layout flint-kv-rows-window-v1`), `drafter_parity` `Reset()` and odd
+`prefill_tile` rejection (post-merge fixes), staged weight copy (#11), and
+matrix attention (#7) shipped **inert** (option OFF).
+
+- [x] Merge #5 (`c47ce23`), #7 (`d64cc43`), #11 (`cbd1075`); post-merge fixes
+      `e3913e7`, `c10c70c`; attention follow-ups `258839f` … `6cb866d`
+- [x] Retarget `extension.json` to 0.5.0; `api_version` stays `>= 0.3.0`
+- [x] Cap decision recorded: 8 GiB ships unchanged, and the ring makes it
+      non-binding at 130k (`r1 3,995,190,656 B` restoring all 128,981 tokens in
+      50.9 ms); raising it is its own release
+- [ ] Clean clone of the release commit + scoped build (proves the tagged
+      revision builds; the registry digest comes from a clone anyway)
+- [ ] Gap battery only, reusing the runs on the identical tree (`64d37ed`
+      differs from the release commit in docs only): gx 3/3 at 8k and 131k
+      spec off/on, null 72/72, settings 8/8, 24k RAM/spec/sparse reuse, 60k
+      reuse, all `flint.*` ctests
+- [ ] 0.4.0 → 0.5.0 disk-cache miss check (identity
+      `flint-rocm-session-v2:flint-kv-rows-window-v1`)
+- [ ] Last, with nothing else running: 262144 capacity and 1x/2x load times
+- [ ] `docs/QUALITY.md` (0.5.0) section, README numbers, `docs/REGISTRY-PR.md`
+- [ ] Tag `v0.5.0` + GitHub Release
+- [ ] Registry PR against gufo-org/gufo-extension (new PR; #27 is merged)
 
 ### 0.4.0 release checklist
 

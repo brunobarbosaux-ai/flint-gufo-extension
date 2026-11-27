@@ -2,16 +2,15 @@
 
 ## Current workstream
 
-**Continuation cache → per-layer `kAppendRows` components** (`docs/PLAN-KV-ROWS.md`).
-Stage 2 (adapter rewrite) COMPLETE (`c559211`, review fixes `e1d0f6f`).
-Stage 3 (disk cache + eviction stress) COMPLETE (`b2893cc`, `4cc90dc`).
-Stage 4 (position assertion + 130k A/B) COMPLETE (`9ceaa4d`).
-Stage 5 (long-context validation) COMPLETE. All five stages done (`47cab02`, `dff1a01`
-for the gate; `9ceaa4d` for the runner check).
-Open follow-ups: post the #1317 before/after comment; raise the 8 GiB cap now that
-Gufo 0.36.0 contains #1319 (`93a1d230`) — scheduled for 0.5.0 with the ring's
-`flint-kv-rows-window-v1` payload layout;
-full battery at the 0.4.0 release gate.
+**0.5.0 release.** Scope frozen: ring KV (#5, `payload_layout
+flint-kv-rows-window-v1`), `drafter_parity` `Reset()` + odd `prefill_tile`
+rejection, staged weight copy (#11), matrix attention (#7) inert (option OFF).
+The 8 GiB retained-snapshot cap ships unchanged — the ring restores all 128,981
+tokens of the 130k frontier from `3,995,190,656 B` in 50.9 ms, so the cap is
+non-binding at 130k and raising it is a separate feature.
+Release plan and remaining legs: `PROGRESS.md`, "0.5.0 release checklist".
+The KV-rows stages (`docs/PLAN-KV-ROWS.md`) are all COMPLETE and shipped in
+0.4.0/0.5.0; the #1317 before/after comment is posted.
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — **merged** into gufo-org/gufo-extension
@@ -29,31 +28,34 @@ Merged for 0.5.0:
 - Post-merge fixes landing on `main`: `tools/drafter_parity.cpp` `Rewind(0)` to
   `Reset()` (the ring makes a deep rewind illegal), and `prefill_tile` parity
   validation in `Model::Load` (odd tiles were silently wrong on `main`).
-- **Matrix-core decode attention (#7) merged 2026-11-26 as `c9ca909`** (merge commit,
+- **Matrix-core decode attention (#7) merged 2026-11-26 as `d64cc43`** (merge commit,
   sebt3's six commits keep their authorship; head `fbdadd0`). Matrix attention ships
   inert: the default build behaves like `main`. Cross-restore is blocked in both
   directions by the payload layout suffix `-matrix`.
-- Follow-ups on `main`, not yet pushed:
-  - `370855a`: `FLINT_MATRIX_ATTENTION` from the environment overrides a disagreeing
+- Follow-ups on `main` after the #7 merge (all pushed, `d64cc43`..`6cb866d`):
+  - `258839f`: `FLINT_MATRIX_ATTENTION` from the environment overrides a disagreeing
     cached value (verified by configure, five cases).
-  - `bb2557e`: eight-row (all-live wave) case in both gate legs.
-  - `2ed4c8b`: narrows two doc claims.
-  - `91cdf29`: records the flip prerequisites in `DEFERRED.md`.
+  - `f8ac4e8`: eight-row (all-live wave) case in both gate legs.
+  - `a8ad54d`: narrows two doc claims.
+  - `903a443`: records the flip prerequisites in `DEFERRED.md`.
+  - `20b33be`: the decode bench fails on a tolerance or invariance breach.
+  - `6cb866d`: records the #7 battery and the staged-copy A/B.
 
-Released, awaiting registry review:
+Released:
 - 0.4.0 (tool calls + per-layer row cache + #6 + #8 + #9) — validated on Gufo
   v0.36.0 (API 0.3.42), tagged `v0.4.0` at `cf9f7aa`; registry PR
-  gufo-org/gufo-extension#27 open for review (digest `sha256:3b8e9e86…`).
+  gufo-org/gufo-extension#27 **merged and published** (digest `sha256:3b8e9e86…`,
+  entry visible in `index.json`).
   GitHub Releases: `v0.4.0` (latest), plus `v0.3.0` and `v0.3.1` back-filled
   from their registry revisions `b262cb6a` and `cb7303d5`.
 - 0.4.1 is reserved for hotfixes only.
 - 0.5.0 (ring + staged weight copy; matrix attention ships with the option OFF, as merged in
-  `c9ca909`; flipping the default is a later release gated on the `DEFERRED.md`
+  `d64cc43`; flipping the default is a later release gated on the `DEFERRED.md`
   prerequisites). The ring
   renames `payload_layout` from `flint-kv-rows-v2` to `flint-kv-rows-window-v1`
   and keeps `state_abi` at `flint-rocm-session-v2`; the identity string changes,
   so 0.4.0 disk caches stop restoring and are re-prefilled.
-- **Staged weight copy (#11) merged 2026-11-27 as `cbd1075`** (merge commit,
+- **Staged weight copy (#11) merged 2026-11-26 as `cbd1075`** (merge commit,
   sebt3's two commits keep authorship; head `fe46d2b`). Weights load through a
   pinned staging buffer with a four-thread copy. Verified on the merge tree
   (`main` `6cb866d` + `fe46d2b`, tree identical to what shipped): `flint.ops`
@@ -111,20 +113,21 @@ Released, awaiting registry review:
 ## Open questions
 
 - gufo#1319 (O(n²) `ReserveBacking` fix) **MERGED** 2026-11-21 (`93a1d230`) and
-  **released in Gufo 0.36.0**. The cap-removed 130k A/B is runnable on the 0.36
-  tree (`.flint-work/gufo036`, never modify `/home/bruno/AI/Gufo-api03`), point
-  `GUFO_EXTENSION_DIRS` at this repo, and measure with the 8 GiB cap temporarily
-  removed. Result decides PLAN-KV-ROWS §7 Q1; scheduled for 0.5.0.
+  **released in Gufo 0.36.0**. The cap-removed 130k A/B is no longer needed for
+  0.5.0: on the merged ring tree a 130k frontier retains `3,995,190,656 B` and
+  restores all 128,981 tokens in 50.9 ms, so the 8 GiB cap does not bind there.
+  Raising it stays a separate, measured change (PLAN-KV-ROWS §7 Q1 closed as
+  "unchanged in 0.5.0").
 - 0.36.0 moved the 262144 admission budget to 87.3 GiB: three sessions are now
   admitted (the old build refused the third) but the third loads in ~112 s and
   leaves ~5.8 GiB host available. Revisit before advertising more than two.
 - 0.36.0 262144 load time is not stable at two sessions (10-187 s over five
-  runs), consistent with the released GGUF mapping becoming evictable. Not a
-  0.4.0 blocker; re-measure with a warmed page cache before quoting a number.
+  runs). The staged copy (#11) halves the pressure case (133 → 64 s) at a cost of
+  0.3-0.5 s on a healthy node; the spread itself is not eliminated, so quote load
+  times only with a warmed page cache. Re-measured for the 0.5.0 notes.
 - gufo#1317: keep open until Stage 5 numbers are posted (before/after capture size,
   restore time, follow-up-turn cost).
-- Ring (#5) rebased onto `main` at `3630602` (`verify/pr5-rebased`, scratch): at
-  128,981 tokens the retained snapshot is 3,995,190,656 B and both the repeat and
-  the follow-up restore **100%** in ~52 ms, so the 8 GiB cap no longer binds at
-  130k. Re-measure on the merged tree before planning the cap raise; with the ring
-  it may be unnecessary.
+- Ring (#5) merged as `c47ce23`. Measured on the merged tree: at 128,981 tokens
+  the retained snapshot is 3,995,190,656 B and both the repeat and the
+  follow-up restore **100%** in ~52 ms, so the 8 GiB cap does not bind at 130k.
+  The cap raise is dropped from 0.5.0 on that evidence (see `DEFERRED.md`).

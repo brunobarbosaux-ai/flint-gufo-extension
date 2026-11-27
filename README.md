@@ -15,7 +15,7 @@ adapted to the external extension contract. See `THIRD_PARTY_NOTICES.md`.
 
 - Maintainer: Bruno Barbosa (brunobarbosaux-ai)
 - Gufo pin: `4a7d8c6d178fc6979e5ae38c07b40e1fe89dd1ce` (v0.36.0, API 0.3.42).
-  That is the tree 0.4.0 is validated on. The source builds on any 0.3-series
+  That is the tree 0.5.0 is validated on. The source builds on any 0.3-series
   host (API revisions only add); the earlier `c40862ff` (v0.32.0, API 0.2)
   pin cannot build 0.3-series code.
 - Gufo API floor: `>= 0.3.0`. Derived from the upstream change records this

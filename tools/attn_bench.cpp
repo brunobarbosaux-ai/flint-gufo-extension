@@ -24,6 +24,19 @@ void Log(const std::string& line) {
   std::fflush(stdout);
 }
 
+// Set by any breached check; main() returns non-zero once the log is complete.
+bool g_failed = false;
+
+void Fail(const std::string& line) {
+  g_failed = true;
+  Log("event=attn_bench FAIL " + line);
+}
+
+// Relative tolerance against the scalar kernel. Measured maxima on gfx1151 are
+// 1.84e-4 (8k), 1.37e-4 (32k), 8.7e-5 (131k); 1e-3 keeps more than five times
+// margin and still catches a kernel that produces garbage or silently falls back.
+constexpr float kMaxRelDiff = 1e-3F;
+
 }  // namespace
 
 int main() {
@@ -115,13 +128,23 @@ int main() {
           float diff = 0.0F;
           for (std::size_t i = 0; i < got.size(); ++i)
             diff = std::max(diff, std::fabs(got[i] - ref[i]));
+          const float rel = scale > 0 ? diff / scale : 0.0F;
           char line[256];
           std::snprintf(line, sizeof(line),
                         "event=attn_bench depth=%u rows=%u mode=%s splits=%u "
                         "ms=%.3f gbps=%.0f max_rel_diff=%.2e",
                         depth, n, mode == 1 ? "scalar" : "wmma", splits, ms,
-                        bytes / (ms * 1e6), scale > 0 ? diff / scale : 0.0F);
+                        bytes / (ms * 1e6), rel);
           Log(line);
+          if (!(rel <= kMaxRelDiff)) {
+            char why[256];
+            std::snprintf(why, sizeof(why),
+                          "depth=%u rows=%u mode=%s splits=%u max_rel_diff=%.2e "
+                          "limit=%.1e",
+                          depth, n, mode == 1 ? "scalar" : "wmma", splits, rel,
+                          static_cast<double>(kMaxRelDiff));
+            Fail(why);
+          }
         }
       }
     }
@@ -160,11 +183,16 @@ int main() {
             ++bad_single;
         }
       }
+      const std::string mode_name = mode == 1 ? "scalar" : "wmma";
       Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
-          " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") +
-          " rows=" + std::to_string(total) + " block_vs_pair_bad=" +
+          " row_invariance mode=" + mode_name + " rows=" +
+          std::to_string(total) + " block_vs_pair_bad=" +
           std::to_string(bad_pair) + " block_vs_single_bad=" +
           std::to_string(bad_single));
+      if (bad_pair != 0 || bad_single != 0)
+        Fail("depth=" + std::to_string(depth) + " row_invariance mode=" +
+             mode_name + " block_vs_pair_bad=" + std::to_string(bad_pair) +
+             " block_vs_single_bad=" + std::to_string(bad_single));
     }
     // Where does a masked key leak into a row? Perturb the key just past row
     // 0 (it is masked for row 0 and live for row 1) and see what moves.
@@ -207,6 +235,10 @@ int main() {
       hipMemcpy(dk + off, keep_k.data(), bytes, hipMemcpyHostToDevice);
       Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
           " leak_probe " + out_line);
+      // The row1 check is a sensitivity check: if zeroing a live key's V no
+      // longer moves row 1, the probe has stopped testing anything.
+      if (out_line != "V0 row0 same; row1 moves; K0 row0 same; ")
+        Fail("depth=" + std::to_string(depth) + " leak_probe " + out_line);
     }
     rk::SetMatrixAttention(rk::MatrixAttentionBuild());
     hipEventDestroy(t0);
@@ -219,5 +251,5 @@ int main() {
     hipFree(dpart);
     hipFree(dpos);
   }
-  return 0;
+  return g_failed ? 1 : 0;
 }

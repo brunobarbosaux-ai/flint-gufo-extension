@@ -159,3 +159,13 @@
 - **FIXED** on `main` (`e3913e7`): `tools/drafter_parity.cpp` starts each prompt from
   `Reset()` instead of `Rewind(0)`, so the ring is overwritten as the prompt is written and
   no deep rewind is attempted. Verified: the tool runs all 14 prompts, 58 s, exit 0.
+
+### Matrix-core attention: prerequisites before it can be the default (#7)
+- As merged, `FLINT_MATRIX_ATTENTION` is OFF. A default build dispatches the scalar path, keeps `kGlobalSplits` at 32 and the payload layout unchanged, so it is behaviourally `main`. The matrix build is opt-in, one build directory per mode (`docs/ATTENTION-WMMA.md`).
+- M1: `src/gpu/kernels/kernels.hip.cpp:1889` `SetMatrixAttention` mutates `g_matrix_attention` at runtime, while `FlintPayloadLayout()` in `runner.cpp:53` keys off the compile-time `MatrixAttentionBuild()`. A default build that ever called the setter on a serving path would write matrix-kernel rows under the un-suffixed layout string. Today only tests and the bench call it. Fix before flipping: assert the two agree on the serving path, or make the setter test-only.
+- M2: the V-zeroing in `AttentionSliceWmmaKernel` (`kernels.hip.cpp:1305-1310`, split-KV staging of V) is documented as required, but `0 * finite == 0`, so the mechanism must be non-finite V, stale ring rows, or a hardware quirk. None is proven. The gate fills V with finite values only. Fix before flipping: add an offset whose masked V region is Inf/NaN and assert row invariance still holds, or drop the zeroing and its claim.
+- M3: doc claims narrowed in `docs/ATTENTION-WMMA.md` (drafter identity verified at 8k/32k only; one-row decode is within 2 % to 29k and ~8 % faster at 131k). Re-measure at 131k before claiming more.
+- L1: `AttentionSliceWmmaKernel` is compiled in every build; `#ifdef FLINT_MATRIX_ATTENTION` would make "inert" literal (compile time and binary size only).
+- L2: `flint_attn_bench` is not guarded by `if(TARGET gufo_flint_hip)` in `extension.cmake`, so a no-HIP configure cannot link it (same as the other tools, not a regression).
+- L3: the key bound in the matrix kernel is computed as `int(qpos) - int(kt)` (`kernels.hip.cpp:1419`); fine below 2^31 context, an unsigned-safe form would remove the latent overflow.
+- L4: the matrix kernel runs at the same ~176 VGPRs/thread as the reference kernel at `__launch_bounds__(256)`; worth a `-Rpass` check on gfx1151 before the mode becomes default.

@@ -8,7 +8,7 @@
 | Tool calls (0.4.0) | `docs/PLAN-DFLASH2.md` + PR #2 | COMPLETE — merged; ships in 0.4.0 |
 | Long-context continuation cache → per-layer `kAppendRows` | `docs/PLAN-KV-ROWS.md` | COMPLETE — stages 1-5 done; ships in 0.4.0 as layout v2 |
 | 0.4.0 release (0.36.0 validation) | this file + `docs/REGISTRY-PR.md` | COMPLETE — tagged `cf9f7aa`, registry #27 merged and published |
-| 0.5.0 release (ring KV, staged weight copy) | this file + `docs/REGISTRY-PR.md` | COMPLETE — tagged `dcccec1`, registry PR #41 open |
+| 0.5.0 release (ring KV, staged weight copy) | this file + `docs/REGISTRY-PR.md` | COMPLETE — released; registry PR #41 awaiting maintainer review |
 | Strycast serve gates | (separate repo) | PR #77 open, CI green |
 
 ### 0.5.0 release checklist
@@ -47,8 +47,9 @@ matrix attention (#7) shipped **inert** (option OFF).
       left); 7 once at 41.0 s (outlier). 131072: 1 session 8.0/8.0/8.0 s, 2
       sessions 8.5/8.0/8.0 s, 36,479 MiB
 - [x] Flag correction: the #11 A/B used `-s 2`, which is `--seed`; every log
-      reports `sessions=1`. DEFERRED/STATE corrected and the public comments
-      need a correction note
+      reports `sessions=1`. DEFERRED/STATE/README/release notes corrected; the
+      public correction on issue #10 / PR #11 is drafted in
+      `.flint-work/correction-ab-sessions.md` and **waits for approval**
 - [x] `docs/QUALITY.md` (0.5.0) section, README numbers, `docs/REGISTRY-PR.md`
 - [x] Tag `v0.5.0` + GitHub Release (`dcccec1`, "v0.5.0 — Ring KV window and
       steadier loads")
@@ -56,6 +57,21 @@ matrix attention (#7) shipped **inert** (option OFF).
       gufo-org/gufo-extension#41, revision `dcccec1`, digest
       `sha256:8508f149…`, `registry.py check` and `verify flint 0.5.0` pass;
       merge needs a maintainer
+
+### After 0.5.0
+
+Nothing here is a release blocker. Full detail and evidence in `DEFERRED.md`.
+
+| Item | State | Next action |
+|---|---|---|
+| Public correction on issue #10 / PR #11 (`-s 2` is `--seed`, the A/B was one session) | draft written, not posted | post after approval; issue #10 is already closed, PR #11 is merged |
+| Registry PR #41 | open, CI green | a Gufo maintainer reviews and merges |
+| `.flint-work` cleanup (~20 GB reproduction trees) | kept on purpose | delete once #41 merges |
+| Matrix attention as the default (#7) | inert, option OFF | M1/M2 fixes, M3 131k re-measure, L1-L4 — its own release |
+| Base-session VRAM undercount (~600-666 MiB) | open, pre-existing | re-measure `--mode memory`, then audit `Session::Init` vs `SessionBytes` |
+| MMQ scratch arena never released (256 MiB per stream) | open | call `flint_mmq_release_stream` on teardown, or share one arena |
+| 262144-token request through serve | never run (startup only) | one long run; no throughput claim exists at that depth |
+| Mid-prompt checkpoint reuse | not implemented | `Adapter::PrefillCheckpointPositions` + host capture |
 
 ### 0.4.0 release checklist
 

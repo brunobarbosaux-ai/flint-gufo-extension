@@ -6,13 +6,17 @@ inconclusive checks stay visible until they pass.
 ## Environment
 
 - GPU: AMD Strix Halo (gfx1151), ROCm 7.2.1
-- Gufo (0.4.0 release validation): v0.36.0 `4a7d8c6`, extension API **0.3.42**
-  (series 0.3). Earlier sections below were measured on the 0.3.x line as noted
-  (v0.31.0/0.32.0 for 0.2-series gates, 0.35.0 for the 0.4.0 PR reviews).
+- Gufo (0.5.0 release validation): v0.36.0 `4a7d8c6`, extension API **0.3.42**
+  (series 0.3) — the same host tree as 0.4.0. Earlier sections below were measured
+  on the 0.3.x line as noted (v0.31.0/0.32.0 for 0.2-series gates, 0.35.0 for the
+  0.4.0 PR reviews).
 - Build: `gpu-test` preset (`RelWithDebInfo`, HIP on, tests on), option-aligned
   per-tier flags matching the reference fork's builds (fast-math on the vendored
   GEMM/mmq/w8a8 tiers; Flint's own kernels stay `-O3`)
-- Extension revision: `efacf0e` (option alignment) with provenance `6dc4ce0`
+- Extension revision: `0.5.0` at `dcccec1bec9941973c6e6e0e66273b8db1953c89` (tag
+  `v0.5.0`); the release battery ran on the identical tree at `58bc87c`. The
+  0.2.0/0.3.0 sections predate it (revision `efacf0e`, provenance `6dc4ce0`),
+  and the 0.4.0 section was measured at `cf9f7aa`.
 - Oracle for all parity gates: pinned `llama.cpp` b11804 ROCm build, CPU mode,
   `flint-UD-Q4_K_XL.gguf`, fixed seed — the baseline does not drift the way a
   rebuilt reference binary would
@@ -237,6 +241,18 @@ cliff.
 
 ## Open / not yet validated
 
+Open after 0.5.0 (full detail in `DEFERRED.md`):
+
+- [ ] A **262144-token request** through serve. Only startup at that context is
+      verified; long-context requests are exercised to 130k. No throughput claim
+      at 262144 exists.
+- [ ] Multi-session **load time under memory pressure** stays spread out (staged
+      copy halves the pressured case, 133 s → 64 s). Quote load times only with a
+      warmed page cache.
+- [ ] Base-session VRAM undercount of ~600-666 MiB in `SessionBytes`; the memory
+      gate measures deltas, so absolute claims inherit it.
+- [ ] Matrix-core attention as the default is gated on the `DEFERRED.md`
+      prerequisites (M1/M2, L1-L4).
 - [ ] The `kManaged` weight-placement branch needs confirmation on a machine
       with a small device-heap cap (BIOS-reserved GPU memory or a low
       `ttm.pages_limit`). The per-call OOM fallback bounds the risk, but the

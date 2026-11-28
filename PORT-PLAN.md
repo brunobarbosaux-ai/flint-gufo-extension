@@ -1,5 +1,10 @@
 # Flint external Gufo extension — port plan
 
+Status: **COMPLETE and historical.** The 0.2-series port shipped in 0.2.0; the
+0.3-series port (API 0.3.42) shipped in 0.3.0, and 0.5.0 is current — see
+`README.md` and `PROGRESS.md`. Kept as the record of the API-boundary decisions;
+the pin below is the original target, not the current one.
+
 ## Target
 
 Standalone repo `flint-gufo-extension` that builds against **unmodified Gufo

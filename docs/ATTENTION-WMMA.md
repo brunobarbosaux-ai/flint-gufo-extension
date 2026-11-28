@@ -5,7 +5,13 @@ scalar slice kernels for a global layer (no window, `head_dim` 128, a group of 8
 query heads per KV head) when the pass carries 1 to 8 rows: plain decode and the
 verification pass of speculative decoding.
 
-It is **off by default** and chosen at build time:
+**Status in 0.5.0:** shipped, compiled in every build, and **off by default** — a
+default build behaves like 0.4.0. A default build runs the scalar path,
+`kGlobalSplits` stays 32, and the payload layout is `flint-kv-rows-window-v1`
+without a suffix. Flipping the default is gated on the prerequisites recorded in
+`DEFERRED.md` § "Matrix-core attention" (M1/M2, the 131k re-measure, L1-L4).
+
+The choice is made at build time:
 
 ```sh
 FLINT_MATRIX_ATTENTION=1 gufo extension install <source>

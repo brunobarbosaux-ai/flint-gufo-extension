@@ -11,7 +11,9 @@ maintainer's review is the only open step. Scope as shipped: ring KV (#5,
 binds at 130k. Evidence: `docs/QUALITY.md` (0.5.0); checklist:
 `PROGRESS.md`.
 Next, if picked up: matrix attention's `DEFERRED.md` prerequisites (M1/M2,
-L1-L4) — a separate release, not a hotfix.
+L1-L4) — a separate release, not a hotfix. The other open threads (600-666 MiB
+VRAM undercount, MMQ arena release, 262144-token request, mid-prompt checkpoints)
+are listed in `PROGRESS.md` § "After 0.5.0".
 
 Shipped and idle:
 - 0.3.1 (retained-snapshot cap) — **merged** into gufo-org/gufo-extension
@@ -115,32 +117,41 @@ Released:
   - Build dirs: `.flint-work/gufo036/build/host-{036,pr5d,...}` (targets `gufo`,
     `flint_spec_gate`, the `flint_*_test` binaries)
   - Extension worktrees: `.flint-work/wt-pr5d`, `wt-main-fix`, `wt-pr7`, ...
-  - `main` build: `.flint-work/gufo036/build/host-main-fix` — rebuilt per change;
-    it predates the #11 merge, so rebuild before the 0.5.0 gate
-  - Battery: `.flint-work/battery-pr5d.sh` (writes logs to `.flint-work/battery-<dir>/`)
-  - **Cleanup debt:** delete `.flint-work` once 0.5.0 ships and no branch is under
-    verification; it holds a full clone plus build trees (~30 GB).
+  - `main` build: `.flint-work/gufo036/build/host-main-fix` — rebuilt per change.
+    The release binaries are `.flint-work/gufo036/build/rel050` (0.5.0, built
+    with `-DGUFO_EXTENSION_DIRS` pointing at the clean clone
+    `.flint-work/rel050`) and `.flint-work/gufo036/build/rel040` (0.4.0
+    `cf9f7aa`, kept for the cross-version greedy and cache checks).
+  - Battery: `.flint-work/battery-rel050.sh` (0.5.0 release legs, logs in
+    `.flint-work/battery-rel050/`); the per-PR scripts (`battery-pr5d.sh`,
+    `battery-pr7.sh`, `battery-pr11m.sh`) are the historical runs
+  - **Cleanup debt:** delete `.flint-work` once registry PR #41 is merged and no
+    branch is under verification. Until then the two release build trees
+    (`gufo036/build/rel040` and `gufo036/build/rel050`, ~20 GB) stay as
+    reproduction trees for the review; everything else there is disposable.
 - Target model: `/home/bruno/AI/GGUF/flint-UD-Q4_K_XL.gguf`
 - Drafters: `/home/bruno/AI/GGUF/mtp/Flint-DFlash2-{BF16,Q6_K}.gguf`
 - Oracle (disposable, `/tmp` is fine): `/tmp/opencode/llamacpp-oracle/llama-b11804`
 
 ## Open questions
 
+- 262144 capacity is answered for 0.5.0: with the ring a session reserves about
+  8.7 GiB, so on this box four sessions load in 9.5 s (60.0 GiB) and eight fit
+  (94.9 GiB, 22.6 GiB host left). The old "advertise two" was a count against
+  the full-row layout. What is not answered is **load latency under pressure**
+  (one outlier at 7 sessions, 41 s) and **a 262144-token request**, which has
+  never been run through serve. Never quote a multi-session load time without a
+  warmed page cache.
 - gufo#1319 (O(n²) `ReserveBacking` fix) **MERGED** 2026-11-21 (`93a1d230`) and
   **released in Gufo 0.36.0**. The cap-removed 130k A/B is no longer needed for
   0.5.0: on the merged ring tree a 130k frontier retains `3,995,190,656 B` and
   restores all 128,981 tokens in 50.9 ms, so the 8 GiB cap does not bind there.
   Raising it stays a separate, measured change (PLAN-KV-ROWS §7 Q1 closed as
   "unchanged in 0.5.0").
-- 0.36.0 moved the 262144 admission budget to 87.3 GiB: three sessions are now
-  admitted (the old build refused the third) but the third loads in ~112 s and
-  leaves ~5.8 GiB host available. Revisit before advertising more than two.
-- 0.36.0 262144 load time is not stable at two sessions (10-187 s over five
-  runs). The staged copy (#11) halves the pressure case (133 → 64 s) at a cost of
-  0.3-0.5 s on a healthy node; the spread itself is not eliminated, so quote load
-  times only with a warmed page cache. Re-measured for the 0.5.0 notes.
-- gufo#1317: keep open until Stage 5 numbers are posted (before/after capture size,
-  restore time, follow-up-turn cost).
+- gufo#1317 is **closed** (2026-11-21) after the maintainer's root cause and our
+  before/after numbers were posted. Remaining upstream hygiene (capture off the
+  request thread, clean refusal, non-zero default `stall_timeout`, bounded
+  waits) lives in Gufo core and is listed in `DEFERRED.md`.
 - Ring (#5) merged as `c47ce23`. Measured on the merged tree: at 128,981 tokens
   the retained snapshot is 3,995,190,656 B and both the repeat and the
   follow-up restore **100%** in ~52 ms, so the 8 GiB cap does not bind at 130k.

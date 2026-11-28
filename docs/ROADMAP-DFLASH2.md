@@ -8,6 +8,10 @@ their fabric-clock requirements stay out).
 
 Status markers: `[ ]` open, `[~]` in progress, `[x]` done.
 
+**Status: COMPLETE.** All milestones M1-M6 finished; DFlash2 shipped in 0.3.0
+and is still the speculation path in 0.5.0. Per-milestone records live in
+`PROGRESS.md` § "Milestone status"; the plan below is kept as the design record.
+
 ## Current state (2026-11-15) — M1 done, integration next
 
 **Decision: build it, sampler-agnostic.** The gate below was measured twice and

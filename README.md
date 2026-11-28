@@ -6,6 +6,12 @@ framing it needs, so it builds against an unmodified Gufo checkout.
 
 ## Status
 
+Current release: **0.5.0** (ring KV window, staged weight copy). Validation
+detail is in `docs/QUALITY.md`, § "Ring KV window and steadier loads (0.5.0)".
+0.4.0 is the newest release in the public registry; the 0.5.0 entry is in review
+at <https://github.com/gufo-org/gufo-extension/pull/41>, so until it merges,
+build or install 0.5.0 from this source.
+
 Working on gfx1151 (AMD Strix Halo) with HIP. See `docs/QUALITY.md` for what
 is validated and what is still open.
 

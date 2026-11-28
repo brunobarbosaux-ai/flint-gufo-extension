@@ -1,6 +1,8 @@
 # Build plan: continuation cache as per-layer `kAppendRows` components
 
-Status: **approved to start Stage 1** (2026-11-21). Execution plan; measurements and
+Status: **COMPLETE** — all five stages shipped in 0.4.0 (layout
+`flint-kv-rows-v2`), and the 0.5.0 ring (`flint-kv-rows-window-v1`) makes the
+8 GiB cap non-binding at 130k. Execution plan; measurements and
 decision history live in the §8 log at the bottom (append-only — never rewrite an entry).
 
 Tracking: gufo-org/gufo#1317 (recommendation), gufo-org/gufo#1319 (upstream O(n²) fix).
@@ -264,6 +266,9 @@ Never loosen: stage 1e-4, selector 5e-6, Level 2 95%. A failure is a finding.
   latency with the row components in place. Expectation from the scoping: unchanged
   first-capture latency, much cheaper follow-up turns. If latency is unchanged and
   failures are clean, the cap can become the host budget instead of a hard 8 GiB.
+  **Answered in 0.5.0:** with the ring a 130k frontier retains `3,995,190,656 B`
+  (follow-up `3,776,601,216 B`), so the cap does not bind and the raise is dropped.
+  `DEFERRED.md` § "8 GiB snapshot cap" has the numbers.
 - **Q2 — retained-snapshot budget.** With many frontiers now fitting, re-measure the
   cache budget needed for N concurrent prefixes at 32k/130k. Record the number in
   `DEFERRED.md`.

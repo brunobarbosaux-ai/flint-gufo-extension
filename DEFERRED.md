@@ -1,11 +1,20 @@
 # Deferred items
 
-### Base-session VRAM undercount in `Model::SessionBytes` (pre-existing)
+### Base-session VRAM undercount in `Model::SessionBytes` (pre-existing, still open after 0.5.0)
 - `Session::Init` (`src/gpu/engine.cpp`) allocates per-session scratch pools, step-graph workspaces and allocator slack totalling ~600–666 MiB more than `SessionBytes` accounts for. Measured with `flint_spec_gate --mode memory` (second-session delta): spec-off claim 1457 MiB vs measured 2123 MiB; spec-on claim 1873 MiB vs measured 2443 MiB. Identical in both modes, so it predates DFlash2 and is not an M5 regression.
 - The M5 memory gate criterion (hidden ring + drafter accounted in `ResourceClaim`) is met: the spec-on per-session claim grows 436 MiB over spec-off and the measured growth is exactly the 320 MiB hidden ring.
-- Action before release: audit `Session::Init` allocations against `SessionBytes` and add the missing terms. Evidence: `/tmp/opencode/m5-smoke/memory2.log`.
+- Action (open, not a release gate): audit `Session::Init` allocations against
+  `SessionBytes` and add the missing terms. Every admission/claim number quoted
+  in the docs is this underestimate plus the accounted terms; the 0.5.0 memory
+  gate measures the delta, not the absolute. Original evidence log
+  (`/tmp/opencode/m5-smoke/memory2.log`) was lost with the 2026-11-07 reboot —
+  re-measure with `flint_spec_gate --mode memory` before changing the code.
 
 ### Serve at 262144-token context: eight sessions now load; the spread, not capacity, is the limit
+- **Status after 0.5.0:** the staged weight copy shipped (#11, `cbd1075`) and issue #10
+  is closed. What remains open here is (a) the load-time spread under memory pressure,
+  mitigated 2.05x but not removed, and (b) a 262144-token **request**, which has never
+  been run through serve.
 - History: on 2026-11-17 `gufo serve -c 262144` never completed the `sessions` load phase (11+ min, killed; blocked in KFD GPU allocation, GTT climbing past 55 GB, with AND without `--speculative`); 196608 loaded in ~62 s and the boundary was not bisected.
 - **That hang no longer reproduces** (2026-11-22 on the 0.35.0 build with the row-component cache; re-checked 2026-11-23 on Gufo 0.36.0): 1 session at 262144 reaches `listening` in ~10 s, spec off. The original hang was never bisected, so the cause is not pinned; only the current behaviour is verified.
 - **Load time is not stable at two sessions on 0.36.0**: five runs measured 10, 36, 56, 138 and 187 s. The spread is the pageable `hipMemcpy` out of the memory-mapped artifact (`src/gpu/device_model.cpp:97` for the stacked experts and `:206` in `Copy()`): while part of the file is not resident the kernel evicts the pages the copy is reading and faults them back in, so the upload crawls. Releasing the mapping after upload (0.4.0's #9) is the *enabler* — those pages are evictable at all, where before they stayed pinned for the process lifetime — not the cause, and #9 is not a stall fix (issue #10, sebt3). Measured on `main`, where both arms include #9: direct mapping 32.9/35.6/51.4 s with 65–139k file refaults/s; a pinned 64 MiB staging buffer 24.6/25.2/25.6 s with 21–46k/s. That A/B did **not** reproduce the old hang, so this is the shape of the spread, not a diagnosis of it. One session stays near 10 s. Do not quote a two-session load time without a warmed page cache.
@@ -31,14 +40,21 @@
 ### Serve draft counters report zero (root-caused 2026-11-18; not a logging bug)
 - Serve drives Flint via `SelectNext()`/`Advance()` (per PLAN-DFLASH2: sampler-history correctness), so the counter-copying `DecodeStep` hook (`runner.cpp:612`) is never called; `Descriptor().multi_token_decode` is false and the host's `StepDecode` path never reads `SpecCycle::stats()`.
 - Speculation itself demonstrably runs in serve: decode 74.3 t/s at 8k ≈ spec-on (74.7) vs spec-off (63.6). A same-request A/B tps comparison (serve with vs without `--speculative dflash2`) is the accepted proof for 0.3.0 — no code change.
-- Fix options deferred to 0.5.0 (was v0.4.0): (A) flip `multi_token_decode` capability — extension-only but changes the serve scheduling path (needs full re-verification); (B) host-side counter channel on `TextRunnerState` — touches Gufo core, out of extension scope.
+- Fix options (still open; 0.5.0 shipped without them): (A) flip
+  `multi_token_decode` capability — extension-only but changes the serve
+  scheduling path (needs full re-verification); (B) host-side counter channel on
+  `TextRunnerState` — touches Gufo core, out of extension scope.
 
 ### MMQ scratch arena never reclaimed (noted during `fb616ad` root-cause)
 - `qfn_stack_pool::reserve` allocates a 256 MiB arena per (device, stream); each session owns a private stream, and `flint_mmq_release_stream` (`flint_mmq.h:10`) is declared but never called — arenas are never returned. The claim now models this honestly, but a long-lived server with rotating sessions could accumulate arenas. Action: call `flint_mmq_release_stream` on session teardown, or share one arena under the device lock.
 
 ### Long-context first-request stall (0.3.1 caps the claim; real fix = kAppendRows, gufo#1317)
 - At `-c 130000` with the default RAM cache, the host captured a full private-state snapshot **synchronously on the request thread** (~15.7 GB) before answering: first request 14.2 s vs 0.47 s with the capture refused. Prefill itself was healthy; `--stall-timeout-ms` defaults to 0, so on slower machines the stall logs nothing and looks like a hang.
-- Upstream root cause (Gufo maintainer, gufo-org/gufo#1317): `ResourceCharge::ReserveBacking` compared each backing block with every earlier one, so one 15.7 GB frontier (~240k blocks) made the first capture's allocation take ~20 s; fixed with a sort in gufo-org/gufo#1319 (12 ms). Our 0.3.1 cap is therefore a **mitigation, not the fix**.
+- Upstream root cause (Gufo maintainer, gufo-org/gufo#1317; closed 2026-11-21):
+  `ResourceCharge::ReserveBacking` compared each backing block with every earlier one,
+  so one 15.7 GB frontier (~240k blocks) made the first capture's allocation take
+  ~20 s; fixed with a sort in gufo-org/gufo#1319 (12 ms). Our 0.3.1 cap is therefore a
+  **mitigation, not the fix**.
 - Flint-side mitigation (`0.3.1`): the retained-snapshot capacity/ceiling claim is capped at 8 GiB, so a snapshot larger than the cap is refused cheaply instead of captured. Verified: 130k first request 0.47 s; 8k keeps prefix retention (`cached_tokens=8` on the second request).
 - **Structural fix (done, `docs/PLAN-KV-ROWS.md`)**: K/V are per-layer `kAppendRows` components (row hooks, `rows_per_chunk = 256`, `kPrivateState` only for small fixed state), as recommended in gufo#1317. Gains: captures copy only valid tokens, follow-up turns copy only new tokens (chunk sharing), many frontiers fit the cache (backing-segment sizing not separately measured). Execution plan and stage status: `docs/PLAN-KV-ROWS.md`; the 8 GiB cap is now a version guard (see below).
 - Depth caveat: long-context requests are now exercised to **130k** (Stage 4/5: dense, block-sparse, speculative, disk restart — `docs/PLAN-KV-ROWS.md`), but 262144 is verified at serve **startup** only (see the 262144 item above), so no throughput claim exists at that depth.
@@ -118,7 +134,14 @@
   nothing measured approaches it, and it is still a cheap guard against a full-row layout.
   Raising it is a separate, measured change if a future layout brings the bytes back.
 
-### Ring length must carry the masked-tile slack (PR #5, required before merge)
+### Ring length must carry the masked-tile slack (PR #5) — **FIXED**
+- **FIXED** (pre-merge, `1bf1538`, with `968b720` for the one-row-short append):
+  `RingLength` is now `round64(sliding_window + tile + kAttnKeyTile - 1)`,
+  `kAttnKeyTile` is exposed through `src/gpu/kernels/kernels.hpp`, the
+  `KvRows()` comment says a ring layer is not position-indexed and must be read
+  through `TransferRows()`, and `flint.prefill_split_tile4136` (tile 4136, 23
+  rows of slack before the fix) is in the suite and passes on the 0.5.0 release
+  build. The analysis below is kept as the record of why the term exists.
 - slimsami's analysis: aligned SWA key tiles start at
   `floor((pos_min - window + 1) / kWmmaKeys) * kWmmaKeys`, up to `kWmmaKeys - 1` keys
   below the window. Those keys are masked, but a row's last bit can still depend on the

@@ -1,7 +1,10 @@
 # Registry PR: flint 0.5.0 — **opened as gufo-org/gufo-extension#41**
 
 Status: PR <https://github.com/gufo-org/gufo-extension/pull/41> is open for
-review. Revision `dcccec1bec9941973c6e6e0e66273b8db1953c89` (tag `v0.5.0`),
+review, CI "Check entries and verify new releases" **SUCCESS**, no maintainer
+decision yet. Title `flint extension: add 0.5.0 (ring KV window, staged weight
+copy, 0.36.0 validation)` (renamed so the title names the extension; the body
+opens with `Name: flint`). Revision `dcccec1bec9941973c6e6e0e66273b8db1953c89` (tag `v0.5.0`),
 digest `sha256:8508f149c1f80429cdf584c84737a38892bc6589ee1b4bd92f900ecf704ebac6`
 from a clean clone at that revision. `registry.py check` and
 `registry.py verify flint 0.5.0` both pass. The rest of this file is the draft
@@ -142,4 +145,5 @@ The values below are the ones the branch uses.
   scalar decode kernel as 0.4.0, so this option does not change decode numerics.
   (The ring changes what the cache retains, not the attention arithmetic; greedy
   output stayed byte-identical in the #11 A/B, and spec-on equals spec-off at
-  every depth tested, but no 0.4.0-vs-0.5.0 byte comparison at depth was run.)
+  every depth tested. The 0.4.0 vs 0.5.0 byte comparison was three prompts at
+  depth 0, not at depth.)
